@@ -121,7 +121,7 @@ impl EthernetSender {
 }
 
 #[cfg(test)]
-mod ethrenet_test {
+mod ethrenet_tests {
     use super::*;
     use rstest::rstest;
     use hex::decode;
@@ -166,12 +166,14 @@ mod ethrenet_test {
         let payload = decode(encoded_payload).expect("Failed to decode payload hex string");
         let mut packet = EthernetPacket::new();
         let _ = packet.read(&packet_data).expect("Failed to read packet");
+        let recreated_packet = packet.create_packet().expect("Failed to recreate packet");
 
         assert_eq!(packet.dst, expected_dst);
         assert_eq!(packet.src, expected_src);
         assert_eq!(packet.ethertype, expected_ethertype);
         assert_eq!(packet.payload, payload);
         assert_eq!(packet.valid, expected_valid);
+        assert_eq!(recreated_packet, packet_data, "Recreated packet does not match the original data");
     }
 
     #[rstest]

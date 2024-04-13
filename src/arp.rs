@@ -22,7 +22,9 @@ enum L2StackEvent {
     Ipv4Received
 }
 
+
 // https://datatracker.ietf.org/doc/html/rfc826
+#[derive(Debug)]
 pub struct ArpPacket {
     hw_type: u16,
     proto_type: u16,
@@ -52,7 +54,7 @@ impl ArpPacket {
         }
     }
 
-    pub fn read(&mut self, packet: Vec<u8>) -> Result<bool> {
+    pub fn read(&mut self, packet: &Vec<u8>) -> Result<bool> {
         if packet.len() != ARP_LENGTH {
             return Err(anyhow::anyhow!("ARP must be {} bytes. packet.len()={}", ARP_LENGTH, packet.len()));
         }
@@ -66,6 +68,7 @@ impl ArpPacket {
         self.dst_mac = packet[18..24].try_into()?;
         self.dst_ip = packet[24..28].try_into()?;
         self.validate()?;
+
         Ok(self.valid)
     }
 
@@ -77,6 +80,7 @@ impl ArpPacket {
             log::warn!("Reading Unknown Type (hw type: 0x{:x} opcode: 0x{:x}) packet. Mark packet as invalid.", self.hw_type, self.opcode);
             self.valid = false;
         }
+
         Ok(self.valid)
     }
 
@@ -91,6 +95,7 @@ impl ArpPacket {
         packet.extend_from_slice(&self.src_ip);
         packet.extend_from_slice(&self.dst_mac);
         packet.extend_from_slice(&self.dst_ip);
+
         Ok(packet)
     }
 }
@@ -198,7 +203,7 @@ impl L2Stack {
             }
             if EtherType::from(ethernet_packet.ethertype) == EtherType::ARP {
                 let mut arp = ArpPacket::new();
-                match arp.read(ethernet_packet.payload.clone()) {
+                match arp.read(&ethernet_packet.payload) {
                     Err(e) => {
                         log::warn!("Reading arp packet faild. Err: {}", e);
                         continue;
@@ -306,5 +311,98 @@ fn is_netmask_range(ip: Ipv4Addr, netmask: usize, target_ip: Ipv4Addr) -> bool {
         return true;
     } else {
         return false;
+    }
+}
+
+#[cfg(test)]
+mod arp_tests {
+    use super::*;
+    use rstest::rstest;
+    use hex::decode;
+
+    #[rstest]
+    #[case(
+        "0001080006040001bebeff74a578c0a80001000000000000c0a80002",
+        0x0001,  // HW type (Ethernet)
+        0x0800,  // Protocol type (IPv4)
+        6,       // HW size
+        4,       // Protocol size
+        0x0001,  // Opcode (request)
+        [0xbe, 0xbe, 0xff, 0x74, 0xa5, 0x78],  // Src MAC
+        [192, 168, 0, 1],  // Src IP
+        [0, 0, 0, 0, 0, 0],  // Dst MAC (unspecified in requests)
+        [192, 168, 0, 2],  // Dst IP
+        true    // Expected validity
+    )]
+    #[case(
+        "0001080006040002bebeff74a578c0a80001bebeff74a578c0a80002",
+        0x0001,  // HW type (Ethernet)
+        0x0800,  // Protocol type (IPv4)
+        6,       // HW size
+        4,       // Protocol size
+        0x0002,  // Opcode (reply)
+        [0xbe, 0xbe, 0xff, 0x74, 0xa5, 0x78],  // Src MAC
+        [192, 168, 0, 1],  // Src IP
+        [0xbe, 0xbe, 0xff, 0x74, 0xa5, 0x78],  // Dst MAC
+        [192, 168, 0, 2],  // Dst IP
+        true    // Expected validity
+    )]
+    #[case(
+        "0001080006040000bebeff74a578c0a80001bebeff74a578c0a80002",
+        0x0001,  // HW type (Ethernet)
+        0x0800,  // Protocol type (IPv4)
+        6,       // HW size
+        4,       // Protocol size
+        0x0000,  // Opcode (invalid)
+        [0xbe, 0xbe, 0xff, 0x74, 0xa5, 0x78],  // Src MAC
+        [192, 168, 0, 1],  // Src IP
+        [0xbe, 0xbe, 0xff, 0x74, 0xa5, 0x78],  // Dst MAC
+        [192, 168, 0, 2],  // Dst IP
+        false    // Expected validity
+    )]
+    fn test_arp_packet_read(
+        #[case] encoded_packet: &str,
+        #[case] expected_hw_type: u16,
+        #[case] expected_proto_type: u16,
+        #[case] expected_hw_size: u8,
+        #[case] expected_proto_size: u8,
+        #[case] expected_opcode: u16,
+        #[case] expected_src_mac: [u8; 6],
+        #[case] expected_src_ip: [u8; 4],
+        #[case] expected_dst_mac: [u8; 6],
+        #[case] expected_dst_ip: [u8; 4],
+        #[case] expected_valid: bool
+    ) {
+        let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
+        let mut arp_packet = ArpPacket::new();
+        let result = arp_packet.read(&packet_data).expect("Failed to read ARP packet");
+        let recreated_packet = arp_packet.create_packet().expect("Failed to recreate packet");
+
+        assert_eq!(arp_packet.hw_type, expected_hw_type);
+        assert_eq!(arp_packet.proto_type, expected_proto_type);
+        assert_eq!(arp_packet.hw_size, expected_hw_size);
+        assert_eq!(arp_packet.proto_size, expected_proto_size);
+        assert_eq!(arp_packet.opcode, expected_opcode);
+        assert_eq!(arp_packet.src_mac, expected_src_mac);
+        assert_eq!(arp_packet.src_ip, expected_src_ip);
+        assert_eq!(arp_packet.dst_mac, expected_dst_mac);
+        assert_eq!(arp_packet.dst_ip, expected_dst_ip);
+        assert_eq!(result, expected_valid);
+        assert_eq!(recreated_packet, packet_data, "Recreated packet does not match the original data");
+    }
+
+    #[rstest]
+    // too short packet
+    #[case("0102030405")]
+    // too long packet
+    #[case("0001080006040001bebeff74a578c0a80001000000000000c0a800020111")]
+    fn test_arp_packet_read_error(
+        #[case] encoded_packet: &str,
+    ) {
+        let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
+        let mut packet = ArpPacket::new();
+        let result = packet.read(&packet_data);
+
+        assert!(result.is_err(), "Expected an error for incorrect packet length");
     }
 }
