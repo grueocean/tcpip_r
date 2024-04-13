@@ -1,8 +1,8 @@
 use crate::types::EtherType;
 use anyhow::{Context, Result};
 use log;
-use pnet_datalink::{self, Channel, DataLinkReceiver, DataLinkSender, NetworkInterface};
-use std::sync::{Arc, Mutex};
+use pnet_datalink::{self, Channel, DataLinkReceiver, DataLinkSender};
+use std::sync::Mutex;
 
 const ETHERNET_HEADER_SIZE: usize = 14;
 
@@ -117,5 +117,72 @@ impl EthernetSender {
             }
             None => Err(anyhow::anyhow!("Send operation did not return a result"))
         }
+    }
+}
+
+#[cfg(test)]
+mod ethrenet_test {
+    use super::*;
+    use rstest::rstest;
+    use hex::decode;
+
+    #[rstest]
+    #[case(
+        // normal arp packet
+        "010203040506bebeff74a57808060001080006040001bebeff74a578ac140a6effffffffffffac140a0a",
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        [0xbe, 0xbe, 0xff, 0x74, 0xa5, 0x78],
+        u16::from(EtherType::ARP),
+        "0001080006040001bebeff74a578ac140a6effffffffffffac140a0a",
+        true
+    )]
+    #[case(
+        // normal icmp packet
+        "f09fc2df161f000c29faa337080045000054000040004001a1dbc0a8c8150808080808009b9b206500018af2a8620000000044d6050000000000101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637",
+        [0xf0, 0x9f, 0xc2, 0xdf, 0x16, 0x1f],
+        [0x00, 0x0c, 0x29, 0xfa, 0xa3, 0x37],
+        u16::from(EtherType::IPv4),
+        "45000054000040004001a1dbc0a8c8150808080808009b9b206500018af2a8620000000044d6050000000000101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637",
+        true
+    )]
+    #[case(
+        // Packet EtherType is 0x0000
+        "010203040506bebeff74a57800000001080006040001bebeff74a578ac140a6effffffffffffac140a0a",
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        [0xbe, 0xbe, 0xff, 0x74, 0xa5, 0x78],
+        0x0000 as u16,
+        "0001080006040001bebeff74a578ac140a6effffffffffffac140a0a",
+        false
+    )]
+    fn test_ethernet_packet_read(
+        #[case] encoded_packet: &str,
+        #[case] expected_dst: [u8; 6],
+        #[case] expected_src: [u8; 6],
+        #[case] expected_ethertype: u16,
+        #[case] encoded_payload: &str,
+        #[case] expected_valid: bool
+    ) {
+        let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
+        let payload = decode(encoded_payload).expect("Failed to decode payload hex string");
+        let mut packet = EthernetPacket::new();
+        let _ = packet.read(&packet_data).expect("Failed to read packet");
+
+        assert_eq!(packet.dst, expected_dst);
+        assert_eq!(packet.src, expected_src);
+        assert_eq!(packet.ethertype, expected_ethertype);
+        assert_eq!(packet.payload, payload);
+        assert_eq!(packet.valid, expected_valid);
+    }
+
+    #[rstest]
+    #[case("0102030405")]
+    fn test_ethernet_packet_read_error(
+        #[case] encoded_packet: &str,
+    ) {
+        let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
+        let mut packet = EthernetPacket::new();
+        let result = packet.read(&packet_data);
+
+        assert!(result.is_err(), "Expected an error for insufficient packet length");
     }
 }

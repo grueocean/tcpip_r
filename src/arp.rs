@@ -108,10 +108,10 @@ impl Display for ArpEntry {
 }
 
 pub struct L2Stack {
-    interface_name: String,
-    interface_mac: MacAddress,
-    interface_ipv4: (Ipv4Addr, usize),
-    threads: Mutex<Vec<JoinHandle<()>>>,
+    pub interface_name: String,
+    pub interface_mac: MacAddress,
+    pub interface_ipv4: (Ipv4Addr, usize),
+    pub threads: Mutex<Vec<JoinHandle<()>>>,
     send_channel: Mutex<Sender<Box<[u8]>>>,
     event_condvar: (Mutex<Option<L2StackEvent>>, Condvar),
     receive_queue: Mutex<VecDeque<Vec<u8>>>,
@@ -292,6 +292,7 @@ impl L2Stack {
             };
             log::debug!("Arp entry added. ip: {} {}", arp_dst_ip, arp_entry);
             arp_table.insert(arp_dst_ip, arp_entry);
+            self.publish_event(L2StackEvent::ArpReceived);
         }
         Ok(())
     }
