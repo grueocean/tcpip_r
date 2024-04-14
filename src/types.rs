@@ -31,5 +31,23 @@ pub enum Ipv4Type {
     // 8 bit
     ICMP = 0x1,
     TCP = 0x6,
-    UDP = 0x11
+    UDP = 0x11,
+    Unknown
+}
+
+impl From<u8> for Ipv4Type {
+    fn from(value: u8) -> Self {
+        match value {
+            v if v == Ipv4Type::ICMP as u8 => Ipv4Type::ICMP,
+            v if v == Ipv4Type::TCP as u8 => Ipv4Type::TCP,
+            v if v == Ipv4Type::UDP as u8 => Ipv4Type::UDP,
+            _ => Ipv4Type::Unknown
+        }
+    }
+}
+
+impl From<Ipv4Type> for u8 {
+    fn from(e: Ipv4Type) -> Self {
+        e as u8
+    }
 }

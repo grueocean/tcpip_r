@@ -28,7 +28,7 @@ impl EthernetPacket {
 
     pub fn read(&mut self, packet: &Vec<u8>) -> Result<bool> {
         if packet.len() < ETHERNET_HEADER_SIZE {
-            return Err(anyhow::anyhow!("Insufficient packet length. packet.len()={}", packet.len()));
+            return Err(anyhow::anyhow!("Insufficient packet length for Ethernet Header. packet.len()={}", packet.len()));
         }
         self.dst = packet[0..6].try_into()?;
         self.src = packet[6..12].try_into()?;
