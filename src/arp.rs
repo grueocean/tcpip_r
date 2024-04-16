@@ -1,4 +1,5 @@
-use crate::ethernet::{EthernetPacket, EthernetRecveiver, EthernetSender};
+use crate::ethernet::{self, EthernetPacket, EthernetRecveiver, EthernetSender};
+use crate::ip::{Ipv4Packet};
 use crate::types::{EtherType};
 use anyhow::{Context, Result};
 use eui48::MacAddress;
@@ -100,6 +101,7 @@ impl ArpPacket {
     }
 }
 
+#[derive(Clone)]
 pub struct ArpEntry {
     mac: MacAddress,
     creation_time: Instant,
@@ -115,7 +117,7 @@ impl Display for ArpEntry {
 pub struct L2Stack {
     pub interface_name: String,
     pub interface_mac: MacAddress,
-    pub interface_ipv4: (Ipv4Addr, usize),
+    pub interface_ipv4: (Ipv4Addr, usize, Ipv4Addr, Ipv4Addr), // ip, netmask, net addr, broadcast addr
     pub threads: Mutex<Vec<JoinHandle<()>>>,
     send_channel: Mutex<Sender<Box<[u8]>>>,
     event_condvar: (Mutex<Option<L2StackEvent>>, Condvar),
@@ -132,7 +134,12 @@ impl L2Stack {
             Self {
                 interface_name: interface_name,
                 interface_mac: mac,
-                interface_ipv4: ip,
+                interface_ipv4: (
+                    ip.0,
+                    ip.1,
+                    generate_network_addr(ip.0, ip.1),
+                    generate_broadcast_addr(ip.0, ip.1)
+                ),
                 threads: Mutex::new(Vec::new()),
                 send_channel: Mutex::new(send_channl),
                 event_condvar: (Mutex::new(None), Condvar::new()),
@@ -177,7 +184,7 @@ impl L2Stack {
         let mut iface_send = EthernetSender::new(&self.interface_name)?;
         loop {
             let packet = recv_channl.recv().unwrap();
-            iface_send.send_packet(&*packet)?
+            iface_send.send_packet(&*packet)?;
         }
 
         Ok(())
@@ -217,16 +224,47 @@ impl L2Stack {
                     Ok(_) => {}
                 }
             } else if EtherType::from(ethernet_packet.ethertype) == EtherType::IPv4 {
+                // We do not check if the packet is in the correct IPv4 format or if the dst
+                // IP matches the interface IP here; those are handled at the L3 layer.
                 let mut queue = self.receive_queue.lock().unwrap();
+                let mut ipv4_packet = Ipv4Packet::new();
+                match ipv4_packet.read(&ethernet_packet.payload) {
+                    Err(e) => {
+                        log::warn!("Reading ipv4 packet failed. Err: {}", e);
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
                 queue.push_back(ethernet_packet.payload);
                 self.publish_event(L2StackEvent::Ipv4Received);
             }
         }
     }
 
-    pub fn send(&self, packet: &[u8]) -> Result<()> {
+    pub fn send(&self, packet: &Vec<u8>) -> Result<()> {
+        // Currently, we just assume this is a ipv4 packet.
+        let mut ipv4_packet = Ipv4Packet::new();
+        let mut ethernet_packet = EthernetPacket::new();
+        match ipv4_packet.read(packet) {
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to read ipv4 packet while sending it in L2 layer. Err: {}", e));
+            }
+            Ok(_) => {}
+        }
+        let arp_entry = {
+            self.arp_table.lock().unwrap().get(&Ipv4Addr::from(ipv4_packet.dst_addr)).cloned()
+        };
+        if let Some(arp) = arp_entry {
+            ethernet_packet.dst = arp.mac.as_bytes().try_into()?;
+        } else {
+            let target_arp_entry = self.resolve_arp(&Ipv4Addr::from(ipv4_packet.dst_addr))?;
+            ethernet_packet.dst = target_arp_entry.mac.as_bytes().try_into()?;
+        }
+        ethernet_packet.src = self.interface_mac.as_bytes().try_into()?;
+        ethernet_packet.ethertype = u16::from(EtherType::IPv4);
+        ethernet_packet.payload = ipv4_packet.create_packet()?;
         let send_channel_lock = self.send_channel.lock().unwrap();
-        send_channel_lock.send(packet.to_vec().into_boxed_slice())?;
+        send_channel_lock.send(ethernet_packet.create_packet()?.into_boxed_slice())?;
 
         Ok(())
     }
@@ -237,7 +275,7 @@ impl L2Stack {
                 *buffer = data;
                 return Ok(buffer.len());
             }
-            self.wait_event(L2StackEvent::Ipv4Received);
+            self.wait_event_with_timeout(L2StackEvent::Ipv4Received, Duration::from_millis(100));
         }
     }
 
@@ -256,6 +294,27 @@ impl L2Stack {
         }
     }
 
+    fn wait_event_with_timeout(&self, wait_event: L2StackEvent, timeout: Duration) -> bool {
+        let (lock, condvar) = &self.event_condvar;
+        let start_time = Instant::now();
+        let mut event = lock.lock().unwrap();
+            loop {
+            if let Some(ref e) = *event {
+                if *e == wait_event { return true; }
+            }
+            let elapsed = start_time.elapsed();
+            if elapsed >= timeout {
+                return false; // Timeout expired
+            }
+            let remaining_time = timeout - elapsed;
+            let (new_event, timeout_result) = condvar.wait_timeout(event, remaining_time).unwrap();
+            event = new_event;
+            if timeout_result.timed_out() {
+                return false; // Timeout occurred
+            }
+        }
+    }
+
     fn publish_event(&self, event: L2StackEvent) {
         let (lock, condvar) = &self.event_condvar;
         let mut e = lock.lock().unwrap();
@@ -263,11 +322,45 @@ impl L2Stack {
         condvar.notify_all();
     }
 
+    fn resolve_arp(&self, target_ip: &Ipv4Addr) -> Result<ArpEntry> {
+        let mut count = 0;
+        let mut ethernet_packet = EthernetPacket::new();
+        ethernet_packet.dst = MacAddress::broadcast().as_bytes().try_into()?;
+        ethernet_packet.src = self.interface_mac.as_bytes().try_into()?;
+        ethernet_packet.ethertype = u16::from(EtherType::ARP);
+        let mut arp_request = ArpPacket::new();
+        arp_request.hw_type = 0x0001;
+        arp_request.proto_type = 0x0800;
+        arp_request.hw_size = 0x6;
+        arp_request.proto_size = 0x4;
+        arp_request.opcode = 0x0001;
+        arp_request.src_mac = self.interface_mac.as_bytes().try_into()?;
+        arp_request.src_ip = self.interface_ipv4.0.octets();
+        arp_request.dst_mac = [0; 6];
+        arp_request.dst_ip = target_ip.octets();
+        ethernet_packet.payload = arp_request.create_packet()?;
+        while count < ARP_RETRY {
+            let send_channel_lock = self.send_channel.lock().unwrap();
+            send_channel_lock.send(ethernet_packet.create_packet()?.into_boxed_slice())?;
+            // should wait with timeout, in case we miss wake up.
+            self.wait_event_with_timeout(L2StackEvent::ArpReceived, Duration::from_millis(100));
+            let arp_entry = {
+                self.arp_table.lock().unwrap().get(target_ip).cloned()
+            };
+            if let Some(arp) = arp_entry {
+                return Ok(arp);
+            }
+            count += 1;
+        }
+
+        Err(anyhow::anyhow!("Tried {} times, buf failed to resolve IP {}.", ARP_RETRY, target_ip))
+    }
+
     fn arp_handler(&self, ethernet: EthernetPacket, arp: ArpPacket) -> Result<()> {
-        let (ip, netmask) = self.interface_ipv4;
+        let (ip, netmask, _, _) = self.interface_ipv4;
         let arp_src_ip = Ipv4Addr::from(arp.src_ip);
         let arp_dst_ip = Ipv4Addr::from(arp.dst_ip);
-        if arp.opcode == 0x1 && Ipv4Addr::from(arp.dst_ip) == ip && is_netmask_range(ip, netmask, arp_src_ip) {
+        if arp.opcode == 0x1 && arp_dst_ip == ip && is_netmask_range(ip, netmask, arp_src_ip) {
             // request to me, from my network.
             let mut arp_reply = ArpPacket::new();
             arp_reply.hw_type = 0x0001;
@@ -295,14 +388,27 @@ impl L2Stack {
                 creation_time: Instant::now(),
                 ttl: ARP_CACHE_TIME
             };
-            log::debug!("Arp entry added. ip: {} {}", arp_dst_ip, arp_entry);
-            arp_table.insert(arp_dst_ip, arp_entry);
+            log::debug!("Arp entry added. ip: {} {}", arp_src_ip, arp_entry);
+            arp_table.insert(arp_src_ip, arp_entry);
             self.publish_event(L2StackEvent::ArpReceived);
         }
         Ok(())
     }
 }
 
+fn generate_network_addr(ip: Ipv4Addr, netmask: usize) -> Ipv4Addr {
+    let ip_u32: u32 = u32::from_be_bytes(ip.octets());
+    let mask_u32: u32 = 0xffffffff >> netmask;
+
+    Ipv4Addr::from(ip_u32 & mask_u32)
+}
+
+fn generate_broadcast_addr(ip: Ipv4Addr, netmask: usize) -> Ipv4Addr {
+    let ip_u32: u32 = u32::from_be_bytes(ip.octets());
+    let mask_u32: u32 = 0xffffffff >> netmask;
+
+    Ipv4Addr::from(ip_u32 & mask_u32)
+}
 fn is_netmask_range(ip: Ipv4Addr, netmask: usize, target_ip: Ipv4Addr) -> bool {
     let ip_u32: u32 = u32::from_be_bytes(ip.octets());
     let mask_u32: u32 = 0xffffffff >> netmask;

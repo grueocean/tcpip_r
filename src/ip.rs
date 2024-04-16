@@ -20,7 +20,7 @@ const IPv4_HEADER_LENGTH_BASIC: usize = 20;
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                    Options                    |    Padding    |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
+#[derive(Debug)]
 pub struct Ipv4Packet {
     pub version: u8,           // 4 bit
     pub ihl: u8,               // 4 bit
@@ -83,7 +83,7 @@ impl Ipv4Packet {
             self.options = Some(u32::from_be_bytes(packet[20..24].try_into()?));
             self.payload = packet[24..].to_vec();
         } else {
-            return Err(anyhow::anyhow!("Unsupported Ipv4 Header length. length={}", self.length));
+            return Err(anyhow::anyhow!("Unsupported Ipv4 Header length. length={}", self.ihl));
         }
         self.validate()?;
 
