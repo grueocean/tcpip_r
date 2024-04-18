@@ -1,3 +1,6 @@
+use thiserror::Error;
+use std::net::Ipv4Addr;
+
 // https://www.iana.org/assignments/ieee-802-numbers/ieee-802-numbers.xhtml
 #[derive(Debug, PartialEq)]
 pub enum EtherType {
@@ -50,4 +53,13 @@ impl From<Ipv4Type> for u8 {
     fn from(e: Ipv4Type) -> Self {
         e as u8
     }
+}
+
+#[derive(Error, Debug)]
+pub enum L2Error {
+    #[error("Failed to resolve IP {target_ip} after {retries} attempts.")]
+    ResolveError {
+        target_ip: Ipv4Addr,
+        retries: usize,
+    },
 }

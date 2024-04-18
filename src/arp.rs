@@ -1,6 +1,6 @@
 use crate::ethernet::{self, EthernetPacket, EthernetRecveiver, EthernetSender};
-use crate::ip::{Ipv4Packet};
-use crate::types::{EtherType};
+use crate::ip::{Ipv4Packet, Ipv4Config};
+use crate::types::{EtherType, L2Error};
 use anyhow::{Context, Result};
 use eui48::MacAddress;
 use log;
@@ -117,7 +117,7 @@ impl Display for ArpEntry {
 pub struct L2Stack {
     pub interface_name: String,
     pub interface_mac: MacAddress,
-    pub interface_ipv4: (Ipv4Addr, usize, Ipv4Addr, Ipv4Addr), // ip, netmask, net addr, broadcast addr
+    pub interface_ipv4: Ipv4Config, // ip, netmask, net addr, broadcast addr
     pub threads: Mutex<Vec<JoinHandle<()>>>,
     send_channel: Mutex<Sender<Box<[u8]>>>,
     event_condvar: (Mutex<Option<L2StackEvent>>, Condvar),
@@ -126,20 +126,13 @@ pub struct L2Stack {
 }
 
 impl L2Stack {
-    pub fn new(interface_name: String, mac: MacAddress, ip: (Ipv4Addr, usize)) -> Result<Arc<Self>> {
-        let (_, netmask) = ip;
-        if netmask > 33 { return Err(anyhow::anyhow!("Incorrect subnet mask ({}). ", netmask)); }
+    pub fn new(interface_name: String, mac: MacAddress, ip: Ipv4Config) -> Result<Arc<Self>> {
         let (send_channl, recv_channl) = channel();
         let l2 = Arc::new(
             Self {
                 interface_name: interface_name,
                 interface_mac: mac,
-                interface_ipv4: (
-                    ip.0,
-                    ip.1,
-                    generate_network_addr(ip.0, ip.1),
-                    generate_broadcast_addr(ip.0, ip.1)
-                ),
+                interface_ipv4: ip,
                 threads: Mutex::new(Vec::new()),
                 send_channel: Mutex::new(send_channl),
                 event_condvar: (Mutex::new(None), Condvar::new()),
@@ -205,7 +198,7 @@ impl L2Stack {
             }
             let dst_mac = MacAddress::from_bytes(&ethernet_packet.dst)?;
             if dst_mac != self.interface_mac && dst_mac != MacAddress::broadcast() {
-                log::trace!("Discarding packet. Interface mac is {} but packet dst is to {}.", self.interface_mac, dst_mac);
+                log::trace!("Discarding packet. Interface mac is {}, but packet dst is to {}.", self.interface_mac, dst_mac);
                 continue;
             }
             if EtherType::from(ethernet_packet.ethertype) == EtherType::ARP {
@@ -227,14 +220,6 @@ impl L2Stack {
                 // We do not check if the packet is in the correct IPv4 format or if the dst
                 // IP matches the interface IP here; those are handled at the L3 layer.
                 let mut queue = self.receive_queue.lock().unwrap();
-                let mut ipv4_packet = Ipv4Packet::new();
-                match ipv4_packet.read(&ethernet_packet.payload) {
-                    Err(e) => {
-                        log::warn!("Reading ipv4 packet failed. Err: {}", e);
-                        continue;
-                    }
-                    Ok(_) => {}
-                }
                 queue.push_back(ethernet_packet.payload);
                 self.publish_event(L2StackEvent::Ipv4Received);
             }
@@ -335,7 +320,7 @@ impl L2Stack {
         arp_request.proto_size = 0x4;
         arp_request.opcode = 0x0001;
         arp_request.src_mac = self.interface_mac.as_bytes().try_into()?;
-        arp_request.src_ip = self.interface_ipv4.0.octets();
+        arp_request.src_ip = self.interface_ipv4.address.octets();
         arp_request.dst_mac = [0; 6];
         arp_request.dst_ip = target_ip.octets();
         ethernet_packet.payload = arp_request.create_packet()?;
@@ -353,14 +338,14 @@ impl L2Stack {
             count += 1;
         }
 
-        Err(anyhow::anyhow!("Tried {} times, buf failed to resolve IP {}.", ARP_RETRY, target_ip))
+        Err(anyhow::anyhow!(L2Error::ResolveError { target_ip: *target_ip, retries: ARP_RETRY }))
     }
 
     fn arp_handler(&self, ethernet: EthernetPacket, arp: ArpPacket) -> Result<()> {
-        let (ip, netmask, _, _) = self.interface_ipv4;
         let arp_src_ip = Ipv4Addr::from(arp.src_ip);
         let arp_dst_ip = Ipv4Addr::from(arp.dst_ip);
-        if arp.opcode == 0x1 && arp_dst_ip == ip && is_netmask_range(ip, netmask, arp_src_ip) {
+        if arp.opcode == 0x1 && arp_dst_ip == self.interface_ipv4.address &&
+           is_netmask_range(&self.interface_ipv4.address, self.interface_ipv4.netmask, &arp_src_ip) {
             // request to me, from my network.
             let mut arp_reply = ArpPacket::new();
             arp_reply.hw_type = 0x0001;
@@ -369,7 +354,7 @@ impl L2Stack {
             arp_reply.proto_size = 0x04;
             arp_reply.opcode = 0x2;
             arp_reply.src_mac = self.interface_mac.as_bytes().try_into()?;
-            arp_reply.src_ip = ip.octets();
+            arp_reply.src_ip = self.interface_ipv4.address.octets();
             arp_reply.dst_mac = arp.src_mac;
             arp_reply.dst_ip = arp.src_ip;
             let mut ethernet_packet = EthernetPacket::new();
@@ -380,7 +365,7 @@ impl L2Stack {
             log::debug!("Replying to arp request. dst mac: {} dst ip: {}", MacAddress::from_bytes(&arp.src_mac)?, arp_src_ip);
             let send_lock = self.send_channel.lock().unwrap();
             send_lock.send(ethernet_packet.create_packet()?.into_boxed_slice()).context("Failed to send reply arp packet.")?;
-        } else if arp.opcode == 0x2 && is_netmask_range(ip, netmask, arp_dst_ip) {
+        } else if arp.opcode == 0x2 && is_netmask_range(&self.interface_ipv4.address, self.interface_ipv4.netmask, &arp_dst_ip) {
             // reply
             let mut arp_table = self.arp_table.lock().unwrap();
             let arp_entry = ArpEntry {
@@ -396,24 +381,31 @@ impl L2Stack {
     }
 }
 
-fn generate_network_addr(ip: Ipv4Addr, netmask: usize) -> Ipv4Addr {
+fn generate_network_addr(ip: &Ipv4Addr, netmask: usize) -> Ipv4Addr {
+    if netmask == 0 {
+        return Ipv4Addr::new(0, 0, 0, 0);
+    }
     let ip_u32: u32 = u32::from_be_bytes(ip.octets());
-    let mask_u32: u32 = 0xffffffff >> netmask;
+    let mask_u32: u32 = 0xffffffff << (32 - netmask);
 
     Ipv4Addr::from(ip_u32 & mask_u32)
 }
 
-fn generate_broadcast_addr(ip: Ipv4Addr, netmask: usize) -> Ipv4Addr {
+fn generate_broadcast_addr(ip: &Ipv4Addr, netmask: usize) -> Ipv4Addr {
+    if netmask == 0 {
+        return Ipv4Addr::new(255, 255, 255, 255);
+    }
     let ip_u32: u32 = u32::from_be_bytes(ip.octets());
-    let mask_u32: u32 = 0xffffffff >> netmask;
+    let mask_u32: u32 = 0xffffffff << (32 - netmask);
 
-    Ipv4Addr::from(ip_u32 & mask_u32)
+    Ipv4Addr::from(ip_u32 | !mask_u32)
 }
-fn is_netmask_range(ip: Ipv4Addr, netmask: usize, target_ip: Ipv4Addr) -> bool {
-    let ip_u32: u32 = u32::from_be_bytes(ip.octets());
-    let mask_u32: u32 = 0xffffffff >> netmask;
+
+pub fn is_netmask_range(ip: &Ipv4Addr, netmask: usize, target_ip: &Ipv4Addr) -> bool {
+    let network_addr_u32 = u32::from(generate_network_addr(ip, netmask));
+    let broadcast_addr_u32 = u32::from(generate_broadcast_addr(ip, netmask));
     let target_u32: u32 = u32::from_be_bytes(target_ip.octets());
-    if (ip_u32 & mask_u32 <= target_u32) && (target_u32 <= ip_u32 | !mask_u32) {
+    if (network_addr_u32 <= target_u32) && (target_u32 <= broadcast_addr_u32) {
         return true;
     } else {
         return false;
@@ -510,5 +502,48 @@ mod arp_tests {
         let result = packet.read(&packet_data);
 
         assert!(result.is_err(), "Expected an error for incorrect packet length");
+    }
+
+
+    #[rstest]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 24, Ipv4Addr::new(192, 168, 1, 0))]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 16, Ipv4Addr::new(192, 168, 0, 0))]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 8, Ipv4Addr::new(192, 0, 0, 0))]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 0, Ipv4Addr::new(0, 0, 0, 0))]
+    fn test_generate_network_addr(
+        #[case] ip: Ipv4Addr,
+        #[case] netmask: usize,
+        #[case] expected: Ipv4Addr,
+    ) {
+        assert_eq!(generate_network_addr(&ip, netmask), expected);
+    }
+
+    #[rstest]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 24, Ipv4Addr::new(192, 168, 1, 255))]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 16, Ipv4Addr::new(192, 168, 255, 255))]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 8, Ipv4Addr::new(192, 255, 255, 255))]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 0, Ipv4Addr::new(255, 255, 255, 255))]
+    fn test_generate_broadcast_addr(
+        #[case] ip: Ipv4Addr,
+        #[case] netmask: usize,
+        #[case] expected: Ipv4Addr,
+    ) {
+        assert_eq!(generate_broadcast_addr(&ip, netmask), expected);
+    }
+
+    #[rstest]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 24, Ipv4Addr::new(192, 168, 1, 10), true)]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 24, Ipv4Addr::new(192, 168, 2, 1), false)]
+    #[case(Ipv4Addr::new(192, 168, 1, 1), 16, Ipv4Addr::new(192, 168, 255, 255), true)]
+    #[case(Ipv4Addr::new(10, 0, 0, 1), 8, Ipv4Addr::new(10, 255, 255, 255), true)]
+    #[case(Ipv4Addr::new(10, 0, 0, 1), 16, Ipv4Addr::new(11, 0, 0, 1), false)]
+    #[case(Ipv4Addr::new(10, 0, 0, 1), 0, Ipv4Addr::new(8, 8, 8, 8), true)]
+    fn test_is_netmask_range(
+        #[case] ip: Ipv4Addr,
+        #[case] netmask: usize,
+        #[case] target_ip: Ipv4Addr,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_netmask_range(&ip, netmask, &target_ip), expected);
     }
 }

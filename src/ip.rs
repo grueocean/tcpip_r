@@ -1,5 +1,11 @@
+use crate::arp::{L2Stack, is_netmask_range};
 use crate::types::Ipv4Type;
 use anyhow::{Context, Result};
+use eui48::MacAddress;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Condvar, Mutex};
 
 const IPv4_HEADER_LENGTH_BASIC: usize = 20;
 
@@ -166,6 +172,100 @@ impl Ipv4Packet {
     }
 }
 
+pub struct Ipv4Config {
+    pub address: Ipv4Addr,
+    pub netmask: usize,
+    pub broadcast_address: Ipv4Addr,
+    pub network_address: Ipv4Addr
+}
+
+#[derive(Debug, Clone, Eq)]
+pub struct Ipv4Network {
+    address: Ipv4Addr,
+    netmask: usize,
+}
+
+impl PartialEq for Ipv4Network {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address && self.netmask == other.netmask
+    }
+}
+
+impl Hash for Ipv4Network {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.address.hash(state);
+        self.netmask.hash(state);
+    }
+}
+
+#[derive(Clone)]
+pub struct Route {
+    gateway_addr: Ipv4Addr,
+    rank: usize
+}
+
+fn search_route(routes: &HashMap<Ipv4Network, Route>, target_ip: &Ipv4Addr) -> Option<Route> {
+    routes.iter()
+        .filter(|(network, _)| is_netmask_range(&network.address, network.netmask, target_ip))
+        .max_by_key(|(_, route)| route.rank)
+        .map(|(_, route)| route.clone())
+}
+
+pub struct L3Stack {
+    l2stack: Arc<L2Stack>,
+    gateway: HashMap<Ipv4Network, Route>
+}
+
+impl L3Stack {
+    pub fn new(interface_name: String, mac: MacAddress, ip: Ipv4Config, gateway: HashMap<Ipv4Network, Route>) -> Result<Self> {
+        let l3 = Self {
+            l2stack: L2Stack::new(interface_name, mac, ip)?,
+            gateway: gateway
+        };
+
+        Ok(l3)
+    }
+
+    pub fn send(&self, packet: &Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn recv(&self, packet: &mut Vec<u8>) -> Result<usize> {
+        loop {
+            let mut recv_data = Vec::new();
+            match self.l2stack.recv(&mut recv_data) {
+                Err(e) => {
+                    log::warn!("Failed to recv packet from l2 stack. Err {}", e);
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            let mut ipv4_packet = Ipv4Packet::new();
+            match ipv4_packet.read(&recv_data) {
+                Err(e) => {
+                    log::warn!("Reading ipv4 packet failed. Err: {}", e);
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            let dst_addr = Ipv4Addr::from(ipv4_packet.dst_addr);
+            if dst_addr != self.l2stack.interface_ipv4.address &&
+               dst_addr != self.l2stack.interface_ipv4.broadcast_address {
+                log::warn!(
+                    "Discarding packet. Interface ip is {}/{}, but packet dst is to {}.",
+                    self.l2stack.interface_ipv4.address,
+                    self.l2stack.interface_ipv4.netmask,
+                    dst_addr
+                );
+                continue;
+            }
+            *packet = ipv4_packet.payload;
+
+            return Ok(packet.len());
+        }
+    }
+}
+
 #[cfg(test)]
 mod ipv4_tests {
     use super::*;
@@ -321,5 +421,58 @@ mod ipv4_tests {
         let result = packet.read(&packet_data);
 
         assert!(result.is_err(), "Expected an error for incorrect header");
+    }
+
+    #[rstest]
+    #[case(
+        Ipv4Addr::new(192, 168, 1, 104),
+        vec![
+            (Ipv4Network { address: Ipv4Addr::new(192, 168, 1, 0), netmask: 24 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 1), rank: 10 }),
+            (Ipv4Network { address: Ipv4Addr::new(10, 0, 0, 0), netmask: 8 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 2), rank: 5 }),
+            (Ipv4Network { address: Ipv4Addr::new(192, 168, 1, 128), netmask: 25 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 3), rank: 1 }),
+            (Ipv4Network { address: Ipv4Addr::new(0, 0, 0, 0), netmask: 0 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 4), rank: 0 })
+        ],
+        Ipv4Addr::new(192, 168, 1, 1)
+    )]
+    #[case(
+        Ipv4Addr::new(192, 168, 1, 130),
+        vec![
+            (Ipv4Network { address: Ipv4Addr::new(192, 168, 1, 0), netmask: 24 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 1), rank: 1 }),
+            (Ipv4Network { address: Ipv4Addr::new(10, 0, 0, 0), netmask: 8 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 2), rank: 5 }),
+            (Ipv4Network { address: Ipv4Addr::new(192, 168, 1, 128), netmask: 25 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 3), rank: 10 }),
+            (Ipv4Network { address: Ipv4Addr::new(0, 0, 0, 0), netmask: 0 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 4), rank: 0 })
+        ],
+        Ipv4Addr::new(192, 168, 1, 3)
+    )]
+    #[case(
+        Ipv4Addr::new(10, 0, 0, 200),
+        vec![
+            (Ipv4Network { address: Ipv4Addr::new(192, 168, 1, 0), netmask: 24 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 1), rank: 10 }),
+            (Ipv4Network { address: Ipv4Addr::new(10, 0, 0, 0), netmask: 8 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 2), rank: 5 }),
+            (Ipv4Network { address: Ipv4Addr::new(192, 168, 1, 128), netmask: 25 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 3), rank: 1 }),
+            (Ipv4Network { address: Ipv4Addr::new(0, 0, 0, 0), netmask: 0 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 4), rank: 0 })
+        ],
+        Ipv4Addr::new(192, 168, 1, 2)
+    )]
+    #[case(
+        Ipv4Addr::new(8, 8, 8, 8),
+        vec![
+            (Ipv4Network { address: Ipv4Addr::new(192, 168, 1, 0), netmask: 24 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 1), rank: 10 }),
+            (Ipv4Network { address: Ipv4Addr::new(10, 0, 0, 0), netmask: 8 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 2), rank: 5 }),
+            (Ipv4Network { address: Ipv4Addr::new(192, 168, 1, 128), netmask: 25 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 3), rank: 1 }),
+            (Ipv4Network { address: Ipv4Addr::new(0, 0, 0, 0), netmask: 0 }, Route { gateway_addr: Ipv4Addr::new(192, 168, 1, 4), rank: 0 })
+        ],
+        Ipv4Addr::new(192, 168, 1, 4)
+    )]
+    fn test_search_route(
+        #[case] target_ip: Ipv4Addr,
+        #[case] routes_data: Vec<(Ipv4Network, Route)>,
+        #[case] expected_gateway: Ipv4Addr
+    ) {
+        let routes: HashMap<Ipv4Network, Route> = routes_data.into_iter().collect();
+        let result = search_route(&routes, &target_ip);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().gateway_addr, expected_gateway);
     }
 }
