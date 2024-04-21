@@ -4,6 +4,7 @@ mod ethernet;
 mod ip;
 use ip::Ipv4Config;
 mod types;
+mod udp;
 use env_logger;
 use eui48::MacAddress;
 use std::net::Ipv4Addr;
@@ -17,7 +18,7 @@ fn main() {
         broadcast_address: Ipv4Addr::new(172, 20, 10, 255),
         network_address: Ipv4Addr::new(172, 20, 10, 0)
     };
-    let l2 = L2Stack::new("d0".to_string(), mac, ip).unwrap();
+    let l2 = L2Stack::new("d0".to_string(), mac, 1500, ip).unwrap();
     loop {
         let mut buffer = Vec::new();
         let packet = l2.recv(&mut buffer);

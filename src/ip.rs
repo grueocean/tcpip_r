@@ -5,7 +5,7 @@ use eui48::MacAddress;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 const IPv4_HEADER_LENGTH_BASIC: usize = 20;
 
@@ -211,26 +211,40 @@ fn search_route(routes: &HashMap<Ipv4Network, Route>, target_ip: &Ipv4Addr) -> O
         .map(|(_, route)| route.clone())
 }
 
-pub struct L3Stack {
+pub struct L3Interface {
     l2stack: Arc<L2Stack>,
-    gateway: HashMap<Ipv4Network, Route>
+    gateway: HashMap<Ipv4Network, Route>,
+    ipv4_identification: u16
 }
 
-impl L3Stack {
-    pub fn new(interface_name: String, mac: MacAddress, ip: Ipv4Config, gateway: HashMap<Ipv4Network, Route>) -> Result<Self> {
+impl L3Interface {
+    pub fn new(interface_name: String, mac: MacAddress, mtu: usize, ip: Ipv4Config, gateway: HashMap<Ipv4Network, Route>) -> Result<Self> {
         let l3 = Self {
-            l2stack: L2Stack::new(interface_name, mac, ip)?,
-            gateway: gateway
+            l2stack: L2Stack::new(interface_name, mac, mtu, ip)?,
+            gateway: gateway,
+            ipv4_identification: 0,
         };
 
         Ok(l3)
     }
 
-    pub fn send(&self, packet: &Vec<u8>) -> Result<()> {
+    fn generate_identification(&mut self) -> u16 {
+        if self.ipv4_identification == u16::MAX {
+            self.ipv4_identification = 0;
+        } else {
+            self.ipv4_identification += 1;
+        }
+
+        self.ipv4_identification
+    }
+
+    pub fn send(&self, ipv4_packet: &mut Ipv4Packet) -> Result<()> {
+        // protocol should be set by upper layer.
+
         Ok(())
     }
 
-    pub fn recv(&self, packet: &mut Vec<u8>) -> Result<usize> {
+    pub fn recv(&self) -> Result<Ipv4Packet> {
         loop {
             let mut recv_data = Vec::new();
             match self.l2stack.recv(&mut recv_data) {
@@ -259,9 +273,8 @@ impl L3Stack {
                 );
                 continue;
             }
-            *packet = ipv4_packet.payload;
 
-            return Ok(packet.len());
+            return Ok(ipv4_packet);
         }
     }
 }

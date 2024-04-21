@@ -117,6 +117,7 @@ impl Display for ArpEntry {
 pub struct L2Stack {
     pub interface_name: String,
     pub interface_mac: MacAddress,
+    pub interface_mtu: usize,
     pub interface_ipv4: Ipv4Config, // ip, netmask, net addr, broadcast addr
     pub threads: Mutex<Vec<JoinHandle<()>>>,
     send_channel: Mutex<Sender<Box<[u8]>>>,
@@ -126,12 +127,13 @@ pub struct L2Stack {
 }
 
 impl L2Stack {
-    pub fn new(interface_name: String, mac: MacAddress, ip: Ipv4Config) -> Result<Arc<Self>> {
+    pub fn new(interface_name: String, mac: MacAddress, mtu: usize, ip: Ipv4Config) -> Result<Arc<Self>> {
         let (send_channl, recv_channl) = channel();
         let l2 = Arc::new(
             Self {
                 interface_name: interface_name,
                 interface_mac: mac,
+                interface_mtu: mtu,
                 interface_ipv4: ip,
                 threads: Mutex::new(Vec::new()),
                 send_channel: Mutex::new(send_channl),
@@ -226,7 +228,7 @@ impl L2Stack {
         }
     }
 
-    pub fn send(&self, packet: &Vec<u8>) -> Result<()> {
+    pub fn send(&self, packet: &Vec<u8>, dst_mac: Option<MacAddress>) -> Result<()> {
         // Currently, we just assume this is a ipv4 packet.
         let mut ipv4_packet = Ipv4Packet::new();
         let mut ethernet_packet = EthernetPacket::new();
@@ -236,14 +238,13 @@ impl L2Stack {
             }
             Ok(_) => {}
         }
-        let arp_entry = {
-            self.arp_table.lock().unwrap().get(&Ipv4Addr::from(ipv4_packet.dst_addr)).cloned()
-        };
-        if let Some(arp) = arp_entry {
-            ethernet_packet.dst = arp.mac.as_bytes().try_into()?;
+        // If the target IP is outside the L2 network, we must send the packet to the gateway.
+        // However, the gateway info is managed by L3, not L2, so the L3 stack may sometimes
+        // need to specify the destination MAC.
+        if let Some(dst) = dst_mac {
+            ethernet_packet.dst = dst.as_bytes().try_into()?;
         } else {
-            let target_arp_entry = self.resolve_arp(&Ipv4Addr::from(ipv4_packet.dst_addr))?;
-            ethernet_packet.dst = target_arp_entry.mac.as_bytes().try_into()?;
+            ethernet_packet.dst = self.lookup_arp(&Ipv4Addr::from(ipv4_packet.dst_addr))?.as_bytes().try_into()?;
         }
         ethernet_packet.src = self.interface_mac.as_bytes().try_into()?;
         ethernet_packet.ethertype = u16::from(EtherType::IPv4);
@@ -339,6 +340,17 @@ impl L2Stack {
         }
 
         Err(anyhow::anyhow!(L2Error::ResolveError { target_ip: *target_ip, retries: ARP_RETRY }))
+    }
+
+    pub fn lookup_arp(&self, target_ip: &Ipv4Addr) -> Result<MacAddress> {
+        let arp_entry = {
+            self.arp_table.lock().unwrap().get(target_ip).cloned()
+        };
+        if let Some(arp) = arp_entry {
+            return Ok(arp.mac);
+        } else {
+            return Ok(self.resolve_arp(target_ip)?.mac);
+        }
     }
 
     fn arp_handler(&self, ethernet: EthernetPacket, arp: ArpPacket) -> Result<()> {
