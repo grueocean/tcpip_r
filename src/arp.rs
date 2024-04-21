@@ -228,19 +228,10 @@ impl L2Stack {
         }
     }
 
-    pub fn send(&self, packet: &Vec<u8>, dst_mac: Option<MacAddress>) -> Result<()> {
-        // Currently, we just assume this is a ipv4 packet.
-        let mut ipv4_packet = Ipv4Packet::new();
+    pub fn send(&self, mut ipv4_packet: Ipv4Packet, dst_mac: Option<MacAddress>) -> Result<()> {
         let mut ethernet_packet = EthernetPacket::new();
-        match ipv4_packet.read(packet) {
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to read ipv4 packet while sending it in L2 layer. Err: {}", e));
-            }
-            Ok(_) => {}
-        }
-        // If the target IP is outside the L2 network, we must send the packet to the gateway.
-        // However, the gateway info is managed by L3, not L2, so the L3 stack may sometimes
-        // need to specify the destination MAC.
+        // Currently we resolve ip from L3 that L2 is unaware of gateway info.
+        // But L2Stack itself also cat resolve ip within local network.
         if let Some(dst) = dst_mac {
             ethernet_packet.dst = dst.as_bytes().try_into()?;
         } else {
@@ -339,7 +330,7 @@ impl L2Stack {
             count += 1;
         }
 
-        Err(anyhow::anyhow!(L2Error::ResolveError { target_ip: *target_ip, retries: ARP_RETRY }))
+        Err(L2Error::ResolveError { target_ip: *target_ip, retries: ARP_RETRY }.into())
     }
 
     pub fn lookup_arp(&self, target_ip: &Ipv4Addr) -> Result<MacAddress> {
@@ -358,7 +349,7 @@ impl L2Stack {
         let arp_dst_ip = Ipv4Addr::from(arp.dst_ip);
         if arp.opcode == 0x1 && arp_dst_ip == self.interface_ipv4.address &&
            is_netmask_range(&self.interface_ipv4.address, self.interface_ipv4.netmask, &arp_src_ip) {
-            // request to me, from my network.
+            // request to me, from local network.
             let mut arp_reply = ArpPacket::new();
             arp_reply.hw_type = 0x0001;
             arp_reply.proto_type = 0x0800;

@@ -63,3 +63,21 @@ pub enum L2Error {
         retries: usize,
     },
 }
+
+#[derive(Error, Debug)]
+pub enum L3Error {
+    #[error("Cannot send packet to netowrk address {target_ip}. l2Stack netwrok is {l2_ip}/{l2_netmask}.")]
+    AddressError {
+        target_ip: Ipv4Addr,
+        l2_ip: Ipv4Addr,
+        l2_netmask: usize
+    },
+    #[error("Destination {target_ip} within local network is unreachable.")]
+    LocalUnreachableError {
+        target_ip: Ipv4Addr
+    },
+    #[error("Gateway {target_ip} is unreachable.")]
+    GatewayUnreachableError {
+        target_ip: Ipv4Addr
+    },
+}

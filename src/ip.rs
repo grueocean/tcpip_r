@@ -1,5 +1,5 @@
 use crate::arp::{L2Stack, is_netmask_range};
-use crate::types::Ipv4Type;
+use crate::types::{Ipv4Type, L2Error, L3Error};
 use anyhow::{Context, Result};
 use eui48::MacAddress;
 use std::collections::{HashMap, VecDeque};
@@ -214,32 +214,107 @@ fn search_route(routes: &HashMap<Ipv4Network, Route>, target_ip: &Ipv4Addr) -> O
 pub struct L3Interface {
     l2stack: Arc<L2Stack>,
     gateway: HashMap<Ipv4Network, Route>,
-    ipv4_identification: u16
+    ipv4_identification: Mutex<u16>
 }
 
 impl L3Interface {
-    pub fn new(interface_name: String, mac: MacAddress, mtu: usize, ip: Ipv4Config, gateway: HashMap<Ipv4Network, Route>) -> Result<Self> {
-        let l3 = Self {
+    pub fn new(interface_name: String, mac: MacAddress, mtu: usize, ip: Ipv4Config, gateway: HashMap<Ipv4Network, Route>) -> Result<Arc<Self>> {
+        let l3 = Arc::new(Self {
             l2stack: L2Stack::new(interface_name, mac, mtu, ip)?,
             gateway: gateway,
-            ipv4_identification: 0,
-        };
+            ipv4_identification: Mutex::new(0),
+        });
 
         Ok(l3)
     }
 
-    fn generate_identification(&mut self) -> u16 {
-        if self.ipv4_identification == u16::MAX {
-            self.ipv4_identification = 0;
+    fn generate_identification(&self) -> u16 {
+        let mut id = self.ipv4_identification.lock().unwrap();
+        if *id == u16::MAX {
+            *id = 0;
         } else {
-            self.ipv4_identification += 1;
+            *id += 1;
         }
 
-        self.ipv4_identification
+        *id
     }
 
-    pub fn send(&self, ipv4_packet: &mut Ipv4Packet) -> Result<()> {
-        // protocol should be set by upper layer.
+    fn resolve_ip(&self, ip: &Ipv4Addr) -> Result<Option<MacAddress>> {
+        // reject packet to network addr
+        if ip == &self.l2stack.interface_ipv4.network_address {
+            return Err(anyhow::anyhow!(
+                L3Error::AddressError {
+                    target_ip: *ip,
+                    l2_ip: self.l2stack.interface_ipv4.address,
+                    l2_netmask: self.l2stack.interface_ipv4.netmask
+                }
+            ));
+        // set broadcast mac addr if dst is broadcast ip addr
+        } else if ip == &self.l2stack.interface_ipv4.broadcast_address {
+            return Ok(Some(MacAddress::broadcast()));
+        // lookup gateway mac addr if dst is not whitin local network
+        } else if !is_netmask_range(
+            &self.l2stack.interface_ipv4.address,
+            self.l2stack.interface_ipv4.netmask,
+            ip
+        ) {
+            if let Some(gateway) = search_route(&self.gateway, ip) {
+                match self.l2stack.lookup_arp(&gateway.gateway_addr) {
+                    Ok(mac) => { return Ok(Some(mac)); }
+                    Err(e) => {
+                        if let Some(L2Error::ResolveError {target_ip: _, retries: _}) = e.downcast_ref::<L2Error>() {
+                            log::warn!("Cannot resolve gateway addr {}.", gateway.gateway_addr);
+                            return Err(L3Error::GatewayUnreachableError { target_ip: gateway.gateway_addr }.into());
+                        } else {
+                            return Err(anyhow::anyhow!("Lookup gateway addr {} failed unexpectedly. Err: {}", gateway.gateway_addr, e));
+                        }
+                    }
+                }
+            } else {
+                return Err(
+                    anyhow::anyhow!(
+                        "No available gateway. dst ip is {} and l2Stack is {}/{}.",
+                        *ip,
+                        self.l2stack.interface_ipv4.address,
+                        self.l2stack.interface_ipv4.netmask
+                    )
+                );
+            }
+        // lookup dst mac addr directly that it is whitin local network
+        } else {
+            match self.l2stack.lookup_arp(ip) {
+                Ok(mac) => { return Ok(Some(mac)); }
+                Err(e) => {
+                    if let Some(L2Error::ResolveError {target_ip: _, retries: _}) = e.downcast_ref::<L2Error>() {
+                        log::warn!("Cannot resolve local addr {}.", ip);
+                        return Err(L3Error::LocalUnreachableError { target_ip: *ip }.into());
+                    } else {
+                        return Err(anyhow::anyhow!("Lookup local addr {} failed unexpectedly. Err: {}", *ip, e));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn send(&self, mut ipv4_packet: Ipv4Packet) -> Result<()> {
+        // protocol and dst_addr must be set by upper layer.
+        ipv4_packet.version = 4;
+        ipv4_packet.ihl = 5;
+        ipv4_packet.type_of_service = 0;
+        ipv4_packet.length = (ipv4_packet.payload.len() + (ipv4_packet.ihl * 4) as usize) as u16;
+        ipv4_packet.identification = self.generate_identification();
+        ipv4_packet.flags = 0;
+        ipv4_packet.frag_offset = 0;
+        ipv4_packet.ttl = 0xff;
+        ipv4_packet.src_addr = self.l2stack.interface_ipv4.address.octets();
+        let dst_ip = Ipv4Addr::from(ipv4_packet.dst_addr);
+        let dst_mac = self.resolve_ip(&dst_ip)?;
+        ipv4_packet.calc_header_checksum_and_set();
+        if ipv4_packet.validate()? {
+            self.l2stack.send(ipv4_packet, dst_mac)?;
+        } else {
+            return Err(anyhow::anyhow!("Failed to send ipv4 packet is invalid."));
+        }
 
         Ok(())
     }
