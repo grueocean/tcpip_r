@@ -29,12 +29,13 @@ impl From<EtherType> for u16 {
 }
 
 // https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Ipv4Type {
     // 8 bit
     ICMP = 0x1,
     TCP = 0x6,
     UDP = 0x11,
+    Reserved = 0xff,
     Unknown
 }
 
@@ -44,6 +45,7 @@ impl From<u8> for Ipv4Type {
             v if v == Ipv4Type::ICMP as u8 => Ipv4Type::ICMP,
             v if v == Ipv4Type::TCP as u8 => Ipv4Type::TCP,
             v if v == Ipv4Type::UDP as u8 => Ipv4Type::UDP,
+            v if v == Ipv4Type::Reserved as u8 => Ipv4Type::Reserved,
             _ => Ipv4Type::Unknown
         }
     }

@@ -3,9 +3,12 @@ use crate::types::{Ipv4Type, L2Error, L3Error};
 use anyhow::{Context, Result};
 use eui48::MacAddress;
 use std::collections::{HashMap, VecDeque};
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::thread::{self, JoinHandle};
 
 const IPv4_HEADER_LENGTH_BASIC: usize = 20;
 
@@ -218,7 +221,13 @@ pub struct L3Interface {
 }
 
 impl L3Interface {
-    pub fn new(interface_name: String, mac: MacAddress, mtu: usize, ip: Ipv4Config, gateway: HashMap<Ipv4Network, Route>) -> Result<Arc<Self>> {
+    pub fn new(
+        interface_name: String,
+        mac: MacAddress,
+        mtu: usize,
+        ip: Ipv4Config,
+        gateway: HashMap<Ipv4Network, Route>
+    ) -> Result<Arc<Self>> {
         let l3 = Arc::new(Self {
             l2stack: L2Stack::new(interface_name, mac, mtu, ip)?,
             gateway: gateway,
@@ -324,7 +333,7 @@ impl L3Interface {
             let mut recv_data = Vec::new();
             match self.l2stack.recv(&mut recv_data) {
                 Err(e) => {
-                    log::warn!("Failed to recv packet from l2 stack. Err {}", e);
+                    log::warn!("Failed to recv packet from l2 stack. Err: {}", e);
                     continue;
                 }
                 Ok(_) => {}
@@ -350,6 +359,95 @@ impl L3Interface {
             }
 
             return Ok(ipv4_packet);
+        }
+    }
+}
+
+pub struct L3Stack {
+    l3interface: Arc<L3Interface>,
+    l4_receive_channels: Mutex<HashMap<Ipv4Type, Sender<(u8, Box<[u8]>)>>>,
+    threads: Mutex<Vec<JoinHandle<()>>>
+}
+
+impl L3Stack {
+    pub fn new(
+        interface_name: String,
+        mac: MacAddress,
+        mtu: usize,
+        ip: Ipv4Config,
+        gateway: HashMap<Ipv4Network, Route>
+    ) -> Result<Arc<Self>> {
+        let l3stack = Arc::new(
+            Self {
+                l3interface: L3Interface::new(interface_name, mac, mtu, ip, gateway)?,
+                l4_receive_channels: Mutex::new(HashMap::new()),
+                threads: Mutex::new(Vec::new())
+            }
+        );
+
+        let l3stack_recv = l3stack.clone();
+        let handle_recv = thread::spawn(move || {
+            l3stack_recv.receive_thread().unwrap();
+        });
+        l3stack.threads.lock().unwrap().push(handle_recv);
+
+        Ok(l3stack)
+    }
+
+    pub fn register_protocol(&self, proto: u8, l4_recv_channel: Sender<(u8, Box<[u8]>)>) -> Result<()> {
+        let mut recv_channels = self.l4_receive_channels.lock().unwrap();
+        let proto_type = Ipv4Type::from(proto);
+        match recv_channels.entry(proto_type) {
+            Occupied(_) => { Err(anyhow::anyhow!("Cannot register proto {:?} ({}) to L3Stack because it's already registered.", proto_type, proto)) }
+            Vacant(e) => {
+                e.insert(l4_recv_channel);
+                Ok(())
+            }
+        }
+    }
+
+    fn receive_thread(&self) -> Result<()> {
+        loop {
+            let mut ipv4_packet = Ipv4Packet::new();
+            match self.l3interface.recv() {
+                Err(e) => {
+                    log::warn!("Failed to recv packet from L3Interface. Err: {}", e);
+                }
+                Ok(packet) => {
+                    ipv4_packet = packet;
+                }
+            }
+            let proto = Ipv4Type::from(ipv4_packet.protocol);
+            let mut channels = self.l4_receive_channels.lock().unwrap();
+            // RAW stack using Ipv4Type::Reserved will recieve all protocol packet.
+            match channels.entry(Ipv4Type::Reserved) {
+                Occupied(e) => {
+                    match e.get().send((ipv4_packet.protocol, ipv4_packet.payload.into_boxed_slice())) {
+                        Err(e) => {
+                            log::error!("Failed to send packet to RAW stack. Err: {}", e);
+                            continue;
+                        }
+                        Ok(_) => {}
+                    }
+                    continue;
+                }
+                Vacant(_) => {}
+            }
+            if proto != Ipv4Type::Unknown {
+                match channels.entry(proto) {
+                    Occupied(e) => {
+                        match e.get().send((ipv4_packet.protocol, ipv4_packet.payload.into_boxed_slice())) {
+                            Err(e) => {
+                                log::error!("Failed to send packet to {:?} stack. Err: {}", proto, e);
+                                continue;
+                            }
+                            Ok(_) => {}
+                        }
+                        continue;
+                    }
+                    Vacant(_) => {}
+                }
+            }
         }
     }
 }

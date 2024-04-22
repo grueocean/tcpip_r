@@ -231,7 +231,7 @@ impl L2Stack {
     pub fn send(&self, mut ipv4_packet: Ipv4Packet, dst_mac: Option<MacAddress>) -> Result<()> {
         let mut ethernet_packet = EthernetPacket::new();
         // Currently we resolve ip from L3 that L2 is unaware of gateway info.
-        // But L2Stack itself also cat resolve ip within local network.
+        // But L2Stack itself is also able to resolve ip within local network.
         if let Some(dst) = dst_mac {
             ethernet_packet.dst = dst.as_bytes().try_into()?;
         } else {
