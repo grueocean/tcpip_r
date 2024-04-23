@@ -229,6 +229,18 @@ impl L2Stack {
     }
 
     pub fn send(&self, mut ipv4_packet: Ipv4Packet, dst_mac: Option<MacAddress>) -> Result<()> {
+        let dst_ip_addr = Ipv4Addr::from(ipv4_packet.dst_addr);
+        if dst_mac == None && !is_netmask_range(
+            &self.interface_ipv4.address,
+            self.interface_ipv4.netmask,
+            &dst_ip_addr
+        ) {
+            log::error!(
+                "L3 stack don't specify gateway mac addr while packet dst ({}) is out of local netwrok {}/{}.",
+                dst_ip_addr, self.interface_ipv4.address, self.interface_ipv4.netmask
+            );
+            return Err(L2Error::NoGatewayError { target_ip: dst_ip_addr, l2_ip: self.interface_ipv4.address, l2_netmask: self.interface_ipv4.netmask }.into());
+        }
         let mut ethernet_packet = EthernetPacket::new();
         // Currently we resolve ip from L3 that L2 is unaware of gateway info.
         // But L2Stack itself is also able to resolve ip within local network.

@@ -12,6 +12,8 @@ use std::thread::{self, JoinHandle};
 
 const IPv4_HEADER_LENGTH_BASIC: usize = 20;
 
+static L3STACK_GLOBAL: OnceLock<L3Stack> = OnceLock::new();
+
 // https://datatracker.ietf.org/doc/html/rfc791
 //
 // 0                   1                   2                   3
@@ -50,7 +52,7 @@ pub struct Ipv4Packet {
 
 impl Ipv4Packet {
     pub fn new() -> Self {
-        Ipv4Packet {
+        Self {
             version: 0,
             ihl: 0,
             type_of_service: 0,
@@ -138,7 +140,7 @@ impl Ipv4Packet {
         }
         let expected_checksum = self.calc_header_checksum();
         if self.header_checksum != expected_checksum && self.header_checksum != 0x0 {
-            log::debug!("Unexpected ip header. header checksum is 0x{:x} but is expected 0x{:x}.", self.header_checksum, expected_checksum);
+            log::debug!("Unexpected ip header. Header checksum is 0x{:x} but is expected 0x{:x}.", self.header_checksum, expected_checksum);
             self.valid = false;
             return Err(anyhow::anyhow!("IP Header has bad checksum 0x{:x}, expected 0x{:x}.", self.header_checksum, expected_checksum));
         }
@@ -201,6 +203,14 @@ impl Hash for Ipv4Network {
     }
 }
 
+pub struct NetworkConfiguration {
+    interface_name: String,
+    mac: MacAddress,
+    mtu: usize,
+    ip: Ipv4Config,
+    gateway: HashMap<Ipv4Network, Route>
+}
+
 #[derive(Clone)]
 pub struct Route {
     gateway_addr: Ipv4Addr,
@@ -239,11 +249,7 @@ impl L3Interface {
 
     fn generate_identification(&self) -> u16 {
         let mut id = self.ipv4_identification.lock().unwrap();
-        if *id == u16::MAX {
-            *id = 0;
-        } else {
-            *id += 1;
-        }
+        *id = id.wrapping_add(1);
 
         *id
     }
@@ -322,7 +328,7 @@ impl L3Interface {
         if ipv4_packet.validate()? {
             self.l2stack.send(ipv4_packet, dst_mac)?;
         } else {
-            return Err(anyhow::anyhow!("Failed to send ipv4 packet is invalid."));
+            return Err(anyhow::anyhow!("Failed to send ipv4 packet because it is invalid."));
         }
 
         Ok(())
@@ -365,21 +371,21 @@ impl L3Interface {
 
 pub struct L3Stack {
     l3interface: Arc<L3Interface>,
-    l4_receive_channels: Mutex<HashMap<Ipv4Type, Sender<(u8, Box<[u8]>)>>>,
+    l4_receive_channels: Mutex<HashMap<Ipv4Type, Sender<Ipv4Packet>>>,
     threads: Mutex<Vec<JoinHandle<()>>>
 }
 
 impl L3Stack {
-    pub fn new(
-        interface_name: String,
-        mac: MacAddress,
-        mtu: usize,
-        ip: Ipv4Config,
-        gateway: HashMap<Ipv4Network, Route>
-    ) -> Result<Arc<Self>> {
+    pub fn new(config: NetworkConfiguration) -> Result<Arc<Self>> {
         let l3stack = Arc::new(
             Self {
-                l3interface: L3Interface::new(interface_name, mac, mtu, ip, gateway)?,
+                l3interface: L3Interface::new(
+                    config.interface_name,
+                    config.mac,
+                    config.mtu,
+                    config.ip,
+                    config.gateway
+                )?,
                 l4_receive_channels: Mutex::new(HashMap::new()),
                 threads: Mutex::new(Vec::new())
             }
@@ -394,7 +400,7 @@ impl L3Stack {
         Ok(l3stack)
     }
 
-    pub fn register_protocol(&self, proto: u8, l4_recv_channel: Sender<(u8, Box<[u8]>)>) -> Result<()> {
+    pub fn register_protocol(&self, proto: u8, l4_recv_channel: Sender<Ipv4Packet>) -> Result<()> {
         let mut recv_channels = self.l4_receive_channels.lock().unwrap();
         let proto_type = Ipv4Type::from(proto);
         match recv_channels.entry(proto_type) {
@@ -422,7 +428,7 @@ impl L3Stack {
             // RAW stack using Ipv4Type::Reserved will recieve all protocol packet.
             match channels.entry(Ipv4Type::Reserved) {
                 Occupied(e) => {
-                    match e.get().send((ipv4_packet.protocol, ipv4_packet.payload.into_boxed_slice())) {
+                    match e.get().send(ipv4_packet) {
                         Err(e) => {
                             log::error!("Failed to send packet to RAW stack. Err: {}", e);
                             continue;
@@ -436,7 +442,7 @@ impl L3Stack {
             if proto != Ipv4Type::Unknown {
                 match channels.entry(proto) {
                     Occupied(e) => {
-                        match e.get().send((ipv4_packet.protocol, ipv4_packet.payload.into_boxed_slice())) {
+                        match e.get().send(ipv4_packet) {
                             Err(e) => {
                                 log::error!("Failed to send packet to {:?} stack. Err: {}", proto, e);
                                 continue;

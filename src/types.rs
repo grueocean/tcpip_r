@@ -64,6 +64,12 @@ pub enum L2Error {
         target_ip: Ipv4Addr,
         retries: usize,
     },
+    #[error("No gateway address specified. Packet dst is {target_ip} out of l2 network range which is {l2_ip}/{l2_netmask}.")]
+    NoGatewayError {
+        target_ip: Ipv4Addr,
+        l2_ip: Ipv4Addr,
+        l2_netmask: usize
+    },
 }
 
 #[derive(Error, Debug)]
