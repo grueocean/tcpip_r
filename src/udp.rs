@@ -235,6 +235,8 @@ mod udp_tests {
     #[rstest]
     // too short packet, omit 1 byte from checksum
     #[case("4500003cfe5e4000401153eeac136f760ad9c20194e7003500286c")]
+    // bad udp checksum
+    #[case("4500003cfe5e4000401153eeac136f760ad9c20194e7003500286c038650012000010000000000000378787806676f6f676c6503636f6d0000010002")]
     fn test_udp_packet_read_error(
         #[case] encoded_packet: &str,
     ) {
