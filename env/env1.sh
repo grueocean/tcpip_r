@@ -8,7 +8,7 @@
 #      |------|            |   |            |--------|
 #                     l2-0 |   | l2-2
 #                        |-------|
-#                        | l2sw0 |
+#                        | l2sw0 | <- Bridge
 #                        |-------|
 #                     l2-1 |   | l2-3
 #      |------|            |   |            |--------|
@@ -57,6 +57,12 @@ create() {
     ip link set l2-2 up
     ip link set l2-3 up
     ip link set l2sw0 up
+
+    # disable checksum offload
+    ip netns exec Dev0 ethtool -K d0 rx off tx off
+    ip netns exec Dev1 ethtool -K d1 rx off tx off
+    ip netns exec Tcpip0 ethtool -K p0 rx off tx off
+    ip netns exec Tcpip1 ethtool -K p1 rx off tx off
 }
 
 delete() {

@@ -128,7 +128,7 @@ pub struct L2Stack {
 
 impl L2Stack {
     pub fn new(interface_name: String, mac: MacAddress, mtu: usize, ip: Ipv4Config) -> Result<Arc<Self>> {
-        let (send_channl, recv_channl) = channel();
+        let (send_channel, recv_channel) = channel();
         let l2 = Arc::new(
             Self {
                 interface_name: interface_name,
@@ -136,7 +136,7 @@ impl L2Stack {
                 interface_mtu: mtu,
                 interface_ipv4: ip,
                 threads: Mutex::new(Vec::new()),
-                send_channel: Mutex::new(send_channl),
+                send_channel: Mutex::new(send_channel),
                 event_condvar: (Mutex::new(None), Condvar::new()),
                 receive_queue: Mutex::new(VecDeque::new()),
                 arp_table: Mutex::new(HashMap::new())
@@ -144,7 +144,7 @@ impl L2Stack {
         );
         let l2_send = l2.clone();
         let handle_send = thread::spawn(move || {
-            l2_send.send_thread(recv_channl).unwrap();
+            l2_send.send_thread(recv_channel).unwrap();
         });
         l2.threads.lock().unwrap().push(handle_send);
 
@@ -189,7 +189,7 @@ impl L2Stack {
         let mut iface_recv = EthernetRecveiver::new(&self.interface_name)?;
         loop {
             let packet = iface_recv.recv_packet()?;
-            log::trace!("Packet Recieved: {:x?}", packet);
+            log::trace!("Packet Received: {:x?}", packet);
             let mut ethernet_packet = EthernetPacket::new();
             match ethernet_packet.read(&packet) {
                 Err(e) => {
@@ -287,7 +287,7 @@ impl L2Stack {
         let (lock, condvar) = &self.event_condvar;
         let start_time = Instant::now();
         let mut event = lock.lock().unwrap();
-            loop {
+        loop {
             if let Some(ref e) = *event {
                 if *e == wait_event { return true; }
             }

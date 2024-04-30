@@ -12,7 +12,11 @@ use std::thread::{self, JoinHandle};
 
 const IPv4_HEADER_LENGTH_BASIC: usize = 20;
 
-static L3STACK_GLOBAL: OnceLock<L3Stack> = OnceLock::new();
+static L3STACK_GLOBAL: OnceLock<Arc<L3Stack>> = OnceLock::new();
+
+pub fn get_global_l3stack(config: NetworkConfiguration) -> Result<&'static Arc<L3Stack>> {
+    Ok(L3STACK_GLOBAL.get_or_init(|| L3Stack::new(config).unwrap()))
+}
 
 // https://datatracker.ietf.org/doc/html/rfc791
 //
@@ -177,6 +181,7 @@ impl Ipv4Packet {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Ipv4Config {
     pub address: Ipv4Addr,
     pub netmask: usize,
@@ -186,8 +191,8 @@ pub struct Ipv4Config {
 
 #[derive(Debug, Clone, Eq)]
 pub struct Ipv4Network {
-    address: Ipv4Addr,
-    netmask: usize,
+    pub address: Ipv4Addr,
+    pub netmask: usize,
 }
 
 impl PartialEq for Ipv4Network {
@@ -203,18 +208,19 @@ impl Hash for Ipv4Network {
     }
 }
 
+#[derive(Clone)]
 pub struct NetworkConfiguration {
-    interface_name: String,
-    mac: MacAddress,
-    mtu: usize,
-    ip: Ipv4Config,
-    gateway: HashMap<Ipv4Network, Route>
+    pub interface_name: String,
+    pub mac: MacAddress,
+    pub mtu: usize,
+    pub ip: Ipv4Config,
+    pub gateway: HashMap<Ipv4Network, Route>
 }
 
 #[derive(Clone)]
 pub struct Route {
-    gateway_addr: Ipv4Addr,
-    rank: usize
+    pub gateway_addr: Ipv4Addr,
+    pub rank: usize
 }
 
 fn search_route(routes: &HashMap<Ipv4Network, Route>, target_ip: &Ipv4Addr) -> Option<Route> {
@@ -370,7 +376,7 @@ impl L3Interface {
 }
 
 pub struct L3Stack {
-    l3interface: Arc<L3Interface>,
+    pub l3interface: Arc<L3Interface>,
     l4_receive_channels: Mutex<HashMap<Ipv4Type, Sender<Ipv4Packet>>>,
     threads: Mutex<Vec<JoinHandle<()>>>
 }
