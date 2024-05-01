@@ -2,10 +2,11 @@ use crate::ip::{Ipv4Packet, NetworkConfiguration, L3Stack, get_global_l3stack};
 use crate::types::{Ipv4Type};
 use crate::udp;
 use anyhow::{Context, Result};
-use pnet::packet::udp::Udp;
 use std::collections::{HashMap, VecDeque};
-use std::net::Ipv4Addr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::cmp::min;
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
+use std::ops::Range;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::mpsc::{channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -13,6 +14,15 @@ use std::time::{Duration, Instant};
 const UDP_HEADER_LENGTH: usize = 8;
 const UDP_MAX_SOCKET: usize = 10;
 const UDP_MAX_PACKET_PER_QUEUE: usize = 1024;
+// https://datatracker.ietf.org/doc/html/rfc6335
+// the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)
+const UDP_EPHEMERAL_PORT_RANGE: Range<u16> = 49152..65535;
+
+static UDPSTACK_GLOBAL: OnceLock<Arc<UdpStack>> = OnceLock::new();
+
+pub fn get_global_udpstack(config: NetworkConfiguration) -> Result<&'static Arc<UdpStack>> {
+    Ok(UDPSTACK_GLOBAL.get_or_init(|| UdpStack::new(config).unwrap()))
+}
 
 // https://datatracker.ietf.org/doc/html/rfc768
 //
@@ -42,7 +52,7 @@ const UDP_MAX_PACKET_PER_QUEUE: usize = 1024;
 //     pseudo header for checksum calc
 //
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UdpPacket {
     pub src_addr: [u8; 4],  // pesudo header
     pub dst_addr: [u8; 4],  // pesudo header
@@ -184,7 +194,6 @@ struct UdpEvent {
 
 pub struct UdpStack {
     pub config: NetworkConfiguration,
-    pub available_socket_id: Mutex<VecDeque<usize>>,
     pub sockets: Mutex<HashMap<usize, Option<UdpNetworkInfo>>>,
     pub receive_queue: Mutex<HashMap<usize, VecDeque<UdpPacket>>>,
     pub threads: Mutex<Vec<JoinHandle<()>>>,
@@ -195,7 +204,6 @@ impl UdpStack {
     pub fn new(config: NetworkConfiguration) -> Result<Arc<Self>> {
         let udp = Arc::new(Self {
             config: config,
-            available_socket_id: Mutex::new(VecDeque::from((1..=UDP_MAX_SOCKET).collect::<Vec<_>>())),
             sockets: Mutex::new(HashMap::new()),
             receive_queue: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
@@ -214,30 +222,28 @@ impl UdpStack {
     pub fn send(&self, socket_id: usize, network_info: Option<UdpNetworkInfo>, payload: Vec<u8>) -> Result<()> {
         let mut ipv4_packet = Ipv4Packet::new();
         let mut udp_packet = UdpPacket::new();
+        // using send_to (specify dst)
         if let Some(UdpNetworkInfo {
-            local_addr,
-            remote_addr: Some(remote_addr),
-            local_port,
-            remote_port: Some(remote_port)
+            local,
+            remote: Some(remote)
         }) = network_info {
-            udp_packet.src_addr = local_addr.octets();
-            udp_packet.local_port = local_port;
-            udp_packet.dst_addr = remote_addr.octets();
-            udp_packet.remote_port = remote_port;
-            ipv4_packet.dst_addr = remote_addr.octets();
+            udp_packet.src_addr = local.ip().octets();
+            udp_packet.local_port = local.port();
+            udp_packet.dst_addr = remote.ip().octets();
+            udp_packet.remote_port = remote.port();
+            ipv4_packet.dst_addr = remote.ip().octets();
+        // using send (dst is already set to socket.)
         } else {
             let sockets = self.sockets.lock().unwrap();
             if let Some(Some(UdpNetworkInfo {
-                local_addr,
-                remote_addr: Some(remote_addr),
-                local_port,
-                remote_port: Some(remote_port)
+                local,
+                remote: Some(remote)
             })) = sockets.get(&socket_id) {
-                udp_packet.src_addr = local_addr.octets();
-                udp_packet.local_port = *local_port;
-                udp_packet.dst_addr = remote_addr.octets();
-                udp_packet.remote_port = *remote_port;
-                ipv4_packet.dst_addr = remote_addr.octets();
+                udp_packet.src_addr = local.ip().octets();
+                udp_packet.local_port = local.port();
+                udp_packet.dst_addr = remote.ip().octets();
+                udp_packet.remote_port = remote.port();
+                ipv4_packet.dst_addr = remote.ip().octets();
             } else {
                 return Err(anyhow::anyhow!("Failed to send UDP packet. Specify correct dst info or connect socket."));
             }
@@ -256,13 +262,14 @@ impl UdpStack {
         Ok(())
     }
 
-    pub fn recv(&self, socket_id: usize) -> Result<(UdpNetworkInfo, Vec<u8>)> {
+    pub fn recv(&self, socket_id: usize) -> Result<(SocketAddrV4, Vec<u8>)> {
         loop {
             let sockets = self.sockets.lock().unwrap();
             let mut queue = self.receive_queue.lock().unwrap();
             if let (Some(socket_queue), Some(Some(socket))) = (queue.get_mut(&socket_id), sockets.get(&socket_id)) {
                 if let Some(packet) = socket_queue.pop_front() {
-                    return Ok((*socket, packet.payload));
+                    let src = SocketAddrV4::new(Ipv4Addr::from(packet.src_addr), packet.local_port);
+                    return Ok((src, packet.payload));
                 }
             }
             let event = UdpEvent {
@@ -277,31 +284,87 @@ impl UdpStack {
         }
     }
 
-    pub fn bind(&self, socket_id: usize, network_info: UdpNetworkInfo) -> Result<()> {
+    pub fn bind(&self, socket_id: usize, mut network_info: UdpNetworkInfo) -> Result<UdpNetworkInfo> {
         let mut sockets = self.sockets.lock().unwrap();
-        sockets.insert(socket_id, Some(network_info));
+        let used_ports: Vec<u16> = sockets.values()
+            .filter_map(|info| info.as_ref().map(|i| i.local.port()))
+            .collect();
+        if network_info.local.port() == 0 {
+            // assign ephemeral port
+            for port in UDP_EPHEMERAL_PORT_RANGE {
+                if !used_ports.contains(&port) {
+                    network_info.local.set_port(port);
+                    sockets.insert(socket_id, Some(network_info));
+                    self.update_queue(socket_id, network_info)?;
+                    return Ok(network_info);
+                }
+            }
+            anyhow::bail!("Failed to bind socket. No available ephemeral port.");
+        } else {
+            // verify if specified port is already used
+            if used_ports.contains(&network_info.local.port()) {
+                anyhow::bail!("Failed to bind socket. Port {} is already used.", network_info.local.port())
+            } else {
+                sockets.insert(socket_id, Some(network_info));
+                self.update_queue(socket_id, network_info)?;
+                Ok(network_info)
+            }
+        }
+    }
+
+    // Should hold lock of sockets while executing.
+    fn update_queue(&self, socket_id: usize, network_info: UdpNetworkInfo) -> Result<()> {
+        let mut receive_queue = self.receive_queue.lock().unwrap();
+        if let Some(queue) = receive_queue.get_mut(&socket_id) {
+            if let UdpNetworkInfo { local, remote: None} =  network_info {
+                let filtered: VecDeque<UdpPacket> = queue.iter()
+                    .filter(|udp_packet|
+                        udp_packet.dst_addr == local.ip().octets() &&
+                        udp_packet.remote_port == local.port()
+                    )
+                    .cloned()
+                    .collect();
+                *queue = filtered;
+                return Ok(());
+            }
+            if let UdpNetworkInfo { local, remote: Some(remote)} =  network_info {
+                let filtered: VecDeque<UdpPacket> = queue.iter()
+                    .filter(|udp_packet|
+                        udp_packet.dst_addr == local.ip().octets() &&
+                        udp_packet.remote_port == local.port() &&
+                        udp_packet.src_addr == remote.ip().octets() &&
+                        udp_packet.remote_port == remote.port()
+                    )
+                    .cloned()
+                    .collect();
+                *queue = filtered;
+                return Ok(());
+            }
+        }
 
         Ok(())
     }
 
     pub fn generate_socket(&self) -> Result<usize> {
-        let mut ids = self.available_socket_id.lock().unwrap();
-        if let Some(new_id) = ids.pop_front() {
-            let mut sockets = self.sockets.lock().unwrap();
-            sockets.insert(new_id, None);
-            let mut queue = self.receive_queue.lock().unwrap();
-            queue.insert(new_id, VecDeque::new());
-            Ok(new_id)
-        } else {
-            Err(anyhow::anyhow!("Failed to generate new socket because no available id. UDP_MAX_SOCKET={}", UDP_MAX_SOCKET))
+        let mut sockets = self.sockets.lock().unwrap();
+        let mut queue = self.receive_queue.lock().unwrap();
+        for id in 1..UDP_MAX_SOCKET {
+            if sockets.contains_key(&id) {
+                continue;
+            } else {
+                sockets.insert(id, None);
+                queue.insert(id, VecDeque::new());
+
+                return Ok(id);
+            }
         }
+
+        anyhow::bail!("Failed to generate new socket because no available id. UDP_MAX_SOCKET={}", UDP_MAX_SOCKET)
     }
 
     pub fn release_socket(&self, socket_id: usize) -> Result<()> {
-        let mut ids = self.available_socket_id.lock().unwrap();
         let mut sockets = self.sockets.lock().unwrap();
         let mut queue = self.receive_queue.lock().unwrap();
-        ids.push_back(socket_id);
         sockets.remove(&socket_id);
         queue.remove(&socket_id);
 
@@ -335,25 +398,21 @@ impl UdpStack {
         for (id, udp_info) in self.sockets.lock().unwrap().iter() {
             if let Some(network) = udp_info {
                 if let UdpNetworkInfo {
-                    local_addr,
-                    remote_addr: Some(remote_addr),
-                    local_port,
-                    remote_port: Some(remote_port)
+                    local,
+                    remote: Some(remote)
                 } = network {
-                    if local_addr.octets() != udp_packet.dst_addr ||
-                       *local_port != udp_packet.local_port ||
-                       remote_addr.octets() != udp_packet.src_addr ||
-                       *remote_port != udp_packet.remote_port {
+                    if local.ip().octets() != udp_packet.dst_addr ||
+                       local.port() != udp_packet.local_port ||
+                       remote.ip().octets() != udp_packet.src_addr ||
+                       remote.port() != udp_packet.remote_port {
                         continue;
                     }
                 };
                 if let UdpNetworkInfo {
-                    local_addr,
-                    remote_addr: None,
-                    local_port,
-                    remote_port: None
+                    local,
+                    remote: None
                 } = network {
-                    if local_addr.octets() != udp_packet.dst_addr || *local_port != udp_packet.remote_port { continue; }
+                    if local.ip().octets() != udp_packet.dst_addr || local.port() != udp_packet.remote_port { continue; }
                 };
                 let mut queue = self.receive_queue.lock().unwrap();
                 if let Some(q) = queue.get_mut(id) {
@@ -416,16 +475,150 @@ impl UdpStack {
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub struct UdpNetworkInfo {
-    pub local_addr: Ipv4Addr,
-    pub remote_addr: Option<Ipv4Addr>,
-    pub local_port: u16,
-    pub remote_port: Option<u16>,
+    pub local: SocketAddrV4,
+    pub remote: Option<SocketAddrV4>
 }
 
 pub struct UdpSocket {
     config: NetworkConfiguration,
     socket_id: usize,
-    info: UdpNetworkInfo
+    info: Option<UdpNetworkInfo>
+}
+
+// follow stdlib interface https://doc.rust-lang.org/std/net/struct.UdpSocket.html
+impl UdpSocket {
+    pub fn new(config: NetworkConfiguration) -> Result<Self> {
+        let udp = get_global_udpstack(config.clone())?;
+        let socket = udp.generate_socket()?;
+
+        Ok(Self { config: config, socket_id: socket, info: None })
+    }
+
+    pub fn bind<A: ToSocketAddrs>(&mut self, addr: A) -> Result<()> {
+        if let Some(info) = self.info {
+            anyhow::bail!("It is already bound to {}/{}.", info.local.ip(), info.local.port());
+        } else {
+            match addr.to_socket_addrs()?.next() {
+                Some(addr) => {
+                    // We only assign port and ignore ip address because l3stack currently have an exact 1 interface and ip address.
+                    let info = UdpNetworkInfo {
+                        local: SocketAddrV4::new(self.config.ip.address, addr.port()),
+                        remote: None
+                    };
+                    self.info = Some(info);
+                    let udp = get_global_udpstack(self.config.clone())?;
+                    udp.bind(self.socket_id, info)?;
+
+                    return Ok(());
+                }
+                None => {
+                    anyhow::bail!("Failed to bind socket. Address may be invalid.");
+                }
+            }
+        }
+    }
+
+    pub fn connect<A: ToSocketAddrs>(&mut self, addr: A) -> Result<()> {
+        if let Some(mut info) = self.info {
+            if let Some(remote) = info.remote {
+                anyhow::bail!("It is already connected to {}:{}.", remote.ip(), remote.port())
+            } else {
+                match addr.to_socket_addrs()?.next() {
+                    Some(addr) => {
+                        match addr.ip() {
+                            IpAddr::V4(v4_addr) => {
+                                info.remote = Some(SocketAddrV4::new(v4_addr, addr.port()));
+                                let udp = get_global_udpstack(self.config.clone())?;
+                                udp.bind(self.socket_id, info)?;
+                                return Ok(());
+                            }
+                            IpAddr::V6(_) => {
+                                anyhow::bail!("Ipv6 is not supported.")
+                            }
+                        }
+                    }
+                    None => {
+                        anyhow::bail!("Address may be invalid.");
+                    }
+                }
+            }
+        } else {
+            anyhow::bail!("Udp socket is unbound. Need to bind at first.")
+        }
+    }
+
+    pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> Result<()> {
+        if let Some(info) = self.info {
+            anyhow::ensure!(info.remote == None, "send_to is only available for non-connected socket.");
+            match addr.to_socket_addrs()?.next() {
+                Some(addr) => {
+                    match addr.ip() {
+                        IpAddr::V4(v4_addr) => {
+                            let udp = get_global_udpstack(self.config.clone())?;
+                            let network_info = UdpNetworkInfo {
+                                local: info.local,
+                                remote: Some(SocketAddrV4::new(v4_addr, addr.port()))
+                            };
+                            udp.send(
+                                self.socket_id,
+                                Some(network_info),
+                                buf.to_vec()
+                            )?;
+                            return Ok(());
+                        }
+                        IpAddr::V6(_) => {
+                            anyhow::bail!("Ipv6 is not supported.")
+                        }
+                    }
+                }
+                None => {
+                    anyhow::bail!("Address may be invalid.");
+                }
+            }
+        } else {
+            anyhow::bail!("Udp socket is unbound. Need to bind at first.");
+        }
+    }
+
+    pub fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddrV4)> {
+        if let Some(info) = self.info {
+            anyhow::ensure!(info.remote == None, "recv_from is only available for non-connected socket.");
+            let udp = get_global_udpstack(self.config.clone())?;
+            let (src, payload) = udp.recv(self.socket_id)?;
+            let length = min(buf.len(), payload.len());
+            buf[..length].copy_from_slice(&payload[..length]);
+
+            Ok((length, src))
+        } else {
+            anyhow::bail!("Udp socket is unbound. Need to bind at first.");
+        }
+    }
+
+    pub fn send(&self, buf: &[u8]) -> Result<()> {
+        if let Some(info) = self.info {
+            anyhow::ensure!(info.remote != None, "send is only available for connected socket.");
+            let udp = get_global_udpstack(self.config.clone())?;
+            udp.send(self.socket_id, None, buf.to_vec())?;
+
+            Ok(())
+        } else {
+            anyhow::bail!("Udp socket is unbound. Need to bind at first.");
+        }
+    }
+
+    pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        if let Some(info) = self.info {
+            anyhow::ensure!(info.remote != None, "recv is only available for connected socket.");
+            let udp = get_global_udpstack(self.config.clone())?;
+            let (_src, payload) = udp.recv(self.socket_id)?;
+            let length = min(buf.len(), payload.len());
+            buf[..length].copy_from_slice(&payload[..length]);
+
+            Ok(length)
+        } else {
+            anyhow::bail!("Udp socket is unbound. Need to bind at first.");
+        }
+    }
 }
 
 #[cfg(test)]

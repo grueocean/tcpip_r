@@ -384,7 +384,7 @@ impl L2Stack {
             // reply
             let mut arp_table = self.arp_table.lock().unwrap();
             let arp_entry = ArpEntry {
-                mac: MacAddress::from_bytes(&arp.dst_mac)?,
+                mac: MacAddress::from_bytes(&arp.src_mac)?,
                 creation_time: Instant::now(),
                 ttl: ARP_CACHE_TIME
             };

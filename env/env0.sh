@@ -23,6 +23,10 @@ create() {
 
     ip netns exec Tcpip0 ip link set lo up
     ip netns exec Tcpip0 ip link set p0 up
+
+    # disable checksum offload
+    ip netns exec Dev0 ethtool -K d0 rx off tx off
+    ip netns exec Tcpip0 ethtool -K p0 rx off tx off
 }
 
 delete() {

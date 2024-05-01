@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
 
-const IPv4_HEADER_LENGTH_BASIC: usize = 20;
+const IPV4_HEADER_LENGTH_BASIC: usize = 20;
 
 static L3STACK_GLOBAL: OnceLock<Arc<L3Stack>> = OnceLock::new();
 
@@ -76,7 +76,7 @@ impl Ipv4Packet {
     }
 
     pub fn read(&mut self, packet: &Vec<u8>) -> Result<bool> {
-        if packet.len() < IPv4_HEADER_LENGTH_BASIC {
+        if packet.len() < IPV4_HEADER_LENGTH_BASIC {
             return Err(anyhow::anyhow!("Insufficient packet length for IPv4 Header. packet.len()={}", packet.len()));
         }
         self.version = u8::from_be_bytes(packet[0..1].try_into()?) >> 4;  // top 4 bit

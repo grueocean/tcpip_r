@@ -7,10 +7,10 @@ mod types;
 mod udp;
 use env_logger;
 use eui48::MacAddress;
-use std::{hash::Hash, net::Ipv4Addr};
+use std::{hash::Hash, net::{Ipv4Addr, SocketAddrV4}};
 
 use crate::ip::{NetworkConfiguration, Ipv4Network, Route, L3Interface};
-use crate::udp::{UdpStack, UdpNetworkInfo};
+use crate::udp::{UdpStack, UdpNetworkInfo, UdpSocket};
 
 fn main() {
     env_logger::init();
@@ -29,14 +29,14 @@ fn main() {
         ip: ip,
         gateway: route.into_iter().collect()
     };
-    let udp = UdpStack::new(config).unwrap();
-    let socket = udp.generate_socket().unwrap();
-    let udp_info = UdpNetworkInfo {
-        local_addr: Ipv4Addr::new(172, 20, 10, 100),
-        remote_addr: None,
-        local_port: 200 as u16,
-        remote_port: None
-    };
+    // let udp = UdpStack::new(config).unwrap();
+    // let socket = udp.generate_socket().unwrap();
+    // let udp_info = UdpNetworkInfo {
+    //     local: SocketAddrV4::new(Ipv4Addr::new(172, 20, 10, 100), 200),
+    //     remote: None
+    // };
+    let mut udp_socket = UdpSocket::new(config).unwrap();
+    udp_socket.bind("172.20.10.100:200");
     // use hex::decode;
     // use ip::Ipv4Packet;
     // use std::collections::HashMap;
@@ -49,10 +49,16 @@ fn main() {
     // l3.send(packet);
 
     loop {
-        udp.bind(socket, udp_info).unwrap();
-        let (info, packet) = udp.recv(socket).unwrap();
-        dbg!(info);
-        dbg!(packet);
+        let mut buf = [0; 10];
+        let (amt, src) = udp_socket.recv_from(&mut buf).unwrap();
+        dbg!(amt);
+        dbg!(src);
+        dbg!(buf);
+        udp_socket.send_to(b"hello udp socket\n", "172.20.10.111:300");
+        // udp.bind(socket, udp_info).unwrap();
+        // let (info, packet) = udp.recv(socket).unwrap();
+        // dbg!(info);
+        // dbg!(packet);
         // use hex::decode;
         // let test = "45000054bee5400040010ec9ac140a64ac140a6e08007f8c0f3a00012c5b1e660000000056a4090000000000101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637";
         // l2.send(&decode(test).unwrap());
