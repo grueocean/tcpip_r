@@ -482,7 +482,7 @@ pub struct UdpNetworkInfo {
 pub struct UdpSocket {
     config: NetworkConfiguration,
     socket_id: usize,
-    info: Option<UdpNetworkInfo>
+    pub info: Option<UdpNetworkInfo>
 }
 
 // follow stdlib interface https://doc.rust-lang.org/std/net/struct.UdpSocket.html
@@ -507,7 +507,8 @@ impl UdpSocket {
                     };
                     self.info = Some(info);
                     let udp = get_global_udpstack(self.config.clone())?;
-                    udp.bind(self.socket_id, info)?;
+                    let new_info = udp.bind(self.socket_id, info)?;
+                    self.info = Some(new_info);
 
                     return Ok(());
                 }

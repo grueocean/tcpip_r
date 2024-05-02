@@ -396,7 +396,7 @@ impl L2Stack {
     }
 }
 
-fn generate_network_addr(ip: &Ipv4Addr, netmask: usize) -> Ipv4Addr {
+pub fn generate_network_addr(ip: &Ipv4Addr, netmask: usize) -> Ipv4Addr {
     if netmask == 0 {
         return Ipv4Addr::new(0, 0, 0, 0);
     }
@@ -406,7 +406,7 @@ fn generate_network_addr(ip: &Ipv4Addr, netmask: usize) -> Ipv4Addr {
     Ipv4Addr::from(ip_u32 & mask_u32)
 }
 
-fn generate_broadcast_addr(ip: &Ipv4Addr, netmask: usize) -> Ipv4Addr {
+pub fn generate_broadcast_addr(ip: &Ipv4Addr, netmask: usize) -> Ipv4Addr {
     if netmask == 0 {
         return Ipv4Addr::new(255, 255, 255, 255);
     }

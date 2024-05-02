@@ -1,4 +1,5 @@
-use crate::arp::{L2Stack, is_netmask_range};
+use crate::ethernet::get_interface_mac;
+use crate::arp::{L2Stack, is_netmask_range, generate_network_addr, generate_broadcast_addr};
 use crate::types::{Ipv4Type, L2Error, L3Error};
 use anyhow::{Context, Result};
 use eui48::MacAddress;
@@ -6,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
@@ -181,12 +183,40 @@ impl Ipv4Packet {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Ipv4Config {
     pub address: Ipv4Addr,
     pub netmask: usize,
     pub broadcast_address: Ipv4Addr,
     pub network_address: Ipv4Addr
+}
+
+impl FromStr for Ipv4Config {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() != 2 {
+            return Err("Input must be in the format <IPv4Address>/<Netmask>".into());
+        }
+
+        let address = parts[0].parse::<Ipv4Addr>().map_err(|_| "Invalid IP address format".to_string())?;
+        let netmask = parts[1].parse::<usize>().map_err(|_| "Invalid netmask format".to_string())?;
+
+        if netmask > 32 {
+            return Err("Netmask must be between 0 and 32".into());
+        }
+
+        let network_address = generate_network_addr(&address, netmask);
+        let broadcast_address = generate_broadcast_addr(&address, netmask);
+
+        Ok(Ipv4Config {
+            address,
+            netmask,
+            network_address,
+            broadcast_address,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Eq)]
@@ -208,7 +238,7 @@ impl Hash for Ipv4Network {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NetworkConfiguration {
     pub interface_name: String,
     pub mac: MacAddress,
@@ -217,7 +247,47 @@ pub struct NetworkConfiguration {
     pub gateway: HashMap<Ipv4Network, Route>
 }
 
-#[derive(Clone)]
+impl NetworkConfiguration {
+    pub fn new(
+        interface_name: String,
+        mac: MacAddress,
+        mtu: usize,
+        ip: Ipv4Config,
+        gateway: HashMap<Ipv4Network, Route>
+    ) -> Self {
+        Self {
+            interface_name,
+            mac,
+            mtu,
+            ip,
+            gateway
+        }
+    }
+}
+
+pub fn generate_network_config(
+    interface_name: String,
+    mac: MacAddress,
+    mtu: usize,
+    ip: Ipv4Config,
+    default_gateway: Ipv4Addr
+) -> Result<NetworkConfiguration> {
+    let route = vec![
+        (Ipv4Network { address: ip.address, netmask: ip.netmask },
+        Route { gateway_addr: default_gateway, rank: 1 })
+    ];
+    let mut config = NetworkConfiguration {
+        interface_name: interface_name.clone(), mac, mtu, ip, gateway: route.into_iter().collect()
+    };
+    if mac == MacAddress::new([0, 0, 0, 0, 0, 0]) {
+        if let Some(interface_mac) = get_interface_mac(interface_name)? {
+            config.mac = interface_mac;
+        }
+    }
+    Ok(config)
+}
+
+#[derive(Clone, Debug)]
 pub struct Route {
     pub gateway_addr: Ipv4Addr,
     pub rank: usize

@@ -1,5 +1,6 @@
 use crate::types::EtherType;
 use anyhow::{Context, Result};
+use eui48::MacAddress;
 use log;
 use pnet_datalink::{self, Channel, DataLinkReceiver, DataLinkSender};
 use std::sync::Mutex;
@@ -117,6 +118,17 @@ impl EthernetSender {
             }
             None => Err(anyhow::anyhow!("Send operation did not return a result"))
         }
+    }
+}
+
+pub fn get_interface_mac(interface_name: String) -> Result<Option<MacAddress>> {
+    if let Some(mac) = pnet_datalink::interfaces()
+            .into_iter()
+            .find(|i| i.name == interface_name)
+            .and_then(|i| i.mac) {
+        Ok(Some(MacAddress::new(mac.octets())))
+    } else {
+        Ok(None)
     }
 }
 

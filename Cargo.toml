@@ -1,5 +1,5 @@
 [package]
-name = "tcpip-r"
+name = "tcpip_r"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.81"
+clap = { version = "4.5.4", features = ["derive"] }
 env_logger = "0.11.3"
 eui48 = "1.1.0"
 hex = "0.4.3"
