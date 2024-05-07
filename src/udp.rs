@@ -266,7 +266,7 @@ impl UdpStack {
         loop {
             let sockets = self.sockets.lock().unwrap();
             let mut queue = self.receive_queue.lock().unwrap();
-            if let (Some(socket_queue), Some(Some(socket))) = (queue.get_mut(&socket_id), sockets.get(&socket_id)) {
+            if let Some(socket_queue) = queue.get_mut(&socket_id) {
                 if let Some(packet) = socket_queue.pop_front() {
                     let src = SocketAddrV4::new(Ipv4Addr::from(packet.src_addr), packet.local_port);
                     return Ok((src, packet.payload));
@@ -309,6 +309,16 @@ impl UdpStack {
                 self.update_queue(socket_id, network_info)?;
                 Ok(network_info)
             }
+        }
+    }
+
+    pub fn connect(&self, socket_id: usize, netwrok_info: UdpNetworkInfo) -> Result<UdpNetworkInfo> {
+        let mut sockets = self.sockets.lock().unwrap();
+        if let Some(Some(info)) = sockets.get_mut(&socket_id)  {
+            *info = netwrok_info;
+            Ok(netwrok_info)
+        } else {
+            anyhow::bail!("Cannot connect unbound socket.");
         }
     }
 
@@ -530,7 +540,9 @@ impl UdpSocket {
                             IpAddr::V4(v4_addr) => {
                                 info.remote = Some(SocketAddrV4::new(v4_addr, addr.port()));
                                 let udp = get_global_udpstack(self.config.clone())?;
-                                udp.bind(self.socket_id, info)?;
+                                let new_info = udp.connect(self.socket_id, info)?;
+                                self.info = Some(new_info);
+
                                 return Ok(());
                             }
                             IpAddr::V6(_) => {
