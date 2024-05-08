@@ -2,6 +2,7 @@ use crate::ethernet::get_interface_mac;
 use crate::arp::{L2Stack, is_netmask_range, generate_network_addr, generate_broadcast_addr};
 use crate::types::{Ipv4Type, L2Error, L3Error};
 use anyhow::{Context, Result};
+use log;
 use eui48::MacAddress;
 use std::collections::{HashMap, VecDeque};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
@@ -13,6 +14,8 @@ use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
 
 const IPV4_HEADER_LENGTH_BASIC: usize = 20;
+const IPV4_MAX_SIZE: usize = 65535;
+const IPV4_MIN_MTU: usize = 68; // rfc791
 
 static L3STACK_GLOBAL: OnceLock<Arc<L3Stack>> = OnceLock::new();
 
@@ -37,7 +40,7 @@ pub fn get_global_l3stack(config: NetworkConfiguration) -> Result<&'static Arc<L
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                    Options                    |    Padding    |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Ipv4Packet {
     pub version: u8,           // 4 bit
     pub ihl: u8,               // 4 bit
@@ -181,6 +184,61 @@ impl Ipv4Packet {
 
         Ok(packet)
     }
+
+    pub fn create_fragment_packets(&self, mtu: usize) -> Result<VecDeque<Self>> {
+        anyhow::ensure!((self.flags & 0b010) == 0, "Cannot split packet with DF (Don't Fragment) enabled.");
+        let mut packets = VecDeque::new();
+        let base_packet = self.clone();
+        let header_length = (self.ihl * 4) as usize;
+        // fragment must be 8-byte alligned
+        let max_payload = (
+            std::cmp::min(
+                mtu - header_length,
+                IPV4_MAX_SIZE - header_length
+            )
+        ) &!0b111;
+        let num_fragments = (self.payload.len() - 1) / max_payload + 1;
+
+        // https://datatracker.ietf.org/doc/html/rfc791
+        //
+        //Bit 0: reserved, must be zero
+        //Bit 1: (DF) 0 = May Fragment,  1 = Don't Fragment.
+        //Bit 2: (MF) 0 = Last Fragment, 1 = More Fragments.
+        //
+        //    0   1   2
+        //  +---+---+---+
+        //  |   | D | M |
+        //  | 0 | F | F |
+        //  +---+---+---+
+        //
+
+        if num_fragments == 1 {
+            let mut packet_fragment = base_packet.clone();
+            packet_fragment.flags = 0;
+            packet_fragment.frag_offset = 0;
+            packet_fragment.calc_header_checksum_and_set();
+            packets.push_back(packet_fragment);
+        } else {
+            for i in 0..num_fragments {
+                let mut packet_fragment = base_packet.clone();
+                packet_fragment.frag_offset = (i * max_payload / 8) as u16;
+                // not a last fragment
+                if i + 1 != num_fragments {
+                    packet_fragment.flags = 0b001; // DF=0 MF=1
+                    packet_fragment.payload = packet_fragment.payload[i*max_payload..(i+1)*max_payload].to_vec();
+                // last fragment
+                } else {
+                    packet_fragment.flags = 0b000; // DF=0 MF=0
+                    packet_fragment.payload = packet_fragment.payload[i*max_payload..].to_vec();
+                }
+                packet_fragment.length = (packet_fragment.payload.len() + header_length) as u16;
+                packet_fragment.calc_header_checksum_and_set();
+                packets.push_back(packet_fragment);
+            }
+        }
+
+        Ok(packets)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -314,6 +372,7 @@ impl L3Interface {
         ip: Ipv4Config,
         gateway: HashMap<Ipv4Network, Route>
     ) -> Result<Arc<Self>> {
+        anyhow::ensure!(mtu >= IPV4_MIN_MTU, "Mtu ({}) is less than minimum 68 (max header 60 + min pyload 8).", mtu);
         let l3 = Arc::new(Self {
             l2stack: L2Stack::new(interface_name, mac, mtu, ip)?,
             gateway: gateway,
@@ -391,22 +450,19 @@ impl L3Interface {
         // protocol and dst_addr must be set by upper layer.
         ipv4_packet.version = 4;
         ipv4_packet.ihl = 5;
+        let header_length = (ipv4_packet.ihl * 4) as usize;
         ipv4_packet.type_of_service = 0;
-        ipv4_packet.length = (ipv4_packet.payload.len() + (ipv4_packet.ihl * 4) as usize) as u16;
+        ipv4_packet.length = (ipv4_packet.payload.len() + header_length) as u16;
         ipv4_packet.identification = self.generate_identification();
-        ipv4_packet.flags = 0;
-        ipv4_packet.frag_offset = 0;
         ipv4_packet.ttl = 0xff;
         ipv4_packet.src_addr = self.l2stack.interface_ipv4.address.octets();
         let dst_ip = Ipv4Addr::from(ipv4_packet.dst_addr);
         let dst_mac = self.resolve_ip(&dst_ip)?;
-        ipv4_packet.calc_header_checksum_and_set();
-        if ipv4_packet.validate()? {
-            self.l2stack.send(ipv4_packet, dst_mac)?;
-        } else {
-            return Err(anyhow::anyhow!("Failed to send ipv4 packet because it is invalid."));
+        anyhow::ensure!(ipv4_packet.payload.len() <= IPV4_MAX_SIZE + header_length, "Ipv4 payload is too long ({}).", ipv4_packet.payload.len());
+        let packets = ipv4_packet.create_fragment_packets(self.l2stack.interface_mtu)?;
+        for fragment in packets {
+            self.l2stack.send(fragment, dst_mac)?;
         }
-
         Ok(())
     }
 
@@ -552,7 +608,7 @@ mod ipv4_tests {
         2,      // Flags
         0,      // Fragment Offset
         64,     // TTL
-        1,     // Protocol (ICMP)
+        1,      // Protocol (ICMP)
         0x68d8, // Header Checksum (calculated value should match this)
         [192, 168, 200, 21],  // Source IP
         [8, 8, 8, 8],         // Destination IP

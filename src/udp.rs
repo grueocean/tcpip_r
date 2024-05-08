@@ -2,6 +2,7 @@ use crate::ip::{Ipv4Packet, NetworkConfiguration, L3Stack, get_global_l3stack};
 use crate::types::{Ipv4Type};
 use crate::udp;
 use anyhow::{Context, Result};
+use log;
 use std::collections::{HashMap, VecDeque};
 use std::cmp::min;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
