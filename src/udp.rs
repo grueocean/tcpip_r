@@ -413,9 +413,9 @@ impl UdpStack {
                     remote: Some(remote)
                 } = network {
                     if local.ip().octets() != udp_packet.dst_addr ||
-                       local.port() != udp_packet.local_port ||
+                       local.port() != udp_packet.remote_port ||
                        remote.ip().octets() != udp_packet.src_addr ||
-                       remote.port() != udp_packet.remote_port {
+                       remote.port() != udp_packet.local_port {
                         continue;
                     }
                 };

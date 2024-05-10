@@ -4,6 +4,7 @@ use crate::types::{Ipv4Type, L2Error, L3Error};
 use anyhow::{Context, Result};
 use log;
 use eui48::MacAddress;
+use pnet::packet;
 use std::collections::{HashMap, VecDeque};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::hash::{Hash, Hasher};
@@ -12,10 +13,30 @@ use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const IPV4_HEADER_LENGTH_BASIC: usize = 20;
 const IPV4_MAX_SIZE: usize = 65535;
-const IPV4_MIN_MTU: usize = 68; // rfc791
+const IPV4_MIN_MTU: usize = 68;    // rfc791
+const IPV4_MIN_MTU_2: usize = 576; // rfc1122, rfc8900
+const IPV4_FRAGMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+// https://datatracker.ietf.org/doc/html/rfc791
+//
+//Bit 0: reserved, must be zero
+//Bit 1: (DF) 0 = May Fragment,  1 = Don't Fragment.
+//Bit 2: (MF) 0 = Last Fragment, 1 = More Fragments.
+//
+//    0   1   2
+//  +---+---+---+
+//  |   | D | M |
+//  | 0 | F | F |
+//  +---+---+---+
+//
+
+const IPV4_FLAG_DF: u8 = 0b010;
+const IPV4_FLAG_MF: u8 = 0b001;
+const IPV4_FLAG_ZERO: u8 = 0b000;
 
 static L3STACK_GLOBAL: OnceLock<Arc<L3Stack>> = OnceLock::new();
 
@@ -186,7 +207,7 @@ impl Ipv4Packet {
     }
 
     pub fn create_fragment_packets(&self, mtu: usize) -> Result<VecDeque<Self>> {
-        anyhow::ensure!((self.flags & 0b010) == 0, "Cannot split packet with DF (Don't Fragment) enabled.");
+        anyhow::ensure!((self.flags & IPV4_FLAG_DF) == 0, "Cannot split packet with DF (Don't Fragment) enabled.");
         let mut packets = VecDeque::new();
         let base_packet = self.clone();
         let header_length = (self.ihl * 4) as usize;
@@ -198,23 +219,9 @@ impl Ipv4Packet {
             )
         ) &!0b111;
         let num_fragments = (self.payload.len() - 1) / max_payload + 1;
-
-        // https://datatracker.ietf.org/doc/html/rfc791
-        //
-        //Bit 0: reserved, must be zero
-        //Bit 1: (DF) 0 = May Fragment,  1 = Don't Fragment.
-        //Bit 2: (MF) 0 = Last Fragment, 1 = More Fragments.
-        //
-        //    0   1   2
-        //  +---+---+---+
-        //  |   | D | M |
-        //  | 0 | F | F |
-        //  +---+---+---+
-        //
-
         if num_fragments == 1 {
             let mut packet_fragment = base_packet.clone();
-            packet_fragment.flags = 0;
+            packet_fragment.flags = IPV4_FLAG_ZERO;
             packet_fragment.frag_offset = 0;
             packet_fragment.calc_header_checksum_and_set();
             packets.push_back(packet_fragment);
@@ -224,11 +231,11 @@ impl Ipv4Packet {
                 packet_fragment.frag_offset = (i * max_payload / 8) as u16;
                 // not a last fragment
                 if i + 1 != num_fragments {
-                    packet_fragment.flags = 0b001; // DF=0 MF=1
+                    packet_fragment.flags = IPV4_FLAG_MF;   // DF=0 MF=1
                     packet_fragment.payload = packet_fragment.payload[i*max_payload..(i+1)*max_payload].to_vec();
                 // last fragment
                 } else {
-                    packet_fragment.flags = 0b000; // DF=0 MF=0
+                    packet_fragment.flags = IPV4_FLAG_ZERO; // DF=0 MF=0
                     packet_fragment.payload = packet_fragment.payload[i*max_payload..].to_vec();
                 }
                 packet_fragment.length = (packet_fragment.payload.len() + header_length) as u16;
@@ -238,6 +245,192 @@ impl Ipv4Packet {
         }
 
         Ok(packets)
+    }
+}
+
+trait MatchFragmentHeader {
+    fn match_fragment_header(&self, other: &Self) -> bool;
+}
+
+impl MatchFragmentHeader for Ipv4Packet {
+    fn match_fragment_header(&self, other: &Self) -> bool {
+        self.version == other.version &&
+        self.ihl == other.ihl &&
+        self.type_of_service == other.type_of_service &&
+        self.identification == other.identification &&
+        self.ttl == other.ttl &&
+        self.protocol == other.protocol &&
+        self.src_addr == other.src_addr &&
+        self.dst_addr == other.dst_addr &&
+        self.options == other.options
+    }
+}
+
+#[derive(Debug)]
+pub struct Ipv4FragmentHole {
+    pub start: usize,
+    pub end: usize
+}
+
+#[derive(Debug)]
+pub struct Ipv4FragmentPiece {
+    pub is_hole: bool,
+    pub hole: Option<Ipv4FragmentHole>,
+    pub packet: Option<Ipv4Packet>
+}
+
+#[derive(Debug)]
+pub struct Ipv4FragmentQueue {
+    timestamp: Instant,
+    has_hole: bool,
+    queue: VecDeque<Ipv4FragmentPiece>
+}
+
+impl Ipv4FragmentQueue {
+    pub fn new() -> Self {
+        let init_hole = Ipv4FragmentPiece {
+            is_hole: true,
+            hole: Some(Ipv4FragmentHole { start: 0, end: IPV4_MAX_SIZE }),
+            packet: None
+        };
+        let mut init_queue = VecDeque::new();
+        init_queue.push_back(init_hole);
+        Self {
+            timestamp: Instant::now(),
+            has_hole: true,
+            queue: init_queue
+        }
+    }
+
+    pub fn check_is_expired(&self, timeout: Duration) -> bool {
+        if self.timestamp.elapsed() >= timeout {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn check_has_hole(&mut self) -> bool {
+        let has_hole = self.queue.iter().any(|p| p.is_hole);
+        self.has_hole = has_hole;
+        return has_hole;
+    }
+
+    // based on rfc815, rfc6864
+    pub fn push_packet(&mut self, packet: Ipv4Packet) -> bool {
+        let mut new_queue = VecDeque::new();
+        let frag_start = (packet.frag_offset * 8) as usize;
+        let frag_end = (packet.frag_offset * 8) as usize + packet.payload.len() - 1;
+
+        for piece in &self.queue {
+            // current piece is hole
+            if let Some(hole) = &piece.hole {
+                // packet is in the hole
+                if hole.start <= frag_start && frag_end <= hole.end {
+                    // if a last fragment, insert packet and truncate tail
+                    // before:
+                    // <--------------hole-------------->
+                    // after:
+                    // <--hole1--><--packet-->||truncate||
+                    if (packet.flags & 0b001) == 0 {
+                        if hole.start < frag_start {
+                            let hole1 = Ipv4FragmentPiece {
+                                is_hole: true,
+                                hole: Some(Ipv4FragmentHole { start: hole.start, end: frag_start - 1}),
+                                packet: None
+                            };
+                            new_queue.push_back(hole1);
+                        }
+                        let new_packet = Ipv4FragmentPiece {
+                            is_hole: false,
+                            hole: None,
+                            packet: Some(packet.clone())
+                        };
+                        new_queue.push_back(new_packet);
+                        break;
+                    // if not a last fragment, just insert packet
+                    // before:
+                    // <--------------hole-------------->
+                    // after:
+                    // <--hole1--><--packet--><--hole2-->
+                    } else {
+                        if frag_start != 0 {
+                            // When adding first packet, no hole1 is generated.
+                            let hole1 = Ipv4FragmentPiece {
+                                is_hole: true,
+                                hole: Some(Ipv4FragmentHole { start: hole.start, end: frag_start - 1}),
+                                packet: None
+                            };
+                            new_queue.push_back(hole1);
+                        }
+                        let new_packet = Ipv4FragmentPiece {
+                            is_hole: false,
+                            hole: None,
+                            packet: Some(packet.clone())
+                        };
+                        let hole2 = Ipv4FragmentPiece {
+                            is_hole: true,
+                            hole: Some(Ipv4FragmentHole { start: frag_end + 1, end: hole.end}),
+                            packet: None
+                        };
+                        new_queue.push_back(new_packet);
+                        new_queue.push_back(hole2);
+                    }
+                } else if frag_end <= hole.start || hole.end <= frag_start {
+                    log::debug!(
+                        "Ignoring a fragmented ipv4 packet suspected of being a duplicate. hole: {}-{} packet: {}-{}",
+                        hole.start, hole.end, frag_start, frag_end
+                    );
+                    continue;
+                } else {
+                    log::debug!(
+                        "Discarding a fragmented ipv4 packet conflicting existing hole. hole: {}-{} packet: {}-{}",
+                        hole.start, hole.end, frag_start, frag_end
+                    );
+                    continue;
+                }
+            }
+            // current piece is packet
+            if let Some(p) = &piece.packet {
+                let new_piece = Ipv4FragmentPiece {
+                    is_hole: false,
+                    hole: None,
+                    packet: Some(p.clone())
+                };
+                new_queue.push_back(new_piece);
+            }
+        }
+        self.queue = new_queue;
+
+        !self.check_has_hole()
+    }
+
+    pub fn create_complete_packet(&self) -> Result<Ipv4Packet> {
+        anyhow::ensure!(!self.has_hole, "Cannot generate complete packet from fragment queue with hole.");
+        let mut packets: VecDeque<Ipv4Packet> =
+            self.queue.iter()
+                .filter_map(|piece| piece.packet.as_ref().cloned())
+                .collect();
+        let mut payload: Vec<u8> = Vec::new();
+        if let Some(mut first_packet) = packets.pop_front() {
+            payload.extend_from_slice(&first_packet.payload);
+            for packet in packets {
+                if first_packet.match_fragment_header(&packet) {
+                    payload.extend_from_slice(&packet.payload);
+                } else {
+                    anyhow::bail!("Fragment queue contains packet with different header value.");
+                }
+            }
+            first_packet.length = payload.len() as u16;
+            first_packet.payload = payload;
+            first_packet.flags = IPV4_FLAG_ZERO;
+            first_packet.frag_offset = 0;
+            // No need to re-calc checksum
+            first_packet.header_checksum = 0;
+            Ok(first_packet)
+        } else {
+            anyhow::bail!("No packet in the fragment queue.")
+        }
     }
 }
 
@@ -372,7 +565,9 @@ impl L3Interface {
         ip: Ipv4Config,
         gateway: HashMap<Ipv4Network, Route>
     ) -> Result<Arc<Self>> {
-        anyhow::ensure!(mtu >= IPV4_MIN_MTU, "Mtu ({}) is less than minimum 68 (max header 60 + min pyload 8).", mtu);
+        if !cfg!(debug_assertions) {
+            anyhow::ensure!(mtu >= IPV4_MIN_MTU_2, "Mtu ({}) is less than minimum {}.", mtu, IPV4_MIN_MTU_2);
+        }
         let l3 = Arc::new(Self {
             l2stack: L2Stack::new(interface_name, mac, mtu, ip)?,
             gateway: gateway,
@@ -503,6 +698,7 @@ impl L3Interface {
 
 pub struct L3Stack {
     pub l3interface: Arc<L3Interface>,
+    fragmented_packet_queue: Mutex<HashMap<u16, Ipv4FragmentQueue>>,
     l4_receive_channels: Mutex<HashMap<Ipv4Type, Sender<Ipv4Packet>>>,
     threads: Mutex<Vec<JoinHandle<()>>>
 }
@@ -518,6 +714,7 @@ impl L3Stack {
                     config.ip,
                     config.gateway
                 )?,
+                fragmented_packet_queue: Mutex::new(HashMap::new()),
                 l4_receive_channels: Mutex::new(HashMap::new()),
                 threads: Mutex::new(Vec::new())
             }
@@ -544,48 +741,90 @@ impl L3Stack {
         }
     }
 
+    fn handle_packet(&self, ipv4_packet: Ipv4Packet) -> Result<()> {
+        let proto = Ipv4Type::from(ipv4_packet.protocol);
+        let mut channels = self.l4_receive_channels.lock().unwrap();
+        // RAW stack using Ipv4Type::Reserved will recieve all protocol packet.
+        match channels.entry(Ipv4Type::Reserved) {
+            Occupied(e) => {
+                match e.get().send(ipv4_packet) {
+                    Err(e) => {
+                        anyhow::bail!("Failed to transfer packet to RAW stack. Err: {}", e);
+                    }
+                    Ok(_) => {}
+                }
+                return Ok(());
+            }
+            Vacant(_) => {}
+        }
+        if proto != Ipv4Type::Unknown {
+            match channels.entry(proto) {
+                Occupied(e) => {
+                    match e.get().send(ipv4_packet) {
+                        Err(e) => {
+                            anyhow::bail!("Failed to transfer packet to {:?} stack. Err: {}", proto, e);
+                        }
+                        Ok(_) => {}
+                    }
+                    return Ok(());
+                }
+                Vacant(_) => {
+                    log::trace!("There is no registered L4 stack for the ipv4 packet (proto={:?}).", proto);
+                    return Ok(());
+                }
+            }
+        } else {
+            // Unkown protocol packet
+            return Ok(());
+        }
+    }
+
     fn receive_thread(&self) -> Result<()> {
         loop {
             let mut ipv4_packet = Ipv4Packet::new();
             match self.l3interface.recv() {
                 Err(e) => {
-                    log::warn!("Failed to recv packet from L3Interface. Err: {}", e);
+                    log::warn!("L3Stack failed to recv packet from L3Interface. Err: {}", e);
                 }
                 Ok(packet) => {
                     ipv4_packet = packet;
                 }
             }
-            let proto = Ipv4Type::from(ipv4_packet.protocol);
-            let mut channels = self.l4_receive_channels.lock().unwrap();
-            // RAW stack using Ipv4Type::Reserved will recieve all protocol packet.
-            match channels.entry(Ipv4Type::Reserved) {
-                Occupied(e) => {
-                    match e.get().send(ipv4_packet) {
-                        Err(e) => {
-                            log::error!("Failed to send packet to RAW stack. Err: {}", e);
-                            continue;
-                        }
-                        Ok(_) => {}
-                    }
-                    continue;
+            // not a fragmented packet
+            if ipv4_packet.frag_offset == 0 && (ipv4_packet.flags & IPV4_FLAG_MF) == 0 {
+                if let Err(e) = self.handle_packet(ipv4_packet) {
+                    log::warn!("L3Stack failed to handle packet. Err: {}", e);
                 }
-                Vacant(_) => {}
-            }
-            if proto != Ipv4Type::Unknown {
-                match channels.entry(proto) {
-                    Occupied(e) => {
-                        match e.get().send(ipv4_packet) {
-                            Err(e) => {
-                                log::error!("Failed to send packet to {:?} stack. Err: {}", proto, e);
-                                continue;
-                            }
-                            Ok(_) => {}
-                        }
+            // fragmented packet
+            } else {
+                let mut frag_queue = self.fragmented_packet_queue.lock().unwrap();
+                let id = ipv4_packet.identification;
+                if let Some(queue) = frag_queue.get_mut(&id) {
+                    if queue.check_is_expired(IPV4_FRAGMENT_TIMEOUT) {
+                        log::warn!("Ipv4 fragment queue (id={}) is cleared due to timeout ({:?}).", id, IPV4_FRAGMENT_TIMEOUT);
+                        frag_queue.remove_entry(&id);
                         continue;
                     }
-                    Vacant(_) => {}
+                    if queue.push_packet(ipv4_packet) {
+                        match queue.create_complete_packet() {
+                            Ok(packet) => {
+                                if let Err(e) = self.handle_packet(packet) {
+                                    log::warn!("L3Stack failed to handle packet. Err: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Creating packet from fragment queue failed. Err: {}", e);
+                            }
+                        }
+                        frag_queue.remove_entry(&id);
+                    }
+                } else {
+                    let mut new_queue = Ipv4FragmentQueue::new();
+                    new_queue.push_packet(ipv4_packet);
+                    frag_queue.insert(id, new_queue);
                 }
             }
+
         }
     }
 }
