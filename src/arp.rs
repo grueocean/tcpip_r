@@ -189,7 +189,7 @@ impl L2Stack {
         let mut iface_recv = EthernetRecveiver::new(&self.interface_name)?;
         loop {
             let packet = iface_recv.recv_packet()?;
-            log::trace!("Packet Received: {:x?}", packet);
+            log::trace!("Packet Received in L2Stack: {:x?}", packet);
             let mut ethernet_packet = EthernetPacket::new();
             match ethernet_packet.read(&packet) {
                 Err(e) => {
@@ -319,7 +319,7 @@ impl L2Stack {
         ethernet_packet.ethertype = u16::from(EtherType::ARP);
         let mut arp_request = ArpPacket::new();
         arp_request.hw_type = 0x0001;
-        arp_request.proto_type = 0x0800;
+        arp_request.proto_type = u16::from(EtherType::IPv4);
         arp_request.hw_size = 0x6;
         arp_request.proto_size = 0x4;
         arp_request.opcode = 0x0001;
@@ -359,12 +359,27 @@ impl L2Stack {
     fn arp_handler(&self, ethernet: EthernetPacket, arp: ArpPacket) -> Result<()> {
         let arp_src_ip = Ipv4Addr::from(arp.src_ip);
         let arp_dst_ip = Ipv4Addr::from(arp.dst_ip);
+        let arp_src_mac = MacAddress::from_bytes(&arp.src_mac)?;
         if arp.opcode == 0x1 && arp_dst_ip == self.interface_ipv4.address &&
            is_netmask_range(&self.interface_ipv4.address, self.interface_ipv4.netmask, &arp_src_ip) {
             // request to me, from local network.
+            if !arp_src_mac.is_nil() && !arp_src_mac.is_broadcast() && !arp_src_mac.is_multicast() &&
+               !arp_src_ip.is_broadcast() && !arp_src_ip.is_multicast() && !arp_src_ip.is_link_local() && !arp_src_ip.is_loopback() {
+                let mut arp_table = self.arp_table.lock().unwrap();
+                let arp_entry = ArpEntry {
+                    mac: arp_src_mac,
+                    creation_time: Instant::now(),
+                    ttl: ARP_CACHE_TIME
+                };
+                log::debug!("Arp entry added from request. ip: {} {}", arp_src_ip, arp_entry);
+                arp_table.insert(arp_src_ip, arp_entry);
+                drop(arp_table);
+                self.publish_event(L2StackEvent::ArpReceived);
+            }
+            // reply to request
             let mut arp_reply = ArpPacket::new();
             arp_reply.hw_type = 0x0001;
-            arp_reply.proto_type = 0x0800;
+            arp_reply.proto_type = u16::from(EtherType::IPv4);
             arp_reply.hw_size = 0x06;
             arp_reply.proto_size = 0x04;
             arp_reply.opcode = 0x2;
@@ -377,18 +392,18 @@ impl L2Stack {
             ethernet_packet.src = self.interface_mac.as_bytes().try_into()?;
             ethernet_packet.ethertype = u16::from(EtherType::ARP);
             ethernet_packet.payload = arp_reply.create_packet()?;
-            log::debug!("Replying to arp request. dst mac: {} dst ip: {}", MacAddress::from_bytes(&arp.src_mac)?, arp_src_ip);
+            log::debug!("Replying to arp request. dst mac: {} dst ip: {}", arp_src_mac, arp_src_ip);
             let send_lock = self.send_channel.lock().unwrap();
             send_lock.send(ethernet_packet.create_packet()?.into_boxed_slice()).context("Failed to send reply arp packet.")?;
         } else if arp.opcode == 0x2 && is_netmask_range(&self.interface_ipv4.address, self.interface_ipv4.netmask, &arp_dst_ip) {
             // reply
             let mut arp_table = self.arp_table.lock().unwrap();
             let arp_entry = ArpEntry {
-                mac: MacAddress::from_bytes(&arp.src_mac)?,
+                mac: arp_src_mac,
                 creation_time: Instant::now(),
                 ttl: ARP_CACHE_TIME
             };
-            log::debug!("Arp entry added. ip: {} {}", arp_src_ip, arp_entry);
+            log::debug!("Arp entry added from reply. ip: {} {}", arp_src_ip, arp_entry);
             arp_table.insert(arp_src_ip, arp_entry);
             self.publish_event(L2StackEvent::ArpReceived);
         }
