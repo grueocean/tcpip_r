@@ -1,6 +1,6 @@
-use crate::ethernet::get_interface_mac;
-use crate::arp::{L2Stack, is_netmask_range, generate_network_addr, generate_broadcast_addr};
-use crate::types::{Ipv4Type, L2Error, L3Error};
+use crate::l2_l3::ethernet::get_interface_mac;
+use crate::l2_l3::arp::{L2Stack, is_netmask_range, generate_network_addr, generate_broadcast_addr};
+use crate::l2_l3::defs::{Ipv4Type, L2Error, L3Error};
 use anyhow::{Context, Result};
 use log;
 use eui48::MacAddress;

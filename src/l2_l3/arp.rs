@@ -1,6 +1,6 @@
-use crate::ethernet::{self, EthernetPacket, EthernetRecveiver, EthernetSender};
-use crate::ip::{Ipv4Packet, Ipv4Config};
-use crate::types::{EtherType, L2Error};
+use crate::l2_l3::ethernet::{self, EthernetPacket, EthernetRecveiver, EthernetSender};
+use crate::l2_l3::ip::{Ipv4Packet, Ipv4Config};
+use crate::l2_l3::defs::{EtherType, L2Error};
 use anyhow::{Context, Result};
 use eui48::MacAddress;
 use log;

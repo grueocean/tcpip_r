@@ -1,6 +1,5 @@
-use crate::ip::{Ipv4Packet, NetworkConfiguration, L3Stack, get_global_l3stack};
-use crate::types::{Ipv4Type};
-use crate::udp;
+use crate::l2_l3::ip::{Ipv4Packet, NetworkConfiguration, L3Stack, get_global_l3stack};
+use crate::l2_l3::defs::{Ipv4Type};
 use anyhow::{Context, Result};
 use log;
 use std::collections::{HashMap, VecDeque};
@@ -173,12 +172,12 @@ impl UdpPacket {
         header
     }
 
-    fn create_packet(&mut self) -> Result<Vec<u8>> {
+    fn create_packet(&mut self) -> Vec<u8> {
         let mut packet = Vec::new();
         packet.extend_from_slice(&self.create_header());
         packet.extend_from_slice(&self.payload);
 
-        Ok(packet)
+        packet
     }
 }
 
@@ -256,7 +255,7 @@ impl UdpStack {
         udp_packet.payload = payload;
         udp_packet.calc_header_checksum_and_set();
         ipv4_packet.protocol = u8::from(Ipv4Type::UDP);
-        ipv4_packet.payload = udp_packet.create_packet()?;
+        ipv4_packet.payload = udp_packet.create_packet();
         let l3 = get_global_l3stack(self.config.clone())?;
         l3.l3interface.send(ipv4_packet)?;
 
@@ -703,7 +702,7 @@ mod udp_tests {
 
             let payload_data = decode(udp_payload_hex).expect("Failed to decode payload hex string");
             assert_eq!(udp_packet.payload, payload_data, "UDP payload does not match");
-            let recreated_packet = udp_packet.create_packet().expect("Failed to recreate packet");
+            let recreated_packet = udp_packet.create_packet();
             assert_eq!(ipv4_packet.payload, recreated_packet);
         }
     }

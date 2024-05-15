@@ -1,4 +1,4 @@
-use crate::types::EtherType;
+use crate::l2_l3::defs::EtherType;
 use anyhow::{Context, Result};
 use eui48::MacAddress;
 use log;

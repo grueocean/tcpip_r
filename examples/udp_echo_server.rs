@@ -5,8 +5,8 @@ use hex;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::from_utf8;
 use tcpip_r::{
-    ip::{generate_network_config, Ipv4Config},
-    udp::UdpSocket
+    l2_l3::ip::{generate_network_config, Ipv4Config},
+    udp::udp_impl::UdpSocket
 };
 
 #[derive(Parser, Debug)]

@@ -2,13 +2,13 @@ use anyhow::Result;
 use clap::Parser;
 use eui48::MacAddress;
 use hex;
-use tcpip_r::udp::UdpNetworkInfo;
+use tcpip_r::udp::udp_impl::UdpNetworkInfo;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::from_utf8;
 use tcpip_r::{
-    ip::{generate_network_config, Ipv4Config},
-    udp::UdpSocket
+    l2_l3::ip::{generate_network_config, Ipv4Config},
+    udp::udp_impl::UdpSocket
 };
 
 #[derive(Parser, Debug)]
