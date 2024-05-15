@@ -266,13 +266,13 @@ impl MatchFragmentHeader for Ipv4Packet {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Ipv4FragmentHole {
     pub start: usize,
     pub end: usize
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Ipv4FragmentPiece {
     pub is_hole: bool,
     pub hole: Option<Ipv4FragmentHole>,
@@ -354,8 +354,8 @@ impl Ipv4FragmentQueue {
                     // after:
                     // <--hole1--><--packet--><--hole2-->
                     } else {
-                        if frag_start != 0 {
-                            // When adding first packet, no hole1 is generated.
+                        if frag_start != hole.start {
+                            // When adding head packet, no hole1 is generated.
                             let hole1 = Ipv4FragmentPiece {
                                 is_hole: true,
                                 hole: Some(Ipv4FragmentHole { start: hole.start, end: frag_start - 1}),
@@ -381,12 +381,14 @@ impl Ipv4FragmentQueue {
                         "Ignoring a fragmented ipv4 packet suspected of being a duplicate. hole: {}-{} packet: {}-{}",
                         hole.start, hole.end, frag_start, frag_end
                     );
+                    new_queue.push_back(piece.clone());
                     continue;
                 } else {
                     log::debug!(
                         "Discarding a fragmented ipv4 packet conflicting existing hole. hole: {}-{} packet: {}-{}",
                         hole.start, hole.end, frag_start, frag_end
                     );
+                    new_queue.push_back(piece.clone());
                     continue;
                 }
             }
