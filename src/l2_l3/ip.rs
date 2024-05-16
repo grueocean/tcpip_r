@@ -23,15 +23,15 @@ const IPV4_FRAGMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // https://datatracker.ietf.org/doc/html/rfc791
 //
-//Bit 0: reserved, must be zero
-//Bit 1: (DF) 0 = May Fragment,  1 = Don't Fragment.
-//Bit 2: (MF) 0 = Last Fragment, 1 = More Fragments.
+// Bit 0: reserved, must be zero
+// Bit 1: (DF) 0 = May Fragment,  1 = Don't Fragment.
+// Bit 2: (MF) 0 = Last Fragment, 1 = More Fragments.
 //
-//    0   1   2
-//  +---+---+---+
-//  |   | D | M |
-//  | 0 | F | F |
-//  +---+---+---+
+//     0   1   2
+//   +---+---+---+
+//   |   | D | M |
+//   | 0 | F | F |
+//   +---+---+---+
 //
 
 const IPV4_FLAG_DF: u8 = 0b010;
@@ -120,7 +120,7 @@ impl Ipv4Packet {
         if self.ihl == 5 {  // 20 bytes header w/o option
             self.options = None;
             self.payload = packet[20..].to_vec();
-        } else if self.ihl == 6 {  // 24 byte header w/ option
+        } else if self.ihl == 6 {  // 24 bytes header w/ option
             self.options = Some(u32::from_be_bytes(packet[20..24].try_into()?));
             self.payload = packet[24..].to_vec();
         } else {
@@ -333,6 +333,7 @@ impl Ipv4FragmentQueue {
                     // after:
                     // <--hole1--><--packet-->||truncate||
                     if (packet.flags & 0b001) == 0 {
+                        // When adding head packet, hole1 is not generated.
                         if hole.start < frag_start {
                             let hole1 = Ipv4FragmentPiece {
                                 is_hole: true,
@@ -355,7 +356,7 @@ impl Ipv4FragmentQueue {
                     // <--hole1--><--packet--><--hole2-->
                     } else {
                         if frag_start != hole.start {
-                            // When adding head packet, no hole1 is generated.
+                            // When adding head packet, hole1 is not generated.
                             let hole1 = Ipv4FragmentPiece {
                                 is_hole: true,
                                 hole: Some(Ipv4FragmentHole { start: hole.start, end: frag_start - 1}),
@@ -391,15 +392,9 @@ impl Ipv4FragmentQueue {
                     new_queue.push_back(piece.clone());
                     continue;
                 }
-            }
             // current piece is packet
-            if let Some(p) = &piece.packet {
-                let new_piece = Ipv4FragmentPiece {
-                    is_hole: false,
-                    hole: None,
-                    packet: Some(p.clone())
-                };
-                new_queue.push_back(new_piece);
+            } else {
+                new_queue.push_back(piece.clone());
             }
         }
         self.queue = new_queue;
