@@ -18,10 +18,10 @@ const UDP_MAX_PACKET_PER_QUEUE: usize = 1024;
 // the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)
 const UDP_EPHEMERAL_PORT_RANGE: Range<u16> = 49152..65535;
 
-static UDPSTACK_GLOBAL: OnceLock<Arc<UdpStack>> = OnceLock::new();
+static UDP_STACK_GLOBAL: OnceLock<Arc<UdpStack>> = OnceLock::new();
 
 pub fn get_global_udpstack(config: NetworkConfiguration) -> Result<&'static Arc<UdpStack>> {
-    Ok(UDPSTACK_GLOBAL.get_or_init(|| UdpStack::new(config).unwrap()))
+    Ok(UDP_STACK_GLOBAL.get_or_init(|| UdpStack::new(config).unwrap()))
 }
 
 // https://datatracker.ietf.org/doc/html/rfc768
@@ -299,11 +299,11 @@ impl UdpStack {
                     return Ok(network_info);
                 }
             }
-            anyhow::bail!("Failed to bind socket. No available ephemeral port.");
+            anyhow::bail!("Failed to bind udp socket. No available ephemeral port.");
         } else {
             // verify if specified port is already used
             if used_ports.contains(&network_info.local.port()) {
-                anyhow::bail!("Failed to bind socket. Port {} is already used.", network_info.local.port())
+                anyhow::bail!("Failed to bind udp socket. Port {} is already used.", network_info.local.port())
             } else {
                 sockets.insert(socket_id, Some(network_info));
                 self.update_queue(socket_id, network_info)?;
@@ -369,7 +369,7 @@ impl UdpStack {
             }
         }
 
-        anyhow::bail!("Failed to generate new socket because no available id. UDP_MAX_SOCKET={}", UDP_MAX_SOCKET)
+        anyhow::bail!("Failed to generate new udp socket because no available id. UDP_MAX_SOCKET={}", UDP_MAX_SOCKET)
     }
 
     pub fn release_socket(&self, socket_id: usize) -> Result<()> {
@@ -551,7 +551,7 @@ impl UdpSocket {
                         }
                     }
                     None => {
-                        anyhow::bail!("Address may be invalid.");
+                        anyhow::bail!("Address may be invalid.")
                     }
                 }
             }

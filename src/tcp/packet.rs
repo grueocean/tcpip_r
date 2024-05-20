@@ -213,9 +213,10 @@ impl TcpPacket {
         header
     }
 
-    fn create_packet(&mut self) -> Vec<u8> {
-        let mut packet = Vec::new();
+    pub fn create_packet(&mut self) -> Vec<u8> {
+        self.calc_header_checksum_and_set();
         self.set_option_raw();
+        let mut packet = Vec::new();
         packet.extend_from_slice(&self.create_header());
         packet.extend_from_slice(&self.payload);
 
@@ -537,6 +538,6 @@ mod tcp_tests {
         let mut tcp_packet = TcpPacket::new();
         let result = tcp_packet.read(&ipv4_packet);
 
-        assert!(result.is_err(), "Expected an error for incorrect TCP header");
+        assert!(result.is_err(), "Expected an error for incorrect TCP packet");
     }
 }

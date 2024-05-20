@@ -1,14 +1,15 @@
+use std::fmt::{self, Display};
+
 // https://www.iana.org/assignments/tcp-parameters/tcp-parameters.xhtml
-#[repr(u8)]
 pub enum TcpOptionKind {
     // 8 bit
-    EndOption = 0x00u8,       // mandatory
-    NoOperation = 0x01u8,     // mandatory, used for word boundary allign
-    MaxSegmentSize = 0x02u8,  // mandatory
-    WindowScale = 0x3u8,      // https://datatracker.ietf.org/doc/html/rfc7323#section-2
-    SackPermission = 0x04u8,  // rfc2018, rfc2883
-    SackOption = 0x05u8,      // rfc2018, rfc2883
-    Timestamp = 0x08u8,       // https://datatracker.ietf.org/doc/html/rfc7323#section-3
+    EndOption = 0x00,       // mandatory
+    NoOperation = 0x01,     // mandatory, used for word boundary allign
+    MaxSegmentSize = 0x02,  // mandatory
+    WindowScale = 0x3,      // https://datatracker.ietf.org/doc/html/rfc7323#section-2
+    SackPermission = 0x04,  // rfc2018, rfc2883
+    SackOption = 0x05,      // rfc2018, rfc2883
+    Timestamp = 0x08,       // https://datatracker.ietf.org/doc/html/rfc7323#section-3
     Unknown
 }
 
@@ -30,5 +31,37 @@ impl From<u8> for TcpOptionKind {
 impl From<TcpOptionKind> for u8 {
     fn from(t: TcpOptionKind) -> Self {
         t as u8
+    }
+}
+
+
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub enum TcpStatus {
+    Listen,
+    SynSent,
+    SynRcvd,
+    Established,
+    FinWait1,
+    FinWait2,
+    TimeWait,
+    CloseWait,
+    LastAck,
+    Closed,
+}
+
+impl Display for TcpStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TcpStatus::Listen => write!(f, "LISTEN"),
+            TcpStatus::SynSent => write!(f, "SYN-SENT"),
+            TcpStatus::SynRcvd => write!(f, "SYN-RCVD"),
+            TcpStatus::Established => write!(f, "ESTABLISHED"),
+            TcpStatus::FinWait1 => write!(f, "FIN-WAIT-1"),
+            TcpStatus::FinWait2 => write!(f, "FIN-WAIT-2"),
+            TcpStatus::TimeWait => write!(f, "TIME-WAIT"),
+            TcpStatus::CloseWait => write!(f, "CLOSE-WAIT"),
+            TcpStatus::LastAck => write!(f, "LAST-ACK"),
+            TcpStatus::Closed => write!(f, "CLOSED"),
+        }
     }
 }

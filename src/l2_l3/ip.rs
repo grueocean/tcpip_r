@@ -211,7 +211,7 @@ impl Ipv4Packet {
         let mut packets = VecDeque::new();
         let base_packet = self.clone();
         let header_length = (self.ihl * 4) as usize;
-        // fragment must be 8-byte alligned
+        // fragment must be 8-bytes alligned
         let max_payload = (
             std::cmp::min(
                 mtu - header_length,
