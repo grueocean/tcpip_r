@@ -9,12 +9,12 @@ use std::thread::{self, JoinHandle};
 
 use super::tcp_impl::get_global_tcpstack;
 
-pub struct TcpSocket {
+pub struct TcpListener {
     config: NetworkConfiguration,
     socket_id: usize,
 }
 
-impl TcpSocket {
+impl TcpListener {
     pub fn new(config: NetworkConfiguration) -> Result<Self> {
         let tcp = get_global_tcpstack(config.clone())?;
         let id = tcp.generate_socket()?;
@@ -29,6 +29,7 @@ impl TcpSocket {
                         let ip = SocketAddrV4::new(v4_addr, addr.port());
                         let tcp = get_global_tcpstack(self.config.clone())?;
                         tcp.bind(self.socket_id, ip)?;
+                        tcp.listen(self.socket_id)?;
                         Ok(())
                     }
                     IpAddr::V6(_) => {
@@ -42,15 +43,36 @@ impl TcpSocket {
         }
     }
 
-    pub fn listen(&self) {
+    pub fn accept(&self) {
 
+    }
+
+    pub fn send(&self) {
+
+    }
+
+    pub fn recv(&self) {
+
+    }
+
+    pub fn close(&self) {
+
+    }
+}
+
+pub struct TcpStream {
+    config: NetworkConfiguration,
+    socket_id: usize,
+}
+
+impl TcpStream {
+    pub fn new(config: NetworkConfiguration) -> Result<Self> {
+        let tcp = get_global_tcpstack(config.clone())?;
+        let id = tcp.generate_socket()?;
+        Ok(Self {config: config.clone(), socket_id: id})
     }
 
     pub fn connect(&self) {
-
-    }
-
-    pub fn accept(&self) {
 
     }
 

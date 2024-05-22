@@ -3,16 +3,20 @@ use crate::{
     tcp::{defs::TcpStatus, packet::TcpPacket}
 };
 use anyhow::{Context, Result};
-use std::{collections::HashMap, default, sync::MutexGuard};
+use pnet::packet::tcp::Tcp;
+use std::{collections::HashMap, default, sync::MutexGuard, time::Duration};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc::channel};
 use std::thread::{self, JoinHandle};
 
-const TCP_MAX_SOCKET: usize = 10;
-// https://datatracker.ietf.org/doc/html/rfc6335
-// the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)
+const TCP_MAX_SOCKET: usize = 100;
+// "the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)" rfc6335
 const TCP_EPHEMERAL_PORT_RANGE: Range<u16> = 49152..65535;
+// "The present global default is five minutes." rfc9293
+const TCP_OPEN_TIMEOUT: Duration = Duration::from_secs(300);
+const TCP_MAX_CONCURRENT_SESSION: usize = 10;
+const TCP_MAX_LISTEN_QUEUE: usize = TCP_MAX_CONCURRENT_SESSION * 3 / 2;
 
 static TCP_STACK_GLOBAL: OnceLock<Arc<TcpStack>> = OnceLock::new();
 
@@ -23,6 +27,7 @@ pub fn get_global_tcpstack(config: NetworkConfiguration) -> Result<&'static Arc<
 pub struct TcpStack {
     pub config: NetworkConfiguration,
     pub connections: Mutex<HashMap<usize, Option<TcpConnection>>>,
+    pub listen_queue: Mutex<HashMap<usize, ListenQueue>>,
     pub threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -31,6 +36,7 @@ impl TcpStack {
         let tcp = Arc::new(Self {
             config: config,
             connections: Mutex::new(HashMap::new()),
+            listen_queue: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
         });
         Ok(tcp)
@@ -106,6 +112,31 @@ impl TcpStack {
         }
     }
 
+    pub fn listen(&self, socket_id: usize) -> Result<()> {
+        let mut conns = self.connections.lock().unwrap();
+        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            if conn.status == TcpStatus::Closed {
+                conn.status = TcpStatus::Listen;
+                let mut listen_queue = self.listen_queue.lock().unwrap();
+                listen_queue.insert(socket_id, ListenQueue {pending: Vec::new(), established: Vec::new()});
+                Ok(())
+            } else {
+                anyhow::bail!("Only Closed socket can transit to Listen. Current: {}", conn.status);
+            }
+        } else {
+            anyhow::bail!("Cannot listen Socket({}) which is not bound.", socket_id);
+        }
+    }
+
+    // pub fn connect(&self, socket_id: usize, addr: SocketAddrV4) -> Result<()> {
+    //     let mut conns = self.connections.lock().unwrap();
+    //     if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+    //         let mut tcp_packet = TcpPacket::new();
+    //     } else {
+    //         anyhow::bail!("Socket({}) is not bound.", socket_id);
+    //     }
+    // }
+
     pub fn send(
         &self,
         socket_id: usize,
@@ -167,21 +198,6 @@ impl TcpStack {
         for (id, connection_info) in conns.iter() {
             if let Some(TcpConnection {
                 src_addr: s_addr,
-                dst_addr: None,
-                local_port: l_port,
-                remote_port: None,
-                status: _status,
-                send_vars: _send_vars,
-                recv_vars: _recv_vars
-            }) = connection_info {
-                if s_addr == dst_addr && l_port == remote_port {
-                    socket_id = Some(*id);
-                } else {
-                    continue;
-                }
-            }
-            if let Some(TcpConnection {
-                src_addr: s_addr,
                 dst_addr: Some(d_addr),
                 local_port: l_port,
                 remote_port: Some(r_port),
@@ -190,6 +206,21 @@ impl TcpStack {
                 recv_vars: _recv_vars
             }) = connection_info {
                 if s_addr == dst_addr && d_addr == src_addr && l_port == remote_port && r_port == local_port {
+                    socket_id = Some(*id);
+                } else {
+                    continue;
+                }
+            }
+            if let Some(TcpConnection {
+                src_addr: s_addr,
+                dst_addr: None,
+                local_port: l_port,
+                remote_port: None,
+                status: _status,
+                send_vars: _send_vars,
+                recv_vars: _recv_vars
+            }) = connection_info {
+                if s_addr == dst_addr && l_port == remote_port {
                     socket_id = Some(*id);
                 } else {
                     continue;
@@ -218,7 +249,7 @@ impl TcpStack {
                     }
                 }
             } else {
-                anyhow::bail!("No TcpConnection Data for picked id {}. This should be impossible if locking logic is correct.", id);
+                anyhow::bail!("No TcpConnection Data for socket id {}. This should be impossible if locking logic is correct.", id);
             }
         } else {
         }
@@ -241,6 +272,11 @@ impl TcpStack {
     fn generate_initial_sequence() -> u32 {
         100
     }
+}
+
+pub struct ListenQueue {
+    pub pending: Vec<usize>,
+    pub established: Vec<usize>,
 }
 
 pub struct TcpConnection {

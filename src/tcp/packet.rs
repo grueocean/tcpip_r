@@ -226,6 +226,15 @@ impl TcpPacket {
     fn set_option_raw(&mut self) {
         self.option_raw = self.option.create_packet_option();
     }
+
+    fn set_offset(&mut self) {
+        self.offset = (TCP_HEADER_LENGTH_BASIC + self.option_raw.len()) as u8;
+    }
+
+    fn set_packet_params(&mut self) {
+        // set option_raw, tcp_length, offset and checksum
+        self.set_option_raw();
+    }
 }
 
 #[derive(Debug, PartialEq)]
