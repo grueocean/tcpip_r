@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 const UDP_HEADER_LENGTH: usize = 8;
 const UDP_MAX_SOCKET: usize = 10;
 const UDP_MAX_PACKET_PER_QUEUE: usize = 1024;
-// https://datatracker.ietf.org/doc/html/rfc6335
-// the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)
+// "the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)" rfc6335
 const UDP_EPHEMERAL_PORT_RANGE: Range<u16> = 49152..65535;
 
 static UDP_STACK_GLOBAL: OnceLock<Arc<UdpStack>> = OnceLock::new();

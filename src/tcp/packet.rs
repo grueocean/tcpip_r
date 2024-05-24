@@ -214,8 +214,7 @@ impl TcpPacket {
     }
 
     pub fn create_packet(&mut self) -> Vec<u8> {
-        self.calc_header_checksum_and_set();
-        self.set_option_raw();
+        self.set_packet_params();
         let mut packet = Vec::new();
         packet.extend_from_slice(&self.create_header());
         packet.extend_from_slice(&self.payload);
@@ -231,19 +230,43 @@ impl TcpPacket {
         self.offset = (TCP_HEADER_LENGTH_BASIC + self.option_raw.len()) as u8;
     }
 
+    fn set_tcp_length(&mut self) {
+        self.tcp_length = (TCP_HEADER_LENGTH_BASIC + self.option_raw.len() + self.payload.len()) as u16;
+    }
+
     fn set_packet_params(&mut self) {
         // set option_raw, tcp_length, offset and checksum
         self.set_option_raw();
+        self.set_offset();
+        self.set_tcp_length();
+        self.calc_header_checksum_and_set()
+    }
+
+    pub fn create_reply_base(&self) -> Self {
+        let mut reply = Self::new();
+        reply.src_addr = self.dst_addr;
+        reply.dst_addr = self.src_addr;
+        reply.local_port = self.remote_port;
+        reply.remote_port = self.local_port;
+        reply
+    }
+
+    pub fn create_rst(&self) -> Self {
+        let mut rst = self.create_reply_base();
+        rst.ack_number = self.seq_number + 1;
+        rst.flag_ack = true;
+        rst.flag_rst = true;
+        rst
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct TcpOption {
-    mss: Option<u16>,                         // kind=2 Maximum Segment Size  2 bytes
-    window_scale: Option<u8>,                 // kind=3 Window Scale Option   1 bytes
-    sack_permitted: bool,                     // kind=4 Sack-Permitted Option 0 bytes (only kind and length=2)
-    sack: Option<Vec<(u32, u32)>>,            // kind=5 Sack Option           8 bytes * n
-    timestamps: Option<TcpOptionTimestamp>    // kind=8 Timestamps Option     4 bytes * 2
+    pub mss: Option<u16>,                         // kind=2 Maximum Segment Size  2 bytes
+    pub window_scale: Option<u8>,                 // kind=3 Window Scale Option   1 bytes
+    pub sack_permitted: bool,                     // kind=4 Sack-Permitted Option 0 bytes (only kind and length=2)
+    pub sack: Option<Vec<(u32, u32)>>,            // kind=5 Sack Option           8 bytes * n
+    pub timestamps: Option<TcpOptionTimestamp>    // kind=8 Timestamps Option     4 bytes * 2
 }
 
 impl TcpOption {

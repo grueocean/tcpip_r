@@ -43,16 +43,13 @@ impl TcpListener {
         }
     }
 
-    pub fn accept(&self) {
-
-    }
-
-    pub fn send(&self) {
-
-    }
-
-    pub fn recv(&self) {
-
+    pub fn accept(&self) -> Result<(TcpStream, SocketAddrV4)> {
+        let tcp = get_global_tcpstack(self.config.clone())?;
+        let (id, addr) = tcp.accept(self.socket_id)?;
+        return Ok((
+            TcpStream { socket_id: id, config: self.config.clone() },
+            addr
+        ));
     }
 
     pub fn close(&self) {
