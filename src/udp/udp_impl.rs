@@ -381,6 +381,7 @@ impl UdpStack {
     }
 
     fn receive_thread(&self) -> Result<()> {
+        log::info!("Starting UdpStack receive_thread.");
         let l3 = get_global_l3stack(self.config.clone())?;
         let (udp_send_channel, udp_recv_channel) = channel();
         l3.register_protocol(u8::from(Ipv4Type::UDP), udp_send_channel)?;

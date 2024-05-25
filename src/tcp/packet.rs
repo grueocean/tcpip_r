@@ -168,7 +168,6 @@ impl TcpPacket {
         }
         let expected_checksum = self.calc_header_checksum();
         if self.checksum != expected_checksum && self.checksum != 0x0 {
-            println!("ex: {:x} act: {:x}", expected_checksum, self.checksum);
             log::debug!("Unexpected tcp header. Header checksum is 0x{:x} but is expected 0x{:x}.", self.checksum, expected_checksum);
             anyhow::bail!("TCP Header has bad checksum 0x{:x}, expected 0x{:x}.", self.checksum, expected_checksum);
         }
@@ -227,7 +226,7 @@ impl TcpPacket {
     }
 
     fn set_offset(&mut self) {
-        self.offset = (TCP_HEADER_LENGTH_BASIC + self.option_raw.len()) as u8;
+        self.offset = ((TCP_HEADER_LENGTH_BASIC + self.option_raw.len()) / 4) as u8;
     }
 
     fn set_tcp_length(&mut self) {
@@ -246,6 +245,7 @@ impl TcpPacket {
         let mut reply = Self::new();
         reply.src_addr = self.dst_addr;
         reply.dst_addr = self.src_addr;
+        reply.protocol = u8::from(Ipv4Type::TCP);
         reply.local_port = self.remote_port;
         reply.remote_port = self.local_port;
         reply

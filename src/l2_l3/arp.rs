@@ -165,14 +165,13 @@ impl L2Stack {
 
     // manage arp cache expire
     fn timer_thread(&self) -> Result<()> {
+        log::info!("Starting L2Stack timer_thread.");
         loop {
             let mut arp_table = self.arp_table.lock().unwrap();
             arp_table.retain(|_, entry| Instant::now() < entry.creation_time + entry.ttl);
             drop(arp_table);
             thread::sleep(ARP_CACHE_REFREASH);
         }
-
-        Ok(())
     }
 
     fn send_thread(&self, recv_channl: Receiver<Box<[u8]>>) -> Result<()> {
@@ -186,6 +185,7 @@ impl L2Stack {
     }
 
     fn receive_thread(&self) -> Result<()> {
+        log::info!("Starting L2Stack receive_thread.");
         let mut iface_recv = EthernetRecveiver::new(&self.interface_name)?;
         loop {
             let packet = iface_recv.recv_packet()?;

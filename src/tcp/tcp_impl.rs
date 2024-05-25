@@ -3,7 +3,7 @@ use crate::{
     tcp::{defs::TcpStatus, packet::TcpPacket}
 };
 use anyhow::{Context, Result};
-use pnet::packet::tcp::{self, Tcp};
+use log;
 use std::{collections::{HashMap, VecDeque}, sync::MutexGuard, time::Duration};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::ops::Range;
@@ -43,6 +43,13 @@ impl TcpStack {
             threads: Mutex::new(Vec::new()),
             event_condvar: (Mutex::new(TcpEvent {socket_id: 0, event: TcpEventType::InitailState}), Condvar::new())
         });
+
+        let tcp_recv = tcp.clone();
+        let handle_recv = thread::spawn(move || {
+            tcp_recv.receive_thread().unwrap();
+        });
+        tcp.threads.lock().unwrap().push(handle_recv);
+
         Ok(tcp)
     }
 
@@ -124,7 +131,7 @@ impl TcpStack {
                 listen_queue.insert(
                     socket_id,
                     ListenQueue {
-                        pending: VecDeque::new(), established_unconsumed: VecDeque::new(), established_consumed: VecDeque::new(), accepted: false
+                        pending: VecDeque::new(), established_unconsumed: VecDeque::new(), established_consumed: VecDeque::new(), accepted: 0
                     });
                 Ok(())
             } else {
@@ -141,6 +148,7 @@ impl TcpStack {
             if conn.status == TcpStatus::Listen {
                 let mut listen_queue = self.listen_queue.lock().unwrap();
                 if let Some(queue) = listen_queue.get_mut(&socket_id) {
+                    queue.accepted += 1;
                     if let Some(id) = queue.established_unconsumed.pop_front() {
                         if let Some(Some(conn_est)) = conns.get(&id) {
                             return Ok((id, SocketAddrV4::new(conn_est.dst_addr, conn_est.remote_port)));
@@ -160,6 +168,7 @@ impl TcpStack {
                         if let Some(established_id) = queue.established_unconsumed.pop_front() {
                             if let Some(Some(conn)) = conns.get(&established_id) {
                                 queue.established_consumed.push_back(established_id);
+                                queue.accepted -= 1;
                                 return Ok((established_id, SocketAddrV4::new(conn.dst_addr, conn.remote_port)));
                             } else {
                                 log::error!("Established connection (id={}) dose not exist in TcpConnections", established_id);
@@ -205,6 +214,7 @@ impl TcpStack {
                                     ) {
                                         if conn.status == TcpStatus::Established {
                                             queue.established_consumed.push_back(syn_recv_id);
+                                            queue.accepted -= 1;
                                             return Ok((syn_recv_id, SocketAddrV4::new(conn.dst_addr, conn.remote_port)));
                                         } else {
                                             break;
@@ -295,7 +305,8 @@ impl TcpStack {
         Ok(())
     }
 
-    pub fn receive_thread(&self) -> Result<()> {
+    fn receive_thread(&self) -> Result<()> {
+        log::info!("Starting TcpStack receive_thread.");
         let l3 = get_global_l3stack(self.config.clone())?;
         let (tcp_send_channel, tcp_recv_channel) = channel();
         l3.register_protocol(u8::from(Ipv4Type::TCP), tcp_send_channel)?;
@@ -347,20 +358,7 @@ impl TcpStack {
             }) = connection_info {
                 if s_addr == dst_addr && d_addr == src_addr && l_port == remote_port && r_port == local_port {
                     socket_id = Some(*id);
-                } else {
-                    continue;
-                }
-            }
-            if let Some(TcpConnection {
-                src_addr: s_addr,
-                dst_addr: Ipv4Addr::UNSPECIFIED,
-                local_port: l_port,
-                remote_port: 0,
-                status: _status,
-                send_vars: _send_vars,
-                recv_vars: _recv_vars
-            }) = connection_info {
-                if s_addr == dst_addr && l_port == remote_port {
+                } else if s_addr == dst_addr && *d_addr == Ipv4Addr::UNSPECIFIED && l_port == remote_port && *r_port == 0 {
                     socket_id = Some(*id);
                 } else {
                     continue;
@@ -441,7 +439,7 @@ impl TcpStack {
                         send_vars: send_vars,
                         recv_vars: recv_vars
                     };
-                    if queue.accepted {
+                    if queue.accepted > 0 {
                         // socket is already accepted and waiting for new established connection.
                         let mut syn_ack = tcp_packet.create_reply_base();
                         syn_ack.seq_number = new_conn.send_vars.next_sequence_num;
@@ -512,9 +510,10 @@ pub struct ListenQueue {
     pub pending: VecDeque<usize>,
     pub established_unconsumed: VecDeque<usize>,
     pub established_consumed: VecDeque<usize>,
-    pub accepted: bool,
+    pub accepted: usize,
 }
 
+#[derive(Debug)]
 pub struct TcpConnection {
     pub src_addr: Ipv4Addr,
     pub dst_addr: Ipv4Addr,
@@ -537,7 +536,7 @@ pub struct TcpConnection {
 // 4 - future sequence numbers that are not yet allowed
 //
 //            Figure 3: Send Sequence Space (rfc9293)
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SendVariables {
     pub unacknowledged: u32,       // send unacknowledged (oldest unacknowledged sequence number)
     pub next_sequence_num: u32,    // send next (next sequence number to be sent)
@@ -568,7 +567,7 @@ impl SendVariables {
 // 3 - future sequence numbers that are not yet allowed
 //
 //        Figure 4: Receive Sequence Space (rfc9293)
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ReceiveVariables {
     pub next_sequence_num: u32,    // receive next
     pub window_size: u16,          // receive window

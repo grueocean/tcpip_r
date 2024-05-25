@@ -775,6 +775,7 @@ impl L3Stack {
     }
 
     fn receive_thread(&self) -> Result<()> {
+        log::info!("Starting L3Stack receive_thread.");
         loop {
             let mut ipv4_packet = Ipv4Packet::new();
             match self.l3interface.recv() {

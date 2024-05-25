@@ -13,6 +13,7 @@ use tcpip_r::{
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
+#[command(after_help = "EXAMPLES: ./udp_echo_client -i d1 -n 172.20.10.101/24 -g 172.20.10.1 -d 172.20.10.100 -p 300")]
 struct Args {
     #[arg(long, short = 'i', help = "Interface name, e.g., eth0")]
     iface: String,
