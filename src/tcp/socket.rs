@@ -69,8 +69,25 @@ impl TcpStream {
         Ok(Self {config: config.clone(), socket_id: id})
     }
 
-    pub fn connect(&self) {
-
+    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> Result<()> {
+        match addr.to_socket_addrs()?.next() {
+            Some(addr) => {
+                match addr.ip() {
+                    IpAddr::V4(v4_addr) => {
+                        let tcp = get_global_tcpstack(self.config.clone())?;
+                        tcp.bind(self.socket_id, SocketAddrV4::new(self.config.ip.address, 0))?;
+                        tcp.connect(self.socket_id, SocketAddrV4::new(v4_addr, addr.port()))?;
+                        Ok(())
+                    }
+                    IpAddr::V6(_) => {
+                        anyhow::bail!("Ipv6 is not supported.")
+                    }
+                }
+            }
+            None => {
+                anyhow::bail!("Address may be invalid.")
+            }
+        }
     }
 
     pub fn send(&self) {

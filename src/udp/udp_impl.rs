@@ -542,7 +542,6 @@ impl UdpSocket {
                                 let udp = get_global_udpstack(self.config.clone())?;
                                 let new_info = udp.connect(self.socket_id, info)?;
                                 self.info = Some(new_info);
-
                                 return Ok(());
                             }
                             IpAddr::V6(_) => {

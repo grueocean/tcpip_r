@@ -258,6 +258,11 @@ impl TcpPacket {
         rst.flag_rst = true;
         rst
     }
+
+    pub fn is_syn(&self) -> bool {
+        self.flag_syn &&
+            !(self.flag_cwr || self.flag_urg || self.flag_ack || self.flag_psh || self.flag_rst || self.flag_fin)
+    }
 }
 
 #[derive(Debug, PartialEq)]
