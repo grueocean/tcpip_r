@@ -94,7 +94,8 @@ impl TcpStack {
                                 remote_port: 0,
                                 status: TcpStatus::Closed,
                                 send_vars: Default::default(),
-                                recv_vars: Default::default()
+                                recv_vars: Default::default(),
+                                recv_buffer: VecDeque::new(),
                             };
                             conns.insert(socket_id, Some(new_conn));
                         }
@@ -109,7 +110,8 @@ impl TcpStack {
                             remote_port: 0,
                             status: TcpStatus::Closed,
                             send_vars: Default::default(),
-                            recv_vars: Default::default()
+                            recv_vars: Default::default(),
+                            recv_buffer: VecDeque::new(),
                         };
                         conns.insert(socket_id, Some(new_conn));
                     } else {
@@ -235,7 +237,8 @@ impl TcpStack {
                                     if let Some(Some(conn)) = conns.get_mut(&syn_recv_id) {
                                         if conn.status == TcpStatus::SynRcvd { continue; }
                                     }
-                                    // continue from outer loop again
+                                    // SYN-RECIEVED socket may be removed in a situation like "Recovery from Old Duplicate SYN".
+                                    // In that case, we come to here and start from outer loop again
                                     break;
                                 }
                             }
@@ -290,12 +293,30 @@ impl TcpStack {
             conn.dst_addr = *addr.ip();
             conn.remote_port = addr.port();
             conn.status = TcpStatus::SynSent;
-            conn.recv_vars.next_sequence_num = seq.wrapping_add(1);
+            conn.send_vars.initial_sequence_num = seq;
+            conn.send_vars.next_sequence_num = seq.wrapping_add(1);
             conn.recv_vars.window_size = 4096; // todo: adjust
-            log::debug!("Socket (id={}) sent syn to {}:{}. SEQ={}", socket_id, addr.ip(), addr.port(), seq);
-            Ok(())
+            log::debug!("Socket (id={}) status changed from CLOSED to SYN-SENT. Sent syn to {}:{}. SEQ={}", socket_id, addr.ip(), addr.port(), seq);
         } else {
             anyhow::bail!("Socket (id={}) is not bound.", socket_id);
+        }
+        drop(conns);
+        loop {
+            if self.wait_event_with_timeout(TcpEvent { socket_id: socket_id, event: TcpEventType::Established }, Duration::from_millis(100)) {
+                let conns = self.connections.lock().unwrap();
+                if let Some(Some(conn)) = conns.get(&socket_id) {
+                    if conn.status == TcpStatus::Established {
+                        return Ok(());
+                    } else {
+                        anyhow::bail!("Wake up mismatch. Expecting socket (id={}) becomes ESTABLISHED but is {}.", socket_id, conn.status);
+                    }
+                } else {
+                    anyhow::bail!("Socket (id={}) is not bound.", socket_id);
+                }
+            // timeout occured, so wait again
+            } else {
+                continue;
+            }
         }
     }
 
@@ -324,12 +345,17 @@ impl TcpStack {
         Ok(())
     }
 
-    pub fn send_back_rst(&self, original_packet: &TcpPacket) -> Result<()> {
-        let rst_packet = original_packet.create_rst();
+    pub fn send_back_rst_syn(&self, original_packet: &TcpPacket) -> Result<()> {
+        let rst_packet = original_packet.create_rst_syn();
         self.send_tcp_packet(rst_packet)?;
         Ok(())
     }
 
+    pub fn send_back_rst_ack(&self, original_packet: &TcpPacket) -> Result<()> {
+        let rst_packet = original_packet.create_rst_ack();
+        self.send_tcp_packet(rst_packet)?;
+        Ok(())
+    }
     fn receive_thread(&self) -> Result<()> {
         log::info!("Starting TcpStack receive_thread.");
         let l3 = get_global_l3stack(self.config.clone())?;
@@ -380,7 +406,8 @@ impl TcpStack {
                 remote_port: r_port,
                 status: _status,
                 send_vars: _send_vars,
-                recv_vars: _recv_vars
+                recv_vars: _recv_vars,
+                recv_buffer: _recv_buffer,
             }) = connection_info {
                 if s_addr == dst_addr && d_addr == src_addr && l_port == remote_port && r_port == local_port {
                     ids.push(*id);
@@ -423,29 +450,56 @@ impl TcpStack {
                     conn.status, id, dst_addr, tcp_packet.remote_port, src_addr, tcp_packet.local_port
                 );
                 match &conn.status {
-                    TcpStatus::Listen => { self.listen_handler(id, tcp_packet, conns)?; }
+                    TcpStatus::Listen => { self.listen_handler(id, tcp_packet, conns).context("listen_handler failed.")?; }
+                    TcpStatus::SynSent => { self.syn_sent_handler(id, tcp_packet, conns).context("syn_sent_handler failed.")?; }
                     other => {
                         anyhow::bail!("Handler for TcpStatus {} is not implemented.", other);
                     }
                 }
                 return Ok(());
             } else {
-                anyhow::bail!("No TcpConnection Data for socket id {}. This should be impossible if locking logic is correct.", id);
+                anyhow::bail!("No TcpConnection Data for the socket (id={}). This should be impossible if locking logic is correct.", id);
             }
         } else {
-            log::debug!("No socket bound for the packet dst {}:{}, send back rst packet.", dst_addr, tcp_packet.remote_port);
-            self.send_back_rst(tcp_packet)?;
+            // "An incoming segment not containing a RST causes a RST to be sent in response." rfc9293
+            if !tcp_packet.flag_rst {
+                self.send_back_rst_syn(tcp_packet)?;
+                log::debug!("No socket bound for the packet to {}:{}, send back rst packet.", dst_addr, tcp_packet.remote_port);
+            // "An incoming segment containing a RST is discarded." rfc9293
+            } else {
+                log::debug!("No socket bound for the rst packet to {}:{}, ignore it.", dst_addr, tcp_packet.remote_port);
+            }
             Ok(())
         }
     }
 
-    pub fn listen_handler(&self, socket_id: usize, tcp_packet: &TcpPacket, mut conns: MutexGuard<HashMap<usize, Option<TcpConnection>>>) -> Result<()> {
-        if !tcp_packet.is_syn() {
+    // 3.10.7.2 LISTEN STATE rfc9293
+    pub fn listen_handler(
+        &self,
+        socket_id: usize,
+        tcp_packet: &TcpPacket,
+        mut conns: MutexGuard<HashMap<usize, Option<TcpConnection>>>
+    ) -> Result<()> {
+        if tcp_packet.flag_rst {
             log::debug!(
-                "Reject not a syn packet from {}:{} by the LISTEN socket (id={}), send back rst packet.",
+                "LISTEN socket ignores any rst packet. socket_id={} remote={}:{}",
                 socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
             );
-            self.send_back_rst(tcp_packet)?;
+            return Ok(());
+        };
+        if tcp_packet.flag_ack {
+            self.send_back_rst_ack(tcp_packet)?;
+            log::debug!(
+                "LISTEN socket rejects any ack packet and send back rst. socket_id={} remote={}:{}",
+                socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
+            );
+            return Ok(());
+        };
+        if !tcp_packet.flag_syn {
+            log::debug!(
+                "LISTEN socket ignores any not a syn packet (also no rst/ack flag). scoket_id={} remote={}:{}",
+                socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
+            );
             return Ok(());
         }
         let mut listen_queue = self.listen_queue.lock().unwrap();
@@ -487,7 +541,8 @@ impl TcpStack {
                         remote_port: tcp_packet.local_port,
                         status: TcpStatus::SynRcvd,
                         send_vars: send_vars,
-                        recv_vars: recv_vars
+                        recv_vars: recv_vars,
+                        recv_buffer: VecDeque::new(),
                     };
                     if queue.accepted > 0 {
                         // socket is already accepted and waiting for new established connection.
@@ -526,11 +581,165 @@ impl TcpStack {
         }
     }
 
-    pub fn syn_sent_handler(&self) -> Result<()> {
-        Ok(())
+    // 3.10.7.3 SYN-SENT STATE rfc9293
+    pub fn syn_sent_handler(
+        &self,
+        socket_id: usize,
+        tcp_packet: &TcpPacket,
+        mut conns: MutexGuard<HashMap<usize, Option<TcpConnection>>>
+    ) -> Result<()> {
+        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            if tcp_packet.flag_ack {
+                // This case includes "Recovery from Old Duplicate SYN" rfc9293
+                if tcp_packet.ack_number <= conn.recv_vars.initial_sequence_num || tcp_packet.ack_number > conn.recv_vars.next_sequence_num {
+                    self.send_back_rst_ack(tcp_packet)?;
+                    log::debug!(
+                        "SYN-SENT socket rejects an unacceptable ack packet and send back rst. socket_id={} remote={}:{} Expected ACK={} but received ACK={}",
+                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.ack_number, conn.recv_vars.next_sequence_num
+                    );
+                    return Ok(());
+                }
+            }
+            if tcp_packet.flag_rst {
+                if tcp_packet.ack_number == conn.recv_vars.next_sequence_num {
+                    log::debug!(
+                        "Socket (id={}) status changed from SYN-SENT to CLOSED. Received acceptable RST. remote={}:{} ACK={})",
+                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.ack_number
+                    );
+                    conn.status = TcpStatus::Closed;
+                    self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Closed });
+                    return Ok(());
+                } else {
+                    log::debug!(
+                        "SYN-SENT socket ignores rst packet with unacceptable ACK. socket_id={} remote={}:{} Expected ACK={} but received ACK={}",
+                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, conn.recv_vars.next_sequence_num, tcp_packet.ack_number
+                    );
+                    return Ok(());
+                }
+            }
+            if tcp_packet.flag_syn {
+                // SYN/ACK, which means Normal 3-way handshake (active and passive)
+                if tcp_packet.flag_ack {
+                    let next_seq = tcp_packet.ack_number;
+                    let next_ack = tcp_packet.seq_number.wrapping_add(1); // syn is treated as 1 byte.
+                    let mut ack_packet = tcp_packet.create_reply_base();
+                    ack_packet.seq_number = next_seq;
+                    ack_packet.ack_number = next_ack;
+                    ack_packet.flag_ack = true;
+                    ack_packet.windows_size = 4096; // todo: adjust
+                    self.send_tcp_packet(ack_packet)?;
+                    if let Some(mss) = tcp_packet.option.mss {
+                        conn.send_vars.send_mss = mss;
+                    } else {
+                        // "SendMSS is... or the default 536 for IPv4 or 1220 for IPv6, if no MSS Option is received." rfc9293
+                        conn.send_vars.send_mss = 536;
+                    }
+                    conn.send_vars.unacknowledged = next_seq;
+                    conn.send_vars.window_size = tcp_packet.windows_size;
+                    conn.send_vars.next_sequence_num = next_seq; // change nothing.
+                    conn.send_vars.last_sequence_num = tcp_packet.seq_number;
+                    conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
+                    conn.recv_vars.initial_sequence_num = tcp_packet.seq_number;
+                    conn.recv_vars.next_sequence_num = next_ack;
+                    conn.status = TcpStatus::Established;
+                    self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Established });
+                    log::debug!(
+                        "Socket (id={}) status changed from SYN-SENT to ESTABLISHED. remote={}:{} NEXT send-SEQ={} recv-SEQ={}",
+                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, next_ack, next_seq
+                    );
+                    return Ok(());
+                // SYN, which means Simultaneous Connection (Both sides trying active open)
+                } else {
+                    let next_seq = conn.send_vars.initial_sequence_num; // send same seq that is already sent
+                    let next_ack = tcp_packet.seq_number.wrapping_add(1);
+                    let mut syn_ack_packet = tcp_packet.create_reply_base();
+                    syn_ack_packet.seq_number = next_seq;
+                    syn_ack_packet.ack_number = next_ack;
+                    syn_ack_packet.flag_syn = true;
+                    syn_ack_packet.flag_ack = true;
+                    syn_ack_packet.windows_size = 4096; // todo: adjust
+                    syn_ack_packet.option.mss = Some(1460); // todo: adjust
+                    self.send_tcp_packet(syn_ack_packet)?;
+                    conn.send_vars.unacknowledged = next_ack;
+                    conn.send_vars.window_size = tcp_packet.windows_size;
+                    conn.send_vars.last_sequence_num = tcp_packet.seq_number;
+                    conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
+                    conn.recv_vars.next_sequence_num = next_ack;
+                    conn.status = TcpStatus::SynRcvd;
+                    log::debug!(
+                        "Socket (id={}) status changed from SYN-SENT to SYN-RECEIVED. This is a Simultaneous Connection situation. remote={}:{}",
+                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
+                    );
+                    return Ok(());
+                }
+            }
+            log::debug!(
+                "LISTEN socket ignores packet. socket_id={} remote={}:{}",
+                socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
+            );
+            Ok(())
+        } else {
+            anyhow::bail!("No socket (id={}).", socket_id);
+        }
     }
 
-    pub fn syn_recv_handler(&self) -> Result<()> {
+    pub fn syn_recv_handler(
+        &self,
+        socket_id: usize,
+        tcp_packet: &TcpPacket,
+        mut conns: MutexGuard<HashMap<usize, Option<TcpConnection>>>
+    ) -> Result<()> {
+        let mut remove = false;
+        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            // Normal 3-way handshake (active and passive)
+            if tcp_packet.is_ack() {
+                if conn.send_vars.next_sequence_num == tcp_packet.ack_number && conn.recv_vars.next_sequence_num == tcp_packet.seq_number {
+                    conn.status = TcpStatus::Established;
+                    log::debug!(
+                        "Socket (id={} status changed from SYN-RECEIVED to ESTABLISHED. remote={}:{} NEXT send-SEQ={} recv-SEQ={}",
+                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.ack_number, tcp_packet.seq_number
+                    );
+                    self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Established });
+                    return Ok(());
+                } else {
+                    log::debug!(
+                        "SYN-RECEIVED socket (id={}) received incorrect packet from {}:{} and ignored. Expected SEQ/ACK={}/{} but received SEQ/ACK={}/{}",
+                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port,
+                        conn.send_vars.next_sequence_num, conn.recv_vars.next_sequence_num, tcp_packet.seq_number, tcp_packet.ack_number
+                    );
+                    return Ok(());
+                }
+            // Simultaneous Connection (Both sides trying active open)
+            } else if tcp_packet.is_syn_ack() {
+            // "Recovery from Old Duplicate SYN" rfc9293
+            } else if tcp_packet.is_rst() {
+                if conn.recv_vars.next_sequence_num == tcp_packet.seq_number {
+                    remove = true;
+                } else {
+                    log::debug!(
+                        "SYN-RECEIVED socket (id={}) ignored unknown rst packet. Expected SEQ={} but received SEQ={}",
+                        socket_id, conn.recv_vars.next_sequence_num, tcp_packet.seq_number
+                    );
+                    return Ok(());
+                }
+            } else {
+                // todo: close
+            }
+        } else {
+            anyhow::bail!("No socket (id={}).", socket_id);
+        }
+        if remove {
+            conns.remove(&socket_id);
+            let mut parent = 0;
+            let mut listen_queue = self.listen_queue.lock().unwrap();
+            for (parent_id, queue) in listen_queue.iter_mut() {
+                if queue.pending.contains(&socket_id) {
+                    queue.pending.retain(|&x| x != socket_id);
+                    parent = *parent_id;
+                }
+            }
+            // log::debug!("SYN-RECEIVED socket (id={} parent={}) is removed because")
+        }
         Ok(())
     }
 
@@ -583,6 +792,7 @@ pub struct TcpConnection {
     pub status: TcpStatus,
     pub send_vars: SendVariables,
     pub recv_vars: ReceiveVariables,
+    pub recv_buffer: VecDeque<u8>,
 }
 
 //
@@ -599,8 +809,8 @@ pub struct TcpConnection {
 //            Figure 3: Send Sequence Space (rfc9293)
 #[derive(Debug, Default)]
 pub struct SendVariables {
-    pub unacknowledged: u32,       // send unacknowledged (oldest unacknowledged sequence number)
-    pub next_sequence_num: u32,    // send next (next sequence number to be sent), basically prev packet's ack
+    pub unacknowledged: u32,       // send unacknowledged (oldest unacknowledged sequence number) -> recv packet's ack
+    pub next_sequence_num: u32,    // send next -> recv packet's ack, next send packet's seq
     pub window_size: u16,          // send window
     pub urgent_pointer: u16,       // send urgent pointer
     pub last_sequence_num: u32,    // segment sequence number used for last window update
@@ -630,7 +840,7 @@ impl SendVariables {
 //        Figure 4: Receive Sequence Space (rfc9293)
 #[derive(Debug, Default)]
 pub struct ReceiveVariables {
-    pub next_sequence_num: u32,    // receive next, basically prev packet's syn + 1
+    pub next_sequence_num: u32,    // receive next -> recv packet's seq + data length, next send packet's ack
     pub window_size: u16,          // receive window
     pub urgent_pointer: u16,       // receive urgent pointer
     pub initial_sequence_num: u32  // initial receive sequence number (IRS)
@@ -650,6 +860,7 @@ pub enum TcpEventType {
     SocketAccepted,
     SynReceived,
     Established,
+    Closed,
 }
 
 #[derive(Debug, Clone, PartialEq)]

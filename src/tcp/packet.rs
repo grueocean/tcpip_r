@@ -251,7 +251,7 @@ impl TcpPacket {
         reply
     }
 
-    pub fn create_rst(&self) -> Self {
+    pub fn create_rst_syn(&self) -> Self {
         let mut rst = self.create_reply_base();
         rst.ack_number = self.seq_number + 1;
         rst.flag_ack = true;
@@ -259,9 +259,31 @@ impl TcpPacket {
         rst
     }
 
+    pub fn create_rst_ack(&self) -> Self {
+        let mut rst = self.create_reply_base();
+        rst.seq_number = self.ack_number;
+        rst.flag_rst = true;
+        rst
+    }
+
     pub fn is_syn(&self) -> bool {
         self.flag_syn &&
             !(self.flag_cwr || self.flag_urg || self.flag_ack || self.flag_psh || self.flag_rst || self.flag_fin)
+    }
+
+    pub fn is_ack(&self) -> bool {
+        self.flag_ack &&
+            !(self.flag_cwr || self.flag_urg || self.flag_syn || self.flag_psh || self.flag_rst || self.flag_fin)
+    }
+
+    pub fn is_rst(&self) -> bool {
+        self.flag_rst &&
+            !(self.flag_cwr || self.flag_urg || self.flag_syn || self.flag_psh || self.flag_ack || self.flag_fin)
+    }
+
+    pub fn is_syn_ack(&self) -> bool {
+        self.flag_syn && self.flag_ack &&
+            !(self.flag_cwr || self.flag_urg || self.flag_psh || self.flag_rst || self.flag_fin)
     }
 }
 

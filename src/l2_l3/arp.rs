@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use std::thread::{self, JoinHandle};
 
 const ARP_LENGTH: usize = 28; // bytes
-const ARP_CACHE_TIME: Duration = Duration::from_secs(10); // seconds
+const ARP_CACHE_TIME: Duration = Duration::from_secs(100); // seconds
 const ARP_CACHE_REFREASH: Duration = Duration::from_millis(100);
 const ARP_RETRY: usize = 3;
 
