@@ -364,7 +364,8 @@ impl L2Stack {
            is_netmask_range(&self.interface_ipv4.address, self.interface_ipv4.netmask, &arp_src_ip) {
             // request to me, from local network.
             if !arp_src_mac.is_nil() && !arp_src_mac.is_broadcast() && !arp_src_mac.is_multicast() &&
-               !arp_src_ip.is_broadcast() && !arp_src_ip.is_multicast() && !arp_src_ip.is_link_local() && !arp_src_ip.is_loopback() {
+               !arp_src_ip.is_broadcast() && !arp_src_ip.is_multicast() && !arp_src_ip.is_link_local() && !arp_src_ip.is_loopback() &&
+               arp_dst_ip == self.interface_ipv4.address {
                 let mut arp_table = self.arp_table.lock().unwrap();
                 let arp_entry = ArpEntry {
                     mac: arp_src_mac,
