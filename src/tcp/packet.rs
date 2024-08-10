@@ -33,6 +33,7 @@ const TCP_HEADER_LENGTH_BASIC: usize = 20;
 // :                                                               |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //
+#[derive(Debug)]
 pub struct TcpPacket {
     pub src_addr: [u8; 4],  // pesudo header
     pub dst_addr: [u8; 4],  // pesudo header

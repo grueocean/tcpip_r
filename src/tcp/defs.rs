@@ -1,4 +1,6 @@
+use thiserror::Error;
 use std::fmt::{self, Display};
+use std::net::{SocketAddrV4};
 
 // https://www.iana.org/assignments/tcp-parameters/tcp-parameters.xhtml
 pub enum TcpOptionKind {
@@ -64,4 +66,18 @@ impl Display for TcpStatus {
             TcpStatus::Closed => write!(f, "CLOSED"),
         }
     }
+}
+
+#[derive(Error, Debug)]
+pub enum TcpError {
+    #[error("Connection refused. socket id: {id} remote addr: {addr}")]
+    RefusedError {
+        id: usize,
+        addr: SocketAddrV4
+    },
+    #[error("Connection closed. socket id: {id} remote addr: {addr}")]
+    ClosedError {
+        id: usize,
+        addr: SocketAddrV4
+    },
 }
