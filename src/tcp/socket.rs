@@ -70,12 +70,18 @@ impl TcpStream {
     }
 
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> Result<()> {
+        self.connect_with_bind(addr, 0)?;
+        Ok(())
+    }
+
+    // Original TcpStrem dosen't have an interface to specify the local port, but I add this for debugging purposes.
+    pub fn connect_with_bind<A: ToSocketAddrs>(&self, addr: A, local_port: u16) -> Result<()> {
         match addr.to_socket_addrs()?.next() {
             Some(addr) => {
                 match addr.ip() {
                     IpAddr::V4(v4_addr) => {
                         let tcp = get_global_tcpstack(self.config.clone())?;
-                        tcp.bind(self.socket_id, SocketAddrV4::new(self.config.ip.address, 0))?;
+                        tcp.bind(self.socket_id, SocketAddrV4::new(self.config.ip.address, local_port))?;
                         tcp.connect(self.socket_id, SocketAddrV4::new(v4_addr, addr.port()))?;
                         Ok(())
                     }

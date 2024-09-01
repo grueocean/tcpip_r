@@ -2,9 +2,11 @@ use crate::l2_l3::{
     defs::Ipv4Type,
     ip::Ipv4Packet,
 };
-use crate::tcp::defs::{TcpOptionKind};
+use crate::tcp::{
+    defs::{TcpStatus, TcpOptionKind}, tcp_impl::TcpConnection
+};
 use anyhow::{Context, Result};
-use pnet::util::Octets;
+use std::{collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}};
 
 // Tcp header max size is 60 (15*4) bytes  because Max Data Offset is 15 (0b1111).
 const TCP_HEADER_LENGTH_BASIC: usize = 20;
@@ -267,24 +269,26 @@ impl TcpPacket {
         rst
     }
 
-    pub fn is_syn(&self) -> bool {
-        self.flag_syn &&
-            !(self.flag_cwr || self.flag_urg || self.flag_ack || self.flag_psh || self.flag_rst || self.flag_fin)
+    pub fn new_rexmt(conn: &mut TcpConnection) -> Result<Self> {
+        match &conn.status {
+            TcpStatus::SynSent => { Ok(Self::new_syn_sent(conn).context("failed to create syn_sent packet.")?) }
+            other => {
+                anyhow::bail!("Cannot generate packet from connection {}.", other);
+            }
+        }
     }
 
-    pub fn is_ack(&self) -> bool {
-        self.flag_ack &&
-            !(self.flag_cwr || self.flag_urg || self.flag_syn || self.flag_psh || self.flag_rst || self.flag_fin)
-    }
-
-    pub fn is_rst(&self) -> bool {
-        self.flag_rst &&
-            !(self.flag_cwr || self.flag_urg || self.flag_syn || self.flag_psh || self.flag_ack || self.flag_fin)
-    }
-
-    pub fn is_syn_ack(&self) -> bool {
-        self.flag_syn && self.flag_ack &&
-            !(self.flag_cwr || self.flag_urg || self.flag_psh || self.flag_rst || self.flag_fin)
+    pub fn new_syn_sent(conn: &mut TcpConnection) -> Result<Self> {
+        let mut syn_sent = Self::new();
+        syn_sent.src_addr = conn.src_addr.octets();
+        syn_sent.dst_addr = conn.dst_addr.octets();
+        syn_sent.protocol = u8::from(Ipv4Type::TCP);
+        syn_sent.local_port = conn.local_port;
+        syn_sent.remote_port = conn.remote_port;
+        syn_sent.seq_number = conn.send_vars.next_sequence_num;
+        syn_sent.flag_syn = true;
+        syn_sent.windows_size = 4096; // todo: adjust
+        Ok(syn_sent)
     }
 }
 
@@ -410,15 +414,15 @@ impl TcpOption {
             packet.push(u8::from(TcpOptionKind::SackOption));
             packet.push((len * 8 + 2) as u8);
             for (left, right) in sack {
-                packet.extend_from_slice(&left.octets());
-                packet.extend_from_slice(&right.octets());
+                packet.extend_from_slice(&left.to_be_bytes());
+                packet.extend_from_slice(&right.to_be_bytes());
             }
         }
         if let Some(TcpOptionTimestamp {ts_value, ts_echo_reply}) = self.timestamps {
             packet.push(u8::from(TcpOptionKind::Timestamp));
             packet.push(10);
-            packet.extend_from_slice(&ts_value.octets());
-            packet.extend_from_slice(&ts_echo_reply.octets());
+            packet.extend_from_slice(&ts_value.to_be_bytes());
+            packet.extend_from_slice(&ts_echo_reply.to_be_bytes());
         }
         let len = packet.len();
         let mut padding = vec![u8::from(TcpOptionKind::NoOperation); (4 - len % 4) % 4];

@@ -28,8 +28,14 @@ struct Args {
     #[arg(long, short = 'g', help = "Gateway Ipv4 Address, e.g., 172.20.10.1")]
     gateway: Ipv4Addr,
 
-    #[arg(long, short = 'p', help = "Port for this tcp server (0 if assign ephemeral port), e.g., 300", default_value_t  = 0)]
+    #[arg(long, short = 'd', help = "Destination Ipv4 Address, e.g., 172.20.10.1")]
+    dst: Ipv4Addr,
+
+    #[arg(long, short = 'p', help = "Destination port, e.g., 300")]
     port: u16,
+
+    #[arg(long, help = "Local port, e.g., 300", default_value_t  = 0)]
+    lport: u16,
 }
 
 fn main() -> Result<()> {
@@ -40,11 +46,9 @@ fn main() -> Result<()> {
     let config = generate_network_config(
         args.iface, args.mac, args.mtu, args.network, args.gateway
     )?;
-    let tcp = TcpListener::new(config)?;
-    tcp.bind(SocketAddrV4::new(args.network.address, args.port))?;
-    println!("Start accepting connections.");
+    let tcp = TcpStream::new(config)?;
+    tcp.connect_with_bind(SocketAddrV4::new(args.dst, args.port), args.lport)?;
+    println!("Socket connected!");
     loop {
-        let (_stream, addr) = tcp.accept()?;
-        println!("accepted: {}", addr);
     }
 }
