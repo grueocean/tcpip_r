@@ -56,9 +56,7 @@ impl ArpPacket {
     }
 
     pub fn read(&mut self, packet: &Vec<u8>) -> Result<bool> {
-        if packet.len() != ARP_LENGTH {
-            return Err(anyhow::anyhow!("ARP must be {} bytes. packet.len()={}", ARP_LENGTH, packet.len()));
-        }
+        anyhow::ensure!(packet.len() >= ARP_LENGTH, "ARP should be {} bytes or more. packet.len()={}", ARP_LENGTH, packet.len());
         self.hw_type = u16::from_be_bytes(packet[0..2].try_into()?);
         self.proto_type = u16::from_be_bytes(packet[2..4].try_into()?);
         self.hw_size = u8::from_be_bytes(packet[4..5].try_into()?);
