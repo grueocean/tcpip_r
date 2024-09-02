@@ -6,9 +6,10 @@ use crate::tcp::{
     defs::{TcpStatus, TcpOptionKind}, tcp_impl::TcpConnection
 };
 use anyhow::{Context, Result};
+use bitflags::bitflags;
 use std::{collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}};
 
-// Tcp header max size is 60 (15*4) bytes  because Max Data Offset is 15 (0b1111).
+// Tcp header max size is 60 (15*4) bytes because Max Data Offset is 15 (0b1111).
 const TCP_HEADER_LENGTH_BASIC: usize = 20;
 
 // https://datatracker.ietf.org/doc/html/rfc9293
@@ -35,7 +36,7 @@ const TCP_HEADER_LENGTH_BASIC: usize = 20;
 // :                                                               |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //
-#[derive(Debug)]
+#[derive(Default, Debug)]
 pub struct TcpPacket {
     pub src_addr: [u8; 4],  // pesudo header
     pub dst_addr: [u8; 4],  // pesudo header
@@ -46,14 +47,7 @@ pub struct TcpPacket {
     pub seq_number: u32,
     pub ack_number: u32,
     pub offset: u8,         // 4 bit (payload begins from 4*offset bytes)
-    pub flag_cwr: bool,     // Congestion Window Reduced
-    pub flag_ece: bool,     // ECN-Echo
-    pub flag_urg: bool,     // Urgent pointer field
-    pub flag_ack: bool,     // Acknowledgment field
-    pub flag_psh: bool,     // Push function
-    pub flag_rst: bool,     // Reset the connection.
-    pub flag_syn: bool,     // Synchronize sequence numbers.
-    pub flag_fin: bool,     // No more data from sender.
+    pub flag: TcpFlag,
     pub windows_size: u16,
     pub checksum: u16,
     pub urg_pointer: u16,
@@ -66,30 +60,10 @@ pub struct TcpPacket {
 impl TcpPacket {
     pub fn new() -> Self {
         Self {
-            src_addr: [0; 4],
-            dst_addr: [0; 4],
-            protocol: 0,
-            tcp_length: 0,
-            local_port: 0,
-            remote_port: 0,
-            seq_number: 0,
-            ack_number: 0,
-            offset: 0,
-            flag_cwr: false,
-            flag_ece: false,
-            flag_urg: false,
-            flag_ack: false,
-            flag_psh: false,
-            flag_rst: false,
-            flag_syn: false,
-            flag_fin: false,
-            windows_size: 0,
-            checksum: 0,
-            urg_pointer: 0,
             option_raw: Vec::new(),
             option: TcpOption::new(),
             payload: Vec::new(),
-            valid: false
+            ..Default::default()
         }
     }
 
@@ -114,15 +88,8 @@ impl TcpPacket {
         let offset_bytes = (self.offset * 4) as usize;
         anyhow::ensure!(tcp_len >= offset_bytes, "TCP packet payload length is {}, but header's data offset indicate {}.", tcp_len, offset_bytes);
 
+        self.flag = TcpFlag::from_bits_retain(u8::from_be_bytes(ipv4_packet.payload[13..14].try_into()?));
         let flag = u8::from_be_bytes(ipv4_packet.payload[13..14].try_into()?);
-        self.flag_cwr = (flag >> 7 & 0b1) == 0b1;
-        self.flag_ece = (flag >> 6 & 0b1) == 0b1;
-        self.flag_urg = (flag >> 5 & 0b1) == 0b1;
-        self.flag_ack = (flag >> 4 & 0b1) == 0b1;
-        self.flag_psh = (flag >> 3 & 0b1) == 0b1;
-        self.flag_rst = (flag >> 2 & 0b1) == 0b1;
-        self.flag_syn = (flag >> 1 & 0b1) == 0b1;
-        self.flag_fin = (flag & 0b1) == 0b1;
 
         self.windows_size = u16::from_be_bytes(ipv4_packet.payload[14..16].try_into()?);
         self.checksum = u16::from_be_bytes(ipv4_packet.payload[16..18].try_into()?);
@@ -185,16 +152,7 @@ impl TcpPacket {
         header.extend_from_slice(&self.seq_number.to_be_bytes());
         header.extend_from_slice(&self.ack_number.to_be_bytes());
 
-        let mut offset_flags = 0u16;
-        offset_flags = offset_flags | ((self.offset as u16) << 12) as u16;
-        if self.flag_cwr { offset_flags |= 1 << 7; }
-        if self.flag_ece { offset_flags |= 1 << 6; }
-        if self.flag_urg { offset_flags |= 1 << 5; }
-        if self.flag_ack { offset_flags |= 1 << 4; }
-        if self.flag_psh { offset_flags |= 1 << 3; }
-        if self.flag_rst { offset_flags |= 1 << 2; }
-        if self.flag_syn { offset_flags |= 1 << 1; }
-        if self.flag_fin { offset_flags |= 1 << 0; }
+        let offset_flags = self.flag.bits() as u16 | ((self.offset as u16) << 12) as u16;
         header.extend_from_slice(&offset_flags.to_be_bytes());
 
         header.extend_from_slice(&self.windows_size.to_be_bytes());
@@ -257,15 +215,14 @@ impl TcpPacket {
     pub fn create_rst_syn(&self) -> Self {
         let mut rst = self.create_reply_base();
         rst.ack_number = self.seq_number + 1;
-        rst.flag_ack = true;
-        rst.flag_rst = true;
+        rst.flag = TcpFlag::RST | TcpFlag::SYN;
         rst
     }
 
     pub fn create_rst_ack(&self) -> Self {
         let mut rst = self.create_reply_base();
         rst.seq_number = self.ack_number;
-        rst.flag_rst = true;
+        rst.flag = TcpFlag::RST | TcpFlag::ACK;
         rst
     }
 
@@ -286,13 +243,27 @@ impl TcpPacket {
         syn_sent.local_port = conn.local_port;
         syn_sent.remote_port = conn.remote_port;
         syn_sent.seq_number = conn.send_vars.next_sequence_num;
-        syn_sent.flag_syn = true;
+        syn_sent.flag = TcpFlag::SYN;
         syn_sent.windows_size = 4096; // todo: adjust
         Ok(syn_sent)
     }
 }
 
-#[derive(Debug, PartialEq)]
+bitflags! {
+    #[derive(Default, Debug, PartialEq)]
+    pub struct TcpFlag: u8 {
+        const FIN = 0b00_00_00_01; // No more data from sender.
+        const SYN = 0b00_00_00_10; // Synchronize sequence numbers.
+        const RST = 0b00_00_01_00; // Reset the connection.
+        const PSH = 0b00_00_10_00; // Push function
+        const ACK = 0b00_01_00_00; // Acknowledgment field
+        const URG = 0b00_10_00_00; // Urgent pointer field
+        const ECE = 0b01_00_00_00; // ECN-Echo
+        const CWR = 0b10_00_00_00; // Congestion Window Reduced
+    }
+}
+
+#[derive(Default, Debug, PartialEq)]
 pub struct TcpOption {
     pub mss: Option<u16>,                         // kind=2 Maximum Segment Size  2 bytes
     pub window_scale: Option<u8>,                 // kind=3 Window Scale Option   1 bytes
@@ -570,14 +541,7 @@ mod tcp_tests {
             assert_eq!(tcp_packet.seq_number, expected_seq_number);
             assert_eq!(tcp_packet.ack_number, expected_ack_number);
             assert_eq!(tcp_packet.offset, expected_data_offset);
-            assert_eq!(tcp_packet.flag_cwr, expected_flag & (0b1 << 7) != 0);
-            assert_eq!(tcp_packet.flag_ece, expected_flag & (0b1 << 6) != 0);
-            assert_eq!(tcp_packet.flag_urg, expected_flag & (0b1 << 5) != 0);
-            assert_eq!(tcp_packet.flag_ack, expected_flag & (0b1 << 4) != 0);
-            assert_eq!(tcp_packet.flag_psh, expected_flag & (0b1 << 3) != 0);
-            assert_eq!(tcp_packet.flag_rst, expected_flag & (0b1 << 2) != 0);
-            assert_eq!(tcp_packet.flag_syn, expected_flag & (0b1 << 1) != 0);
-            assert_eq!(tcp_packet.flag_fin, expected_flag & (0b1 << 0) != 0);
+            assert_eq!(tcp_packet.flag, TcpFlag::from_bits_retain(expected_flag));
             assert_eq!(tcp_packet.windows_size, expected_window);
             assert_eq!(tcp_packet.checksum, expected_checksum);
             assert_eq!(tcp_packet.urg_pointer, expected_urg_pointer);

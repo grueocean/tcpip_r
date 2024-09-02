@@ -521,8 +521,8 @@ mod arp_tests {
     #[rstest]
     // too short packet
     #[case("0102030405")]
-    // too long packet
-    #[case("0001080006040001bebeff74a578c0a80001000000000000c0a800020111")]
+    // We should allow too long packet, because ethernet packet might be padded.
+    // #[case("0001080006040001bebeff74a578c0a80001000000000000c0a800020111")]
     fn test_arp_packet_read_error(
         #[case] encoded_packet: &str,
     ) {

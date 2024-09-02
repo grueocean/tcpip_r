@@ -11,6 +11,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc::channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Instant};
 
+use super::packet::TcpFlag;
+
 const TCP_MAX_SOCKET: usize = 100;
 // "the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)" rfc6335
 const TCP_EPHEMERAL_PORT_RANGE: Range<u16> = 49152..65535;
@@ -200,8 +202,7 @@ impl TcpStack {
                                 syn_ack.remote_port = conn.remote_port;
                                 syn_ack.seq_number = conn.send_vars.next_sequence_num;
                                 syn_ack.ack_number = conn.recv_vars.next_sequence_num;
-                                syn_ack.flag_syn = true;
-                                syn_ack.flag_ack = true;
+                                syn_ack.flag = TcpFlag::SYN | TcpFlag::ACK;
                                 syn_ack.windows_size = conn.recv_vars.window_size;
                                 syn_ack.option.mss = Some((self.config.mtu - 40) as u16);
                                 if let Err(e) = self.send_tcp_packet(syn_ack) {
@@ -320,11 +321,13 @@ impl TcpStack {
             tcp_packet.protocol = u8::from(Ipv4Type::TCP);
             tcp_packet.local_port = conn.local_port;
             tcp_packet.remote_port = addr.port();
-            tcp_packet.flag_syn = true;
+            tcp_packet.flag = TcpFlag::SYN;
             tcp_packet.seq_number = seq;
             tcp_packet.windows_size = 4096; // todo: adjust
             tcp_packet.option.mss = Some(1460); // todo: adjust
-            self.send_tcp_packet(tcp_packet)?;
+            if let Err(e) = self.send_tcp_packet(tcp_packet) {
+                log::warn!("Failed to send SYN. Err: {:?}", e);
+            }
             conn.timer.retransmission.fire_syn();
             conn.dst_addr = *addr.ip();
             conn.remote_port = addr.port();
@@ -392,6 +395,16 @@ impl TcpStack {
     }
 
     pub fn send_tcp_packet(&self, mut tcp_packet: TcpPacket) -> Result<()> {
+        let mut ipv4_packet = Ipv4Packet::new();
+        ipv4_packet.protocol = u8::from(Ipv4Type::TCP);
+        ipv4_packet.dst_addr = tcp_packet.dst_addr;
+        ipv4_packet.payload = tcp_packet.create_packet();
+        let l3 = get_global_l3stack(self.config.clone())?;
+        l3.l3interface.send(ipv4_packet)?;
+        Ok(())
+    }
+
+    pub fn send_tcp_packet_safe(&self, mut tcp_packet: TcpPacket) -> Result<()> {
         let mut ipv4_packet = Ipv4Packet::new();
         ipv4_packet.protocol = u8::from(Ipv4Type::TCP);
         ipv4_packet.dst_addr = tcp_packet.dst_addr;
@@ -525,7 +538,7 @@ impl TcpStack {
             }
         } else {
             // "An incoming segment not containing a RST causes a RST to be sent in response." rfc9293
-            if !tcp_packet.flag_rst {
+            if !tcp_packet.flag.contains(TcpFlag::RST) {
                 self.send_back_rst_syn(tcp_packet)?;
                 log::debug!("No socket bound for the packet to {}:{}, send back rst packet.", dst_addr, tcp_packet.remote_port);
             // "An incoming segment containing a RST is discarded." rfc9293
@@ -543,14 +556,14 @@ impl TcpStack {
         tcp_packet: &TcpPacket,
         mut conns: MutexGuard<HashMap<usize, Option<TcpConnection>>>
     ) -> Result<()> {
-        if tcp_packet.flag_rst {
+        if tcp_packet.flag.contains(TcpFlag::RST) {
             log::debug!(
                 "LISTEN socket (id={}) ignores any rst packet. remote={}:{}",
                 socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
             );
             return Ok(());
         };
-        if tcp_packet.flag_ack {
+        if tcp_packet.flag.contains(TcpFlag::ACK) {
             self.send_back_rst_ack(tcp_packet)?;
             log::debug!(
                 "LISTEN socket (id={}) rejects any ack packet and send back rst. remote={}:{}",
@@ -558,7 +571,7 @@ impl TcpStack {
             );
             return Ok(());
         };
-        if !tcp_packet.flag_syn {
+        if !tcp_packet.flag.contains(TcpFlag::SYN) {
             log::debug!(
                 "LISTEN socket (id={}) ignores any not a syn packet (also no rst/ack flag). remote={}:{}",
                 socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
@@ -620,8 +633,7 @@ impl TcpStack {
                         let ack = new_conn.recv_vars.next_sequence_num;
                         syn_ack.seq_number = seq;
                         syn_ack.ack_number = ack;
-                        syn_ack.flag_syn = true;
-                        syn_ack.flag_ack = true;
+                        syn_ack.flag = TcpFlag::SYN | TcpFlag::ACK;
                         syn_ack.windows_size = new_conn.recv_vars.window_size;
                         // 40 = ip header size (20) + tcp header size (20)
                         syn_ack.option.mss = Some((self.config.mtu - 40) as u16);
@@ -632,9 +644,9 @@ impl TcpStack {
                             id, src_addr, tcp_packet.remote_port, dst_addr, tcp_packet.local_port, socket_id
                         );
                         queue.pending_acked.push_back(id);
-                        self.send_tcp_packet(syn_ack)?;
+                        self.send_tcp_packet(syn_ack).context("Failed to send SYN/ACK.")?;
                         log::debug!(
-                            "Accepted socket (id={}) reply syn-ack to {}:{} in listen_handler. SEQ={} ACK={}",
+                            "Accepted socket (id={}) reply SYN/ACK to {}:{} in listen_handler. SEQ={} ACK={}",
                             id, dst_addr, tcp_packet.local_port, seq, ack
                         );
                         self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::SynReceived });
@@ -659,7 +671,7 @@ impl TcpStack {
         mut conns: MutexGuard<HashMap<usize, Option<TcpConnection>>>
     ) -> Result<()> {
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-            if tcp_packet.flag_ack {
+            if tcp_packet.flag.contains(TcpFlag::ACK) {
                 // This case includes "Recovery from Old Duplicate SYN" rfc9293
                 if tcp_packet.ack_number <= conn.recv_vars.initial_sequence_num || tcp_packet.ack_number > conn.send_vars.next_sequence_num {
                     self.send_back_rst_ack(tcp_packet)?;
@@ -670,7 +682,7 @@ impl TcpStack {
                     return Ok(());
                 }
             }
-            if tcp_packet.flag_rst {
+            if tcp_packet.flag.contains(TcpFlag::RST) {
                 if tcp_packet.ack_number == conn.send_vars.next_sequence_num {
                     log::debug!(
                         "Socket (id={}) status changed from SYN-SENT to CLOSED. Received acceptable RST. remote={}:{} ACK={})",
@@ -687,17 +699,17 @@ impl TcpStack {
                     return Ok(());
                 }
             }
-            if tcp_packet.flag_syn {
+            if tcp_packet.flag.contains(TcpFlag::SYN) {
                 // SYN/ACK, which means Normal 3-way handshake (active and passive)
-                if tcp_packet.flag_ack {
+                if tcp_packet.flag.contains(TcpFlag::ACK) {
                     let next_seq = tcp_packet.ack_number;
                     let next_ack = tcp_packet.seq_number.wrapping_add(1); // syn is treated as 1 byte.
                     let mut ack_packet = tcp_packet.create_reply_base();
                     ack_packet.seq_number = next_seq;
                     ack_packet.ack_number = next_ack;
-                    ack_packet.flag_ack = true;
+                    ack_packet.flag = TcpFlag::ACK;
                     ack_packet.windows_size = 4096; // todo: adjust
-                    self.send_tcp_packet(ack_packet)?;
+                    self.send_tcp_packet(ack_packet).context("Failed to reply ACK.")?;
                     if let Some(mss) = tcp_packet.option.mss {
                         conn.send_vars.send_mss = mss;
                     } else {
@@ -726,11 +738,10 @@ impl TcpStack {
                     let mut syn_ack_packet = tcp_packet.create_reply_base();
                     syn_ack_packet.seq_number = next_seq;
                     syn_ack_packet.ack_number = next_ack;
-                    syn_ack_packet.flag_syn = true;
-                    syn_ack_packet.flag_ack = true;
+                    syn_ack_packet.flag = TcpFlag::SYN | TcpFlag::ACK;
                     syn_ack_packet.windows_size = 4096; // todo: adjust
                     syn_ack_packet.option.mss = Some(1460); // todo: adjust
-                    self.send_tcp_packet(syn_ack_packet)?;
+                    self.send_tcp_packet(syn_ack_packet).context("Failed to send SYN/ACK.")?;
                     conn.syn_replied = true;
                     conn.send_vars.unacknowledged = next_seq;
                     conn.send_vars.window_size = tcp_packet.windows_size;
@@ -787,12 +798,12 @@ impl TcpStack {
                     (conn.recv_vars.next_sequence_num <= tcp_packet.seq_number + tcp_packet.tcp_length as u32 - 1 && tcp_packet.seq_number + tcp_packet.tcp_length as u32 - 1 < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32)
                 ))
             {
-                if !tcp_packet.flag_rst {
+                if !tcp_packet.flag.contains(TcpFlag::RST) {
                     let mut ack = tcp_packet.create_reply_base();
                     ack.seq_number = conn.send_vars.next_sequence_num;
                     ack.ack_number = conn.recv_vars.next_sequence_num;
-                    ack.flag_ack = true;
-                    self.send_tcp_packet(ack)?;
+                    ack.flag = TcpFlag::ACK;
+                    self.send_tcp_packet(ack).context("Failed to send ACK.")?;
                     log::debug!(
                         "SYN-RECEIVED socket (id={}) received unacceptable non-RST packet from {}:{} and just send back ACK. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port,
@@ -807,7 +818,7 @@ impl TcpStack {
                 }
                 return Ok(());
             }
-            if tcp_packet.flag_rst {
+            if tcp_packet.flag.contains(TcpFlag::RST) {
                 // 1) If the RST bit is set and the sequence number is outside the current receive window, silently drop the segment. rfc9293
                 if !(conn.recv_vars.next_sequence_num <= tcp_packet.seq_number && tcp_packet.seq_number < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32) {
                     log::debug!(
@@ -847,7 +858,7 @@ impl TcpStack {
                 }
             }
             // If the connection was initiated with a passive OPEN, then return this connection to the LISTEN state and return. rfc9293
-            if tcp_packet.flag_syn {
+            if tcp_packet.flag.contains(TcpFlag::SYN) {
                 if  let Some(parent) = conn.parent_id {
                     conns.remove(&socket_id);
                     let mut listen_queue = self.listen_queue.lock().unwrap();
@@ -864,13 +875,13 @@ impl TcpStack {
                 }
             }
             // if the ACK bit is off, drop the segment and return rfc9293
-            if !tcp_packet.flag_ack && !tcp_packet.flag_fin {
+            if !tcp_packet.flag.contains(TcpFlag::ACK) && !tcp_packet.flag.contains(TcpFlag::FIN) {
                 log::debug!(
                     "SYN-RECEIVED socket (id={}) received a packet from {}:{} with no SYN/RST/ACK flag and ignored.",
                     socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
                 );
                 return Ok(());
-            } else if tcp_packet.flag_ack {
+            } else if tcp_packet.flag.contains(TcpFlag::ACK) {
                 // If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED state... rfc9293
                 if conn.send_vars.unacknowledged < tcp_packet.ack_number && tcp_packet.ack_number <= conn.send_vars.next_sequence_num {
                     conn.send_vars.window_size = tcp_packet.windows_size;
@@ -887,8 +898,8 @@ impl TcpStack {
                         }
                     }
                     log::debug!(
-                        "Socket (id={}) status changed from SYN-RECEIVED to ESTABLISHED. remote={}:{} SYN={}",
-                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.flag_syn
+                        "Socket (id={}) status changed from SYN-RECEIVED to ESTABLISHED. remote={}:{} flag={:?}",
+                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.flag
                     );
                     self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Established });
                     return Ok(());
@@ -903,7 +914,7 @@ impl TcpStack {
                     return Ok(());
                 }
             }
-            if tcp_packet.flag_fin {
+            if tcp_packet.flag.contains(TcpFlag::FIN) {
                 conn.status = TcpStatus::CloseWait;
                 log::debug!(
                     "Socket (id={}) status changed from SYN-RECEIVED to CLOSE-WAIT. remote={}:{}",
