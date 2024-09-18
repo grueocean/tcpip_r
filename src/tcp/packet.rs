@@ -87,10 +87,7 @@ impl TcpPacket {
         self.offset = u8::from_be_bytes(ipv4_packet.payload[12..13].try_into()?) >> 4;
         let offset_bytes = (self.offset * 4) as usize;
         anyhow::ensure!(tcp_len >= offset_bytes, "TCP packet payload length is {}, but header's data offset indicate {}.", tcp_len, offset_bytes);
-
         self.flag = TcpFlag::from_bits_retain(u8::from_be_bytes(ipv4_packet.payload[13..14].try_into()?));
-        let flag = u8::from_be_bytes(ipv4_packet.payload[13..14].try_into()?);
-
         self.windows_size = u16::from_be_bytes(ipv4_packet.payload[14..16].try_into()?);
         self.checksum = u16::from_be_bytes(ipv4_packet.payload[16..18].try_into()?);
         self.urg_pointer = u16::from_be_bytes(ipv4_packet.payload[18..20].try_into()?);
@@ -226,9 +223,11 @@ impl TcpPacket {
         rst
     }
 
-    pub fn new_rexmt(conn: &mut TcpConnection) -> Result<Self> {
+    pub fn new_out_packet(conn: &mut TcpConnection) -> Result<Self> {
         match &conn.status {
-            TcpStatus::SynSent => { Ok(Self::new_syn_sent(conn).context("failed to create syn_sent packet.")?) }
+            TcpStatus::SynSent => { Ok(Self::new_syn_sent(conn).context("Failed to create syn_sent packet.")?) }
+            TcpStatus::SynRcvd => { Ok(Self::new_syn_rcvd(conn).context("Failed to create syn_rcvd packet.")?) }
+            TcpStatus::Established => { Ok(Self::new_established(conn).context("Failed to create syn_established packet.")?) }
             other => {
                 anyhow::bail!("Cannot generate packet from connection {}.", other);
             }
@@ -246,6 +245,34 @@ impl TcpPacket {
         syn_sent.flag = TcpFlag::SYN;
         syn_sent.windows_size = 4096; // todo: adjust
         Ok(syn_sent)
+    }
+
+    pub fn new_syn_rcvd(conn: &mut TcpConnection) -> Result<Self> {
+        let mut syn_rcvd = Self::new();
+        syn_rcvd.src_addr = conn.src_addr.octets();
+        syn_rcvd.dst_addr = conn.dst_addr.octets();
+        syn_rcvd.protocol = u8::from(Ipv4Type::TCP);
+        syn_rcvd.local_port = conn.local_port;
+        syn_rcvd.remote_port = conn.remote_port;
+        syn_rcvd.seq_number = conn.send_vars.next_sequence_num;
+        syn_rcvd.ack_number = conn.recv_vars.next_sequence_num;
+        syn_rcvd.flag = TcpFlag::SYN | TcpFlag::ACK;
+        syn_rcvd.windows_size = 4096; // todo: adjust
+        Ok(syn_rcvd)
+    }
+
+    pub fn new_established(conn: &mut TcpConnection) -> Result<Self> {
+        let mut syn_rcvd = Self::new();
+        syn_rcvd.src_addr = conn.src_addr.octets();
+        syn_rcvd.dst_addr = conn.dst_addr.octets();
+        syn_rcvd.protocol = u8::from(Ipv4Type::TCP);
+        syn_rcvd.local_port = conn.local_port;
+        syn_rcvd.remote_port = conn.remote_port;
+        syn_rcvd.seq_number = conn.send_vars.next_sequence_num;
+        syn_rcvd.ack_number = conn.recv_vars.next_sequence_num;
+        syn_rcvd.flag = TcpFlag::SYN | TcpFlag::ACK;
+        syn_rcvd.windows_size = 4096; // todo: adjust
+        Ok(syn_rcvd)
     }
 }
 

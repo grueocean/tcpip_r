@@ -39,26 +39,33 @@ impl TcpStack {
             .collect();
         for (socket_id, status) in statusmap {
             match status {
-                TcpStatus::SynSent => { self.timer_handler_syn_sent(socket_id, &mut conns).context("timer_handler_syn_sent failed.")?; }
-                TcpStatus::SynRcvd => { self.timer_handler_syn_rcvd(socket_id, &mut conns).context("timer_handler_syn_rcvd failed.")?; }
-                other => {}
+                TcpStatus::SynSent => { self.timer_handler_syn(socket_id, &mut conns).context("timer_handler_syn failed. (state=SYN-SENT)")?; }
+                TcpStatus::SynRcvd => { self.timer_handler_syn(socket_id, &mut conns).context("timer_handler_syn failed. (state=SYN-RCVD)")?; }
+                _ => {}
             }
         }
         Ok(())
     }
 
-    pub fn timer_handler_syn_sent(&self, socket_id: usize, conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>) -> Result<()> {
+    pub fn timer_handler_syn(&self, socket_id: usize, conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>) -> Result<()> {
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
             if conn.timer.retransmission.timer_param.rexmt_shift == 0 { return Ok(() ); };
             if conn.timer.retransmission.is_expired()? {
-                let syn_rexmt_packet = TcpPacket::new_rexmt(conn)?;
-                self.send_tcp_packet(syn_rexmt_packet)?;
-                conn.timer.retransmission.next_syn();
-                log::debug!(
-                    "Retransmitted SYN packet. socket_id={} local={}:{} remote={}:{} next shift={} next delta={}",
-                    socket_id, conn.src_addr, conn.local_port, conn.dst_addr, conn.remote_port,
-                    conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta
-                );
+                if let Err(e) = self.send_handler(&[0; 0], conn) {
+                    conn.timer.retransmission.next_syn();
+                    log::debug!(
+                        "Failed to retransmit SYN packet. socket_id={} {} next shift={} next delta={} Err: {:?}",
+                        socket_id, conn.print_address(), e,
+                        conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta
+                    );
+                } else {
+                    conn.timer.retransmission.next_syn();
+                    log::debug!(
+                        "Retransmitted SYN packet. socket_id={} local={}:{} remote={}:{} next shift={} next delta={}",
+                        socket_id, conn.src_addr, conn.local_port, conn.dst_addr, conn.remote_port,
+                        conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta
+                    );
+                }
                 if conn.timer.retransmission.is_finished() {
                     log::debug!(
                         "Gave up retransmitting SYN packet and closing the socket (id={}). local={}:{} remote={}:{}",
@@ -67,14 +74,6 @@ impl TcpStack {
                     self.publish_event(TcpEvent {socket_id: socket_id, event: TcpEventType::Closed});
                 }
             }
-        } else {
-            anyhow::bail!("Cannot find socket (id={}).", socket_id);
-        }
-        Ok(())
-    }
-
-    pub fn timer_handler_syn_rcvd(&self, socket_id: usize, conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>) -> Result<()> {
-        if let Some(conn) = conns.get_mut(&socket_id) {
         } else {
             anyhow::bail!("Cannot find socket (id={}).", socket_id);
         }

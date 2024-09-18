@@ -96,12 +96,13 @@ impl TcpStream {
         }
     }
 
-    pub fn send(&self) {
-
+    pub fn write(&self, buf: &[u8]) -> Result<usize> {
+        let tcp = get_global_tcpstack(self.config.clone())?;
+        Ok(tcp.write(self.socket_id, buf)?)
     }
 
-    pub fn recv(&self) {
-
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
     }
 
     pub fn close(&self) {

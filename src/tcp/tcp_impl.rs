@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use log;
-use std::{collections::{HashMap, VecDeque}, sync::MutexGuard, time::Duration};
+use std::{cmp::max, collections::{HashMap, VecDeque}, sync::MutexGuard, time::Duration};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc::channel};
@@ -20,6 +20,7 @@ const TCP_EPHEMERAL_PORT_RANGE: Range<u16> = 49152..65535;
 const TCP_OPEN_TIMEOUT: Duration = Duration::from_secs(300);
 const TCP_MAX_CONCURRENT_SESSION: usize = 10;
 const TCP_MAX_LISTEN_QUEUE: usize = TCP_MAX_CONCURRENT_SESSION * 3 / 2;
+const TCP_SEND_QUEUE_LENGTH: usize = 4096;
 const TCP_RECV_QUEUE_LENGTH: usize = 4096;
 
 static TCP_STACK_GLOBAL: OnceLock<Arc<TcpStack>> = OnceLock::new();
@@ -43,7 +44,7 @@ impl TcpStack {
             connections: Mutex::new(HashMap::new()),
             listen_queue: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
-            event_condvar: (Mutex::new(TcpEvent {socket_id: 0, event: TcpEventType::InitailState}), Condvar::new())
+            event_condvar: (Mutex::new(TcpEvent {socket_id: 0, event: TcpEventType::InitialState}), Condvar::new())
         });
 
         let tcp_recv = tcp.clone();
@@ -106,7 +107,7 @@ impl TcpStack {
                                 *addr.ip(), port, Ipv4Addr::UNSPECIFIED, 0
                             );
                             conns.insert(socket_id, Some(new_conn));
-                            log::info!("Tcp socket (id={}) bind to ephemeral port {}:{}.", socket_id, *addr.ip(), port);
+                            log::info!("Tcp socket (id={}) bind to the ephemeral port {}:{}.", socket_id, *addr.ip(), port);
                             return Ok(());
                         }
                     }
@@ -117,7 +118,7 @@ impl TcpStack {
                             *addr.ip(), addr.port(), Ipv4Addr::UNSPECIFIED, 0
                         );
                         conns.insert(socket_id, Some(new_conn));
-                        log::info!("Tcp socket (id={}) bind to specified port {}:{}.", socket_id, *addr.ip(), addr.port());
+                        log::info!("Tcp socket (id={}) bind to the specified port {}:{}.", socket_id, *addr.ip(), addr.port());
                     } else {
                         anyhow::bail!("Failed to bind tcp socket. Port {} is already used.", addr.port());
                     }
@@ -179,10 +180,7 @@ impl TcpStack {
                             if let Some(Some(conn)) = conns.get(&established_id) {
                                 queue.established_consumed.push_back(established_id);
                                 queue.accepted -= 1;
-                                log::info!(
-                                    "Established socket (id={}) is conusmed by accept call. local={}:{} remote={}:{}",
-                                    established_id, conn.src_addr, conn.local_port, conn.dst_addr, conn.remote_port
-                                );
+                                log::info!("Established socket (id={}) is conusmed by accept call. {}", established_id, conn.print_address());
                                 return Ok((established_id, SocketAddrV4::new(conn.dst_addr, conn.remote_port)));
                             } else {
                                 log::error!("Established connection (id={}) dose not exist in TcpConnections", established_id);
@@ -242,10 +240,7 @@ impl TcpStack {
                                                 if conn.status == TcpStatus::Established {
                                                     queue.established_consumed.push_back(syn_recv_id);
                                                     queue.accepted -= 1;
-                                                    log::info!(
-                                                        "Accepted socket (id={}) connection established. local={}:{} remote={}:{}",
-                                                        syn_recv_id, conn.src_addr, conn.local_port, conn.dst_addr, conn.remote_port
-                                                    );
+                                                    log::info!("Accepted socket (id={}) connection established. {}", syn_recv_id, conn.print_address());
                                                     return Ok((syn_recv_id, SocketAddrV4::new(conn.dst_addr, conn.remote_port)));
                                                 } else {
                                                     break;
@@ -380,18 +375,67 @@ impl TcpStack {
         }
     }
 
-    pub fn send(
+    pub fn write(
         &self,
         socket_id: usize,
-        payload: Vec<u8>,
-        dst: Option<(Ipv4Addr, u16)>, // ip, port
-        conns: Option<&MutexGuard<HashMap<usize, TcpConnection>>>
-    ) -> Result<()> {
-        let mut tcp_packet = TcpPacket::new();
-        if let Some(conns_inherit) = conns {
+        payload: &[u8]
+    ) -> Result<usize> {
+        let mut conns = self.connections.lock().unwrap();
+        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            Ok(self.send_handler( payload, conn)?)
         } else {
+            anyhow::bail!("Cannot find the socket (id={}).", socket_id);
         }
-        Ok(())
+    }
+
+    // It behaves as an entry point for sending packets, like tcp_output in BSD.
+    pub fn send_handler(
+        &self,
+        payload: &[u8],
+        conn: &mut TcpConnection
+    ) -> Result<usize> {
+        match &conn.status {
+            TcpStatus::SynSent => { Ok(self.send_handler_syn_sent(payload, conn).context("send_handler_syn_sent failed.")?) }
+            TcpStatus::SynRcvd => { Ok(self.send_handler_syn_rcvd(payload, conn).context("send_handler_syn_rcvd failed.")?) }
+            TcpStatus::Established => { Ok(self.send_handler_established(payload, conn).context("send_handler_established failed.")?) }
+            other => {
+                anyhow::bail!("Send handler for {} is not implemented.", other);
+            }
+        }
+    }
+
+    pub fn send_handler_syn_sent(
+        &self,
+        payload: &[u8],
+        conn: &mut TcpConnection
+    ) -> Result<usize> {
+        if payload.len() > 0 {
+            log::debug!("Currently we don't send datagram from a SYN-SENT socket, but payload.len()={}.", payload.len());
+        }
+        let syn_packet = TcpPacket::new_out_packet(conn)?;
+        self.send_tcp_packet(syn_packet)?;
+        Ok(0)
+    }
+
+    pub fn send_handler_syn_rcvd(
+        &self,
+        payload: &[u8],
+        conn: &mut TcpConnection
+    ) -> Result<usize> {
+        if payload.len() > 0 {
+            log::debug!("Currently we don't send datagram from a SYN-RCVD socket, but payload.len()={}.", payload.len());
+        }
+        let syn_ack_packet = TcpPacket::new_out_packet(conn)?;
+        self.send_tcp_packet(syn_ack_packet)?;
+        Ok(0)
+    }
+
+    pub fn send_handler_established(
+        &self,
+        payload: &[u8],
+        conn: &mut TcpConnection
+    ) -> Result<usize> {
+        Ok(0)
     }
 
     pub fn send_tcp_packet(&self, mut tcp_packet: TcpPacket) -> Result<()> {
@@ -447,13 +491,50 @@ impl TcpStack {
                     }
                 }
             }
-            match self.tcp_packet_handler(&tcp_packet) {
+            match self.recv_handler(&tcp_packet) {
                 Err(e) => {
                     log::warn!("Failed to handle tcp packet. Err: {}", e);
                     continue;
                 }
                 Ok(_) => {}
             }
+        }
+    }
+
+    pub fn recv_handler(&self, tcp_packet: &TcpPacket) -> Result<()> {
+        let src_addr = &Ipv4Addr::from(tcp_packet.src_addr);
+        let dst_addr = &Ipv4Addr::from(tcp_packet.dst_addr);
+        let (socket_id, conns) = self.get_socket_id(
+            src_addr,
+            dst_addr,
+            &tcp_packet.local_port,
+            &tcp_packet.remote_port
+        )?;
+        if let Some(id) = socket_id {
+            if let Some(Some(conn)) = conns.get(&id) {
+                log::trace!("Handling packet for {} socket (id={} {}).", conn.status, id, conn.print_address());
+                match &conn.status {
+                    TcpStatus::Listen => { self.recv_handler_listen(id, tcp_packet, conns).context("listen_handler failed.")?; }
+                    TcpStatus::SynSent => { self.recv_handler_syn_sent(id, tcp_packet, conns).context("syn_sent_handler failed.")?; }
+                    TcpStatus::SynRcvd => { self.recv_handler_syn_rcvd(id, tcp_packet, conns).context("syn_rcvd_handler failed.")?; }
+                    other => {
+                        anyhow::bail!("Recv handler for TcpStatus {} is not implemented.", other);
+                    }
+                }
+                return Ok(());
+            } else {
+                anyhow::bail!("No TcpConnection Data for the socket (id={}). This should be impossible if locking logic is correct.", id);
+            }
+        } else {
+            // "An incoming segment not containing a RST causes a RST to be sent in response." rfc9293
+            if !tcp_packet.flag.contains(TcpFlag::RST) {
+                self.send_back_rst_syn(tcp_packet)?;
+                log::debug!("No socket bound for the packet to {}:{}, send back rst packet.", dst_addr, tcp_packet.remote_port);
+            // "An incoming segment containing a RST is discarded." rfc9293
+            } else {
+                log::debug!("No socket bound for the rst packet to {}:{}, ignored it.", dst_addr, tcp_packet.remote_port);
+            }
+            Ok(())
         }
     }
 
@@ -483,6 +564,7 @@ impl TcpStack {
                 send_buffer: _send_buffer,
                 recv_buffer: _recv_buffer,
                 timer: _timer,
+                rtt_start: _rtt_start,
             }) = connection_info {
                 if s_addr == dst_addr && d_addr == src_addr && l_port == remote_port && r_port == local_port {
                     ids.push(*id);
@@ -509,48 +591,8 @@ impl TcpStack {
         }
     }
 
-    pub fn tcp_packet_handler(&self, tcp_packet: &TcpPacket) -> Result<()> {
-        let src_addr = &Ipv4Addr::from(tcp_packet.src_addr);
-        let dst_addr = &Ipv4Addr::from(tcp_packet.dst_addr);
-        let (socket_id, conns) = self.get_socket_id(
-            src_addr,
-            dst_addr,
-            &tcp_packet.local_port,
-            &tcp_packet.remote_port
-        )?;
-        if let Some(id) = socket_id {
-            if let Some(Some(conn)) = conns.get(&id) {
-                log::trace!(
-                    "Handling packet for {} socket (id={} local={}:{} remote={}:{}).",
-                    conn.status, id, dst_addr, tcp_packet.remote_port, src_addr, tcp_packet.local_port
-                );
-                match &conn.status {
-                    TcpStatus::Listen => { self.listen_handler(id, tcp_packet, conns).context("listen_handler failed.")?; }
-                    TcpStatus::SynSent => { self.syn_sent_handler(id, tcp_packet, conns).context("syn_sent_handler failed.")?; }
-                    TcpStatus::SynRcvd => { self.syn_rcvd_handler(id, tcp_packet, conns).context("syn_rcvd_handler failed.")?; }
-                    other => {
-                        anyhow::bail!("Handler for TcpStatus {} is not implemented.", other);
-                    }
-                }
-                return Ok(());
-            } else {
-                anyhow::bail!("No TcpConnection Data for the socket (id={}). This should be impossible if locking logic is correct.", id);
-            }
-        } else {
-            // "An incoming segment not containing a RST causes a RST to be sent in response." rfc9293
-            if !tcp_packet.flag.contains(TcpFlag::RST) {
-                self.send_back_rst_syn(tcp_packet)?;
-                log::debug!("No socket bound for the packet to {}:{}, send back rst packet.", dst_addr, tcp_packet.remote_port);
-            // "An incoming segment containing a RST is discarded." rfc9293
-            } else {
-                log::debug!("No socket bound for the rst packet to {}:{}, ignore it.", dst_addr, tcp_packet.remote_port);
-            }
-            Ok(())
-        }
-    }
-
     // 3.10.7.2 LISTEN STATE rfc9293
-    pub fn listen_handler(
+    pub fn recv_handler_listen(
         &self,
         socket_id: usize,
         tcp_packet: &TcpPacket,
@@ -625,6 +667,7 @@ impl TcpStack {
                         send_buffer: VecDeque::new(),
                         recv_buffer: VecDeque::new(),
                         timer: TcpTimer::new(),
+                        rtt_start: Instant::now(),
                     };
                     if queue.accepted > 0 {
                         // socket has already accepted and waiting for new established connection.
@@ -657,14 +700,14 @@ impl TcpStack {
                     return Ok(());
                 }
             }
-            anyhow::bail!("Failed to generate a new tcp socket because no available id. TCP_MAX_SOCKET={}", TCP_MAX_SOCKET)
+            anyhow::bail!("Failed to generate a new tcp socket because there is no available id. TCP_MAX_SOCKET={}", TCP_MAX_SOCKET)
         } else {
             anyhow::bail!("No listen queue for socket id {} which status is Listen.", socket_id);
         }
     }
 
     // 3.10.7.3 SYN-SENT STATE rfc9293
-    pub fn syn_sent_handler(
+    pub fn recv_handler_syn_sent(
         &self,
         socket_id: usize,
         tcp_packet: &TcpPacket,
@@ -676,8 +719,8 @@ impl TcpStack {
                 if tcp_packet.ack_number <= conn.recv_vars.initial_sequence_num || tcp_packet.ack_number > conn.send_vars.next_sequence_num {
                     self.send_back_rst_ack(tcp_packet)?;
                     log::debug!(
-                        "SYN-SENT socket rejects an unacceptable ack packet and send back rst. socket_id={} remote={}:{} Expected ACK={} but received ACK={}",
-                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, conn.send_vars.next_sequence_num, tcp_packet.ack_number
+                        "SYN-SENT socket rejects an unacceptable ack packet and send back rst. socket_id={} {} Expected ACK={} but received ACK={}",
+                        socket_id, conn.print_address(), conn.send_vars.next_sequence_num, tcp_packet.ack_number
                     );
                     return Ok(());
                 }
@@ -685,8 +728,8 @@ impl TcpStack {
             if tcp_packet.flag.contains(TcpFlag::RST) {
                 if tcp_packet.ack_number == conn.send_vars.next_sequence_num {
                     log::debug!(
-                        "Socket (id={}) status changed from SYN-SENT to CLOSED. Received acceptable RST. remote={}:{} ACK={})",
-                        socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.ack_number
+                        "Socket (id={}) status changed from SYN-SENT to CLOSED. Received acceptable RST. {} ACK={})",
+                        socket_id, conn.print_address(), tcp_packet.ack_number
                     );
                     conn.status = TcpStatus::Closed;
                     self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Closed });
@@ -724,6 +767,7 @@ impl TcpStack {
                     conn.recv_vars.initial_sequence_num = tcp_packet.seq_number;
                     conn.recv_vars.next_sequence_num = next_ack;
                     conn.status = TcpStatus::Established;
+                    conn.timer.retransmission.init();
                     self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Established });
                     // SYN-SENT socket is always active open, so we don't need to push it to listen_queue.
                     log::debug!(
@@ -766,7 +810,7 @@ impl TcpStack {
         }
     }
 
-    pub fn syn_rcvd_handler(
+    pub fn recv_handler_syn_rcvd(
         &self,
         socket_id: usize,
         tcp_packet: &TcpPacket,
@@ -888,6 +932,7 @@ impl TcpStack {
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
                     conn.status = TcpStatus::Established;
+                    conn.timer.retransmission.init();
                     let parent_id = conn.parent_id;
                     let mut listen_queue: MutexGuard<HashMap<usize, ListenQueue>> = self.listen_queue.lock().unwrap();
                     // If this socket is passive open, update listenQueue.
@@ -939,7 +984,7 @@ impl TcpStack {
         let mut event = lock.lock().unwrap();
         loop {
             if *event == wait_event {
-                *event = TcpEvent { socket_id: 0, event: TcpEventType::InitailState };
+                *event = TcpEvent { socket_id: 0, event: TcpEventType::InitialState };
                 return true;
             }
             let elapsed = start_time.elapsed();
@@ -962,7 +1007,7 @@ impl TcpStack {
         loop {
             if wait_events.contains(&event) {
                 let ret_event = Some(event.clone());
-                *event = TcpEvent { socket_id: 0, event: TcpEventType::InitailState };
+                *event = TcpEvent { socket_id: 0, event: TcpEventType::InitialState };
                 return (true, ret_event);
             }
             let elapsed = start_time.elapsed();
@@ -1010,6 +1055,7 @@ pub struct TcpConnection {
     pub send_buffer: VecDeque<u8>,
     pub recv_buffer: VecDeque<u8>,
     pub timer: TcpTimer,
+    pub rtt_start: Instant,
 }
 
 impl TcpConnection {
@@ -1027,12 +1073,17 @@ impl TcpConnection {
             send_buffer: VecDeque::new(),
             recv_buffer: VecDeque::new(),
             timer: TcpTimer::new(),
+            rtt_start: Instant::now(),
         }
+    }
+
+    pub fn print_address(&self) -> String {
+        format!("local={}:{} remote={}:{}", self.src_addr, self.local_port, self.dst_addr, self.remote_port)
     }
 }
 
 //
-// 1         2          3          4
+//      1         2          3          4
 // ----------|----------|----------|----------
 //        SND.UNA    SND.NXT    SND.UNA
 //                             +SND.WND
@@ -1045,9 +1096,9 @@ impl TcpConnection {
 //            Figure 3: Send Sequence Space (rfc9293)
 #[derive(Debug, Default)]
 pub struct SendVariables {
-    pub unacknowledged: u32,       // send unacknowledged (oldest unacknowledged sequence number) -> recv packet's ack
-    pub next_sequence_num: u32,    // send next -> recv packet's ack, next send packet's seq
-    pub window_size: u16,          // send window
+    pub unacknowledged: u32,       // send unacknowledged (oldest unacknowledged sequence number) -> recv packet's ack (UNA)
+    pub next_sequence_num: u32,    // send next -> recv packet's ack, next send packet's seq (NXT)
+    pub window_size: u16,          // send window (WND)
     pub urgent_pointer: u16,       // send urgent pointer
     pub last_sequence_num: u32,    // segment sequence number used for last window update (WL1)
     pub last_acknowledge_num: u32, // segment acknowledgment number used for last window update (WL2)
@@ -1064,7 +1115,7 @@ impl SendVariables {
 }
 
 //
-// 1         2          3
+//      1         2          3
 // ----------|----------|----------
 //        RCV.NXT    RCV.NXT
 //                  +RCV.WND
@@ -1076,7 +1127,7 @@ impl SendVariables {
 //        Figure 4: Receive Sequence Space (rfc9293)
 #[derive(Debug, Default)]
 pub struct ReceiveVariables {
-    pub next_sequence_num: u32,    // receive next -> recv packet's seq + data length, next send packet's ack
+    pub next_sequence_num: u32,    // receive next -> recv packet's seq + data length, next send packet's ack (NXT)
     pub window_size: u16,          // receive window
     pub urgent_pointer: u16,       // receive urgent pointer
     pub initial_sequence_num: u32  // initial receive sequence number (IRS)
@@ -1090,9 +1141,185 @@ impl ReceiveVariables {
     }
 }
 
+#[derive(Debug, Default, PartialEq)]
+pub struct ReceiveQueue {
+    pub begin_sequence_num: usize, // Start SEQ of complete_datagram or RCV.NXT if complete_datagram dosen't exists.
+    pub complete_datagram: ReceiveFragment,
+    pub fragmented_datagram: Vec<ReceiveFragment>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct ReceiveFragment {
+    pub sequence_num: usize,
+    pub payload: Vec<u8>,
+}
+
+impl ReceiveFragment {
+    pub fn new() -> Self {
+        Self {
+            ..Default::default()
+        }
+    }
+}
+
+impl ReceiveQueue {
+    pub fn new() -> Self {
+        Self {
+            ..Default::default()
+        }
+    }
+
+    pub fn add(&mut self, seq: usize, payload: &Vec<u8>) -> Result<()> {
+        let new_start = seq;
+        let new_end = seq + payload.len();
+        let complete_start = self.begin_sequence_num;
+        let complete_end = self.begin_sequence_num + max(self.complete_datagram.payload.len(), 1) - 1;
+        let pending_start = max(complete_end + 1, new_start);
+        anyhow::ensure!(new_start >= complete_start, "Invalid segment was added. SEG.SEQ={} QUEUE.BEGIN_SEQ={}", new_start, complete_start);
+        if new_end <= complete_end {
+            return Ok(());
+        }
+        let mut pending_new = Vec::new();
+        let mut tmp_fragment: Option<ReceiveFragment> = None;
+        let mut complete_marge: bool = false;
+        for ReceiveFragment { sequence_num: current_seq, payload: current_payload } in &self.fragmented_datagram {
+            if complete_marge {
+                pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
+                continue;
+            }
+            let current_start = current_seq;
+            let current_end = current_seq + current_payload.len() - 1;
+            // with tmp_fragment
+            if let Some(ReceiveFragment { sequence_num: tmp_seq, payload: ref tmp_payload }) = tmp_fragment {
+                let tmp_start = tmp_seq;
+                let tmp_end = tmp_seq + tmp_payload.len();
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // tmp      :   <-O->
+                // result   :   <-O->  <---O---> (add fragments)
+                if tmp_end < current_start - 1 {
+                    pending_new.push(ReceiveFragment { sequence_num: tmp_seq, payload: tmp_payload.to_vec() });
+                    pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
+                    complete_marge = true;
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // tmp      :   <----O---->
+                // result   :   <-------O------> (add marged fragment)
+                } else if tmp_end <= current_end {
+                    let mut fragment_marged = Vec::new();
+                    fragment_marged.append(&mut tmp_payload[tmp_start..*current_start].to_vec());
+                    fragment_marged.append(&mut current_payload.to_vec());
+                    pending_new.push( ReceiveFragment {sequence_num: tmp_start, payload: fragment_marged} );
+                    complete_marge = true;
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // tmp      :   <---------O--------->
+                // result   :   <---------O---------> (add marged fragment as tmp)
+                } else if current_end < tmp_end {
+                    let mut fragment_marged = Vec::new();
+                    fragment_marged.append(&mut tmp_payload[..*current_start-tmp_start].to_vec());
+                    fragment_marged.append(&mut current_payload.to_vec());
+                    fragment_marged.append(&mut tmp_payload[*current_start-tmp_end..].to_vec());
+                    tmp_fragment = Some( ReceiveFragment {sequence_num: tmp_start, payload: fragment_marged} );
+                    continue;
+                }
+                anyhow::bail!(
+                    "Impossible range: tmp_start={} tmp_end={} current_start={} current_end={}",
+                    tmp_start, tmp_end, current_start, current_end
+                );
+            // without tmp_fragment
+            } else {
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // new      :   <-O->
+                // result   :   <-O->  <---O---> (add fragments)
+                if new_end < current_start - 1 {
+                    pending_new.push( ReceiveFragment {sequence_num: pending_start, payload: payload[pending_start-new_start..].to_vec()} );
+                    pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
+                    complete_marge = true;
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // new      :     <----O---->
+                // result   :     <------O-----> (add marged fragment)
+                } else if current_start - 1 <= new_end && new_end <= current_end {
+                    let mut fragment_marged = Vec::new();
+                    fragment_marged.append(&mut payload[max(pending_start-new_start, 1)-1..*current_start-pending_start].to_vec());
+                    fragment_marged.append(&mut current_payload.to_vec());
+                    pending_new.push( ReceiveFragment {sequence_num: pending_start, payload: fragment_marged} );
+                    complete_marge = true;
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // new      :            <-O->
+                // result   :          <---O---> (add the current fragment as is)
+                } else if pending_start <= *current_start && new_end <= current_end {
+                    pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
+                    complete_marge = true;
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // new      :       <-------O-------->
+                // result   :       <--------O-------> (add marged fragment as tmp)
+                } else if pending_start < *current_start && current_end < new_end {
+                    println!("current_end {} new_end {}", current_end, new_end);
+                    let mut fragment_marged = Vec::new();
+                    fragment_marged.append(&mut payload[max(pending_start-new_start, 1)-1..*current_start-pending_start].to_vec());
+                    fragment_marged.append(&mut current_payload.to_vec());
+                    fragment_marged.append(&mut payload[new_end-current_end..].to_vec());
+                    tmp_fragment = Some( ReceiveFragment {sequence_num: pending_start, payload: fragment_marged} );
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // new      :             <-----O---->
+                // result   :          <-----O-------> (add marged fragment as tmp)
+                } else if *current_start <= pending_start && current_end < new_end {
+                    println!("current_end {} new_start {}", current_end, new_start);
+                    let mut fragment_marged = Vec::new();
+                    fragment_marged.append(&mut current_payload.to_vec());
+                    fragment_marged.append(&mut payload[current_end-new_start+1..].to_vec());
+                    tmp_fragment = Some( ReceiveFragment {sequence_num: *current_start, payload: fragment_marged} );
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // new      :                     <-O->
+                // result   :          <---O--->  <-O-> (add last fragment as tmp)
+                } else if current_end + 1 < pending_start {
+                    pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
+                    tmp_fragment = Some( ReceiveFragment {sequence_num: new_start, payload: payload.to_vec()} );
+                    continue;
+                }
+                anyhow::bail!(
+                    "Impossible range: pending_start={} new_start={} new_end={} current_start={} current_end={}",
+                    pending_start, new_start, new_end, current_start, current_end
+                );
+            }
+        }
+        if let Some(first) = pending_new.first() {
+            if first.sequence_num == complete_end + 1 {
+                self.complete_datagram.payload.append(&mut first.payload.clone());
+                pending_new.remove(0);
+            }
+        }
+        self.fragmented_datagram = pending_new;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TcpEventType {
-    InitailState,
+    InitialState,
     SocketAccepted,
     SynReceived,
     Established,
@@ -1104,4 +1331,115 @@ pub enum TcpEventType {
 pub struct TcpEvent {
     pub socket_id: usize,
     pub event: TcpEventType
+}
+
+#[cfg(test)]
+mod tcp_tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(
+        13,
+        vec![9; 4],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5, 9, 9]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        18,
+        vec![9; 4],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![9, 9, 6, 7, 8]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        20,
+        vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        20,
+        vec![9; 5],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8, 9, 9]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ]
+    )]
+    fn test_receive_queue_add(
+        #[case] new_fragment_seq: usize,
+        #[case] new_fragment_payload: Vec<u8>,
+        #[case] expected_complete: ReceiveFragment,
+        #[case] expected_pending: Vec<ReceiveFragment>,
+     ) {
+        let initial_complete = ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        };
+        let initial_pending = vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ];
+        let mut queue = ReceiveQueue {
+            begin_sequence_num: initial_complete.sequence_num,
+            complete_datagram: initial_complete,
+            fragmented_datagram: initial_pending
+        };
+        let result = queue.add(new_fragment_seq, &new_fragment_payload).expect("Failed to add fragment to queue.");
+
+        assert_eq!(queue.complete_datagram, expected_complete);
+        assert_eq!(queue.fragmented_datagram, expected_pending);
+        assert_eq!(result, ());
+    }
 }
