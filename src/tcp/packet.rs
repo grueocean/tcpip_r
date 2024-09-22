@@ -262,17 +262,17 @@ impl TcpPacket {
     }
 
     pub fn new_established(conn: &mut TcpConnection) -> Result<Self> {
-        let mut syn_rcvd = Self::new();
-        syn_rcvd.src_addr = conn.src_addr.octets();
-        syn_rcvd.dst_addr = conn.dst_addr.octets();
-        syn_rcvd.protocol = u8::from(Ipv4Type::TCP);
-        syn_rcvd.local_port = conn.local_port;
-        syn_rcvd.remote_port = conn.remote_port;
-        syn_rcvd.seq_number = conn.send_vars.next_sequence_num;
-        syn_rcvd.ack_number = conn.recv_vars.next_sequence_num;
-        syn_rcvd.flag = TcpFlag::SYN | TcpFlag::ACK;
-        syn_rcvd.windows_size = 4096; // todo: adjust
-        Ok(syn_rcvd)
+        let mut datagram = Self::new();
+        datagram.src_addr = conn.src_addr.octets();
+        datagram.dst_addr = conn.dst_addr.octets();
+        datagram.protocol = u8::from(Ipv4Type::TCP);
+        datagram.local_port = conn.local_port;
+        datagram.remote_port = conn.remote_port;
+        datagram.seq_number = conn.send_vars.next_sequence_num;
+        datagram.ack_number = conn.recv_vars.next_sequence_num;
+        datagram.flag = TcpFlag::SYN | TcpFlag::ACK;
+        datagram.windows_size = 4096; // todo: adjust
+        Ok(datagram)
     }
 }
 

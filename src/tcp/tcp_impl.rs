@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use log;
-use std::{cmp::max, collections::{HashMap, VecDeque}, sync::MutexGuard, time::Duration};
+use std::{cmp::{max, min}, collections::{HashMap, VecDeque}, sync::MutexGuard, time::Duration};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc::channel};
@@ -22,6 +22,7 @@ const TCP_MAX_CONCURRENT_SESSION: usize = 10;
 const TCP_MAX_LISTEN_QUEUE: usize = TCP_MAX_CONCURRENT_SESSION * 3 / 2;
 const TCP_SEND_QUEUE_LENGTH: usize = 4096;
 const TCP_RECV_QUEUE_LENGTH: usize = 4096;
+const TCP_RECV_QUEUE_WRAP: usize = 1 << 32;
 
 static TCP_STACK_GLOBAL: OnceLock<Arc<TcpStack>> = OnceLock::new();
 
@@ -1144,6 +1145,7 @@ impl ReceiveVariables {
 #[derive(Debug, Default, PartialEq)]
 pub struct ReceiveQueue {
     pub begin_sequence_num: usize, // Start SEQ of complete_datagram or RCV.NXT if complete_datagram dosen't exists.
+    pub queue_length: usize,
     pub complete_datagram: ReceiveFragment,
     pub fragmented_datagram: Vec<ReceiveFragment>,
 }
@@ -1169,14 +1171,42 @@ impl ReceiveQueue {
         }
     }
 
+    pub fn convert_virtual_sequence_num(&self, seq: usize) -> Result<usize> {
+        if self.begin_sequence_num <= seq && seq <= self.begin_sequence_num + self.queue_length {
+            Ok(seq)
+        } else if self.begin_sequence_num <= seq + TCP_RECV_QUEUE_WRAP && seq + TCP_RECV_QUEUE_WRAP <= self.begin_sequence_num + self.queue_length {
+            Ok(seq + TCP_RECV_QUEUE_WRAP)
+        } else {
+            anyhow::bail!("Unacceptable sequence number. SEQ: {} QUEUE.BEGIN: {} QUEUE.LENGTH: {}", seq, self.begin_sequence_num, self.queue_length);
+        }
+    }
+
+    pub fn get_real_begin_sequence_num(&self) -> usize {
+        if self.begin_sequence_num >= TCP_RECV_QUEUE_WRAP {
+            self.begin_sequence_num - TCP_RECV_QUEUE_WRAP
+        } else {
+            self.begin_sequence_num
+        }
+    }
+
     pub fn add(&mut self, seq: usize, payload: &Vec<u8>) -> Result<()> {
-        let new_start = seq;
-        let new_end = seq + payload.len();
+        anyhow::ensure!(payload.len() > 0, "Cannot add an empty segment.");
+        let virtual_seq = self.convert_virtual_sequence_num(seq).context("Failed to add segment, possibly it is out of the receive queue.")?;
+        let new_start = virtual_seq;
+        let new_end = virtual_seq + payload.len() -1;
         let complete_start = self.begin_sequence_num;
         let complete_end = self.begin_sequence_num + max(self.complete_datagram.payload.len(), 1) - 1;
+        let complete_max = complete_start + self.queue_length - 1;
         let pending_start = max(complete_end + 1, new_start);
-        anyhow::ensure!(new_start >= complete_start, "Invalid segment was added. SEG.SEQ={} QUEUE.BEGIN_SEQ={}", new_start, complete_start);
+        anyhow::ensure!(
+            complete_start <= new_start && new_end <= complete_max,
+            "An invalid segment was added. SEG.SEQ={} SEG.LEN = {} QUEUE.BEGIN_SEQ={} QUEUE.MAX_SEQ={}", new_start, payload.len(), complete_start, complete_end
+        );
         if new_end <= complete_end {
+            return Ok(());
+        }
+        if self.complete_datagram.payload.len() == 0 && complete_start == new_start{
+            self.complete_datagram.payload = payload.clone();
             return Ok(());
         }
         let mut pending_new = Vec::new();
@@ -1187,12 +1217,12 @@ impl ReceiveQueue {
                 pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
                 continue;
             }
-            let current_start = current_seq;
+            let current_start = *current_seq;
             let current_end = current_seq + current_payload.len() - 1;
             // with tmp_fragment
             if let Some(ReceiveFragment { sequence_num: tmp_seq, payload: ref tmp_payload }) = tmp_fragment {
                 let tmp_start = tmp_seq;
-                let tmp_end = tmp_seq + tmp_payload.len();
+                let tmp_end = tmp_seq + tmp_payload.len() - 1;
                 //                      current
                 //                         |
                 // fragment : <---X---><---O---><---X---><---O--->
@@ -1208,9 +1238,9 @@ impl ReceiveQueue {
                 // fragment : <---X---><---O---><---X---><---O--->
                 // tmp      :   <----O---->
                 // result   :   <-------O------> (add marged fragment)
-                } else if tmp_end <= current_end {
+                } else if current_start - 1 <= tmp_end && tmp_end <= current_end {
                     let mut fragment_marged = Vec::new();
-                    fragment_marged.append(&mut tmp_payload[tmp_start..*current_start].to_vec());
+                    fragment_marged.append(&mut tmp_payload[..current_start-tmp_start].to_vec());
                     fragment_marged.append(&mut current_payload.to_vec());
                     pending_new.push( ReceiveFragment {sequence_num: tmp_start, payload: fragment_marged} );
                     complete_marge = true;
@@ -1218,14 +1248,45 @@ impl ReceiveQueue {
                 //                      current
                 //                         |
                 // fragment : <---X---><---O---><---X---><---O--->
+                // tmp      :            <-O->
+                // result   :          <---O---> (add the current fragment as is)
+                } else if tmp_start <= current_start && tmp_end <= current_end {
+                    pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
+                    complete_marge = true;
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
                 // tmp      :   <---------O--------->
                 // result   :   <---------O---------> (add marged fragment as tmp)
-                } else if current_end < tmp_end {
+                } else if tmp_start < current_start && current_end < tmp_end {
+                    println!("current_start: {} current_end: {} tmp_start: {} tmp_end: {}", current_start, current_end, tmp_start, tmp_end);
                     let mut fragment_marged = Vec::new();
-                    fragment_marged.append(&mut tmp_payload[..*current_start-tmp_start].to_vec());
+                    fragment_marged.append(&mut tmp_payload[..current_start-tmp_start].to_vec());
                     fragment_marged.append(&mut current_payload.to_vec());
-                    fragment_marged.append(&mut tmp_payload[*current_start-tmp_end..].to_vec());
+                    fragment_marged.append(&mut tmp_payload[1+current_end-tmp_start..].to_vec());
                     tmp_fragment = Some( ReceiveFragment {sequence_num: tmp_start, payload: fragment_marged} );
+                    println!("tmp_fragment {:?}", tmp_fragment);
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // tmp      :             <-----O---->
+                // result   :          <-----O-------> (add marged fragment as tmp)
+                } else if current_start <= tmp_start && tmp_start < current_end + 1 {
+                    println!("current_start: {} current_end: {} tmp_start: {} tmp_end: {}", current_start, current_end, tmp_start, tmp_end);
+                    let mut fragment_marged = Vec::new();
+                    fragment_marged.append(&mut current_payload.to_vec());
+                    fragment_marged.append(&mut tmp_payload[1+current_end-tmp_start..].to_vec());
+                    tmp_fragment = Some( ReceiveFragment {sequence_num: tmp_start, payload: fragment_marged} );
+                    continue;
+                //                      current
+                //                         |
+                // fragment : <---X---><---O---><---X---><---O--->
+                // tmp      :                     <-O->
+                // result   :          <---O--->  <-O-> (leave tmp fragment as is)
+                } else if current_end + 1 < tmp_start {
+                    pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
                     continue;
                 }
                 anyhow::bail!(
@@ -1251,7 +1312,7 @@ impl ReceiveQueue {
                 // result   :     <------O-----> (add marged fragment)
                 } else if current_start - 1 <= new_end && new_end <= current_end {
                     let mut fragment_marged = Vec::new();
-                    fragment_marged.append(&mut payload[max(pending_start-new_start, 1)-1..*current_start-pending_start].to_vec());
+                    fragment_marged.append(&mut payload[max(pending_start-new_start, 1)-1..current_start-new_start].to_vec());
                     fragment_marged.append(&mut current_payload.to_vec());
                     pending_new.push( ReceiveFragment {sequence_num: pending_start, payload: fragment_marged} );
                     complete_marge = true;
@@ -1261,7 +1322,7 @@ impl ReceiveQueue {
                 // fragment : <---X---><---O---><---X---><---O--->
                 // new      :            <-O->
                 // result   :          <---O---> (add the current fragment as is)
-                } else if pending_start <= *current_start && new_end <= current_end {
+                } else if pending_start <= current_start && new_end <= current_end {
                     pending_new.push( ReceiveFragment {sequence_num: *current_seq, payload: current_payload.clone()} );
                     complete_marge = true;
                     continue;
@@ -1270,25 +1331,26 @@ impl ReceiveQueue {
                 // fragment : <---X---><---O---><---X---><---O--->
                 // new      :       <-------O-------->
                 // result   :       <--------O-------> (add marged fragment as tmp)
-                } else if pending_start < *current_start && current_end < new_end {
-                    println!("current_end {} new_end {}", current_end, new_end);
+                } else if pending_start < current_start && current_end < new_end {
+                    println!("current_end {} pending_start {} new_start {} new_end {}", current_end, pending_start, new_start, new_end);
                     let mut fragment_marged = Vec::new();
-                    fragment_marged.append(&mut payload[max(pending_start-new_start, 1)-1..*current_start-pending_start].to_vec());
+                    fragment_marged.append(&mut payload[max(pending_start-new_start, 0)..current_start-new_start].to_vec());
                     fragment_marged.append(&mut current_payload.to_vec());
-                    fragment_marged.append(&mut payload[new_end-current_end..].to_vec());
+                    fragment_marged.append(&mut payload[1+current_end-new_start..].to_vec());
                     tmp_fragment = Some( ReceiveFragment {sequence_num: pending_start, payload: fragment_marged} );
+                    println!("tmp_fragment {:?}", tmp_fragment);
                     continue;
                 //                      current
                 //                         |
                 // fragment : <---X---><---O---><---X---><---O--->
                 // new      :             <-----O---->
                 // result   :          <-----O-------> (add marged fragment as tmp)
-                } else if *current_start <= pending_start && current_end < new_end {
+                } else if current_start <= pending_start && pending_start <= current_end + 1 {
                     println!("current_end {} new_start {}", current_end, new_start);
                     let mut fragment_marged = Vec::new();
                     fragment_marged.append(&mut current_payload.to_vec());
-                    fragment_marged.append(&mut payload[current_end-new_start+1..].to_vec());
-                    tmp_fragment = Some( ReceiveFragment {sequence_num: *current_start, payload: fragment_marged} );
+                    fragment_marged.append(&mut payload[1+current_end-new_start..].to_vec());
+                    tmp_fragment = Some( ReceiveFragment {sequence_num: current_start, payload: fragment_marged} );
                     continue;
                 //                      current
                 //                         |
@@ -1306,6 +1368,12 @@ impl ReceiveQueue {
                 );
             }
         }
+        if let Some(tmp) = tmp_fragment {
+            if !complete_marge {
+                pending_new.push(tmp);
+            }
+        }
+        println!("pending_new: {:?}", pending_new);
         if let Some(first) = pending_new.first() {
             if first.sequence_num == complete_end + 1 {
                 self.complete_datagram.payload.append(&mut first.payload.clone());
@@ -1314,6 +1382,25 @@ impl ReceiveQueue {
         }
         self.fragmented_datagram = pending_new;
         Ok(())
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let copy_len = min(buf.len(), self.complete_datagram.payload.len());
+        buf[..copy_len].copy_from_slice(&self.complete_datagram.payload[..copy_len]);
+        self.complete_datagram.payload.drain(..copy_len);
+
+        let new_begin_sequence_num = self.begin_sequence_num + copy_len;
+        if new_begin_sequence_num >= TCP_RECV_QUEUE_WRAP {
+            self.begin_sequence_num = new_begin_sequence_num - TCP_RECV_QUEUE_WRAP;
+            self.complete_datagram.sequence_num = new_begin_sequence_num - TCP_RECV_QUEUE_WRAP;
+            self.fragmented_datagram.iter_mut().for_each(|frag| {
+                frag.sequence_num -= TCP_RECV_QUEUE_WRAP;
+            });
+        } else {
+            self.begin_sequence_num = new_begin_sequence_num;
+            self.complete_datagram.sequence_num = new_begin_sequence_num;
+        }
+        Ok(copy_len)
     }
 }
 
@@ -1347,6 +1434,46 @@ mod tcp_tests {
             payload: vec![1, 2, 3, 4, 5, 9, 9]
         },
         vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        15,
+        vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5, 9, 9]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        16,
+        vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 16,
+                payload: vec![9, 9]
+            },
             ReceiveFragment {
                 sequence_num: 20,
                 payload: vec![6, 7, 8]
@@ -1411,7 +1538,125 @@ mod tcp_tests {
             }
         ]
     )]
-    fn test_receive_queue_add(
+    #[case(
+        18,
+        vec![9; 14],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![9, 9, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        23,
+        vec![9; 7],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        23,
+        vec![9; 13],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4, 9, 9]
+            }
+        ]
+    )]
+    #[case(
+        25,
+        vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8]
+            },
+            ReceiveFragment {
+                sequence_num: 25,
+                payload: vec![9, 9]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        37,
+        vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 20,
+                payload: vec![6, 7, 8]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            },
+            ReceiveFragment {
+                sequence_num: 37,
+                payload: vec![9, 9]
+            }
+        ]
+    )]
+    #[case(
+        15,
+        vec![9; 5],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5, 9, 9, 9, 9, 9, 6, 7, 8]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![1, 2, 3, 4]
+            }
+        ]
+    )]
+    #[case(
+        15,
+        vec![9; 15],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5, 9, 9, 9, 9, 9, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4]
+        },
+        vec![]
+    )]
+    #[case(
+        13,
+        vec![9; 22],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5, 9, 9, 9, 9, 9, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4, 9]
+        },
+        vec![]
+    )]
+    fn test_receive_queue_add_2_pending(
         #[case] new_fragment_seq: usize,
         #[case] new_fragment_payload: Vec<u8>,
         #[case] expected_complete: ReceiveFragment,
@@ -1433,6 +1678,7 @@ mod tcp_tests {
         ];
         let mut queue = ReceiveQueue {
             begin_sequence_num: initial_complete.sequence_num,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
             complete_datagram: initial_complete,
             fragmented_datagram: initial_pending
         };
@@ -1441,5 +1687,366 @@ mod tcp_tests {
         assert_eq!(queue.complete_datagram, expected_complete);
         assert_eq!(queue.fragmented_datagram, expected_pending);
         assert_eq!(result, ());
+    }
+
+    #[rstest]
+    #[case(
+        23,
+        vec![9; 8],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 23,
+                payload: vec![9, 9, 2, 3, 4, 5, 9, 9]
+            },
+            ReceiveFragment {
+                sequence_num: 32,
+                payload: vec![8, 7, 6, 5]
+            }
+        ]
+    )]
+    #[case(
+        23,
+        vec![9; 9],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 23,
+                payload: vec![9, 9, 2, 3, 4, 5, 9, 9, 9, 8, 7, 6, 5]
+            }
+        ]
+    )]
+    #[case(
+        23,
+        vec![9; 14],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 23,
+                payload: vec![9, 9, 2, 3, 4, 5, 9, 9, 9, 8, 7, 6, 5, 9]
+            }
+        ]
+    )]
+    #[case(
+        30,
+        vec![9; 1],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 25,
+                payload: vec![2, 3, 4, 5]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![9]
+            },
+            ReceiveFragment {
+                sequence_num: 32,
+                payload: vec![8, 7, 6, 5]
+            }
+        ]
+    )]
+    #[case(
+        30,
+        vec![9; 4],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 25,
+                payload: vec![2, 3, 4, 5]
+            },
+            ReceiveFragment {
+                sequence_num: 30,
+                payload: vec![9, 9, 8, 7, 6, 5]
+            }
+        ]
+    )]
+    #[case(
+        13,
+        vec![9; 18],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5, 9, 9, 9, 6, 7, 8, 6, 9, 9, 9, 2, 3, 4, 5, 9, 9]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 32,
+                payload: vec![8, 7, 6, 5]
+            }
+        ]
+    )]
+    #[case(
+        15,
+        vec![9; 16],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5, 9, 9, 9, 6, 7, 8, 6, 9, 9, 9, 2, 3, 4, 5, 9, 9]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 32,
+                payload: vec![8, 7, 6, 5]
+            }
+        ]
+    )]
+    fn test_receive_queue_add_3_pending(
+        #[case] new_fragment_seq: usize,
+        #[case] new_fragment_payload: Vec<u8>,
+        #[case] expected_complete: ReceiveFragment,
+        #[case] expected_pending: Vec<ReceiveFragment>,
+     ) {
+        let initial_complete = ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 4, 5]
+        };
+        let initial_pending = vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 25,
+                payload: vec![2, 3, 4, 5]
+            },
+            ReceiveFragment {
+                sequence_num: 32,
+                payload: vec![8, 7, 6, 5]
+            }
+        ];
+        let mut queue = ReceiveQueue {
+            begin_sequence_num: initial_complete.sequence_num,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: initial_complete,
+            fragmented_datagram: initial_pending
+        };
+        let result = queue.add(new_fragment_seq, &new_fragment_payload).expect("Failed to add fragment to queue.");
+
+        assert_eq!(queue.complete_datagram, expected_complete);
+        assert_eq!(queue.fragmented_datagram, expected_pending);
+        assert_eq!(result, ());
+    }
+
+    #[rstest]
+    #[case(
+        ReceiveQueue {
+            begin_sequence_num: 10,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: ReceiveFragment {
+                sequence_num: 10,
+                payload: vec![1, 2, 3, 4, 5]
+            },
+            fragmented_datagram: vec![
+                ReceiveFragment {
+                    sequence_num: 18,
+                    payload: vec![6, 7, 8, 6]
+                },
+                ReceiveFragment {
+                    sequence_num: 25,
+                    payload: vec![2, 3, 4, 5]
+                }
+            ]
+        },
+        ReceiveQueue {
+            begin_sequence_num: 15,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: ReceiveFragment {
+                sequence_num: 15,
+                payload: vec![]
+            },
+            fragmented_datagram: vec![
+                ReceiveFragment {
+                    sequence_num: 18,
+                    payload: vec![6, 7, 8, 6]
+                },
+                ReceiveFragment {
+                    sequence_num: 25,
+                    payload: vec![2, 3, 4, 5]
+                }
+            ]
+        },
+        5,
+        vec![1, 2, 3, 4, 5, 0, 0, 0, 0, 0]
+    )]
+    #[case(
+        ReceiveQueue {
+            begin_sequence_num: 5,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: ReceiveFragment {
+                sequence_num: 5,
+                payload: vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1]
+            },
+            fragmented_datagram: vec![
+                ReceiveFragment {
+                    sequence_num: 18,
+                    payload: vec![6, 7, 8, 6]
+                },
+                ReceiveFragment {
+                    sequence_num: 25,
+                    payload: vec![2, 3, 4, 5]
+                }
+            ]
+        },
+        ReceiveQueue {
+            begin_sequence_num: 15,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: ReceiveFragment {
+                sequence_num: 15,
+                payload: vec![1]
+            },
+            fragmented_datagram: vec![
+                ReceiveFragment {
+                    sequence_num: 18,
+                    payload: vec![6, 7, 8, 6]
+                },
+                ReceiveFragment {
+                    sequence_num: 25,
+                    payload: vec![2, 3, 4, 5]
+                }
+            ]
+        },
+        10,
+        vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 5]
+    )]
+    fn test_receive_queue_read_10(
+        #[case] mut queue: ReceiveQueue,
+        #[case] expected_after_queue: ReceiveQueue,
+        #[case] expected_data_len: usize,
+        #[case] expected_buf_after: Vec<u8>
+     ) {
+        let mut buf = [0; 10];
+        let data_len = queue.read(&mut buf).unwrap();
+
+        assert_eq!(buf, expected_buf_after[..10]);
+        assert_eq!(data_len, expected_data_len);
+        assert_eq!(queue, expected_after_queue);
+    }
+
+    #[rstest]
+    #[case(
+        ReceiveQueue {
+            begin_sequence_num: TCP_RECV_QUEUE_WRAP - 3,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: ReceiveFragment {
+                sequence_num: TCP_RECV_QUEUE_WRAP - 3,
+                payload: vec![1, 2, 3, 4, 5, 6, 7]
+            },
+            fragmented_datagram: vec![
+                ReceiveFragment {
+                    sequence_num: TCP_RECV_QUEUE_WRAP + 7,
+                    payload: vec![6, 7, 8, 6]
+                },
+                ReceiveFragment {
+                    sequence_num: TCP_RECV_QUEUE_WRAP + 14,
+                    payload: vec![2, 3, 4, 5]
+                }
+            ]
+        },
+        ReceiveQueue {
+            begin_sequence_num: 2,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: ReceiveFragment {
+                sequence_num: 2,
+                payload: vec![6, 7]
+            },
+            fragmented_datagram: vec![
+                ReceiveFragment {
+                    sequence_num: 7,
+                    payload: vec![6, 7, 8, 6]
+                },
+                ReceiveFragment {
+                    sequence_num: 14,
+                    payload: vec![2, 3, 4, 5]
+                }
+            ]
+        },
+        5,
+        vec![1, 2, 3, 4, 5, 0, 0, 0, 0, 0]
+    )]
+    #[case(
+        ReceiveQueue {
+            begin_sequence_num: TCP_RECV_QUEUE_WRAP - 3,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: ReceiveFragment {
+                sequence_num: TCP_RECV_QUEUE_WRAP - 3,
+                payload: vec![1, 2, 3, 4]
+            },
+            fragmented_datagram: vec![
+                ReceiveFragment {
+                    sequence_num: TCP_RECV_QUEUE_WRAP + 7,
+                    payload: vec![6, 7, 8, 6]
+                },
+                ReceiveFragment {
+                    sequence_num: TCP_RECV_QUEUE_WRAP + 14,
+                    payload: vec![2, 3, 4, 5]
+                }
+            ]
+        },
+        ReceiveQueue {
+            begin_sequence_num: 1,
+            queue_length: TCP_RECV_QUEUE_LENGTH,
+            complete_datagram: ReceiveFragment {
+                sequence_num: 1,
+                payload: vec![]
+            },
+            fragmented_datagram: vec![
+                ReceiveFragment {
+                    sequence_num: 7,
+                    payload: vec![6, 7, 8, 6]
+                },
+                ReceiveFragment {
+                    sequence_num: 14,
+                    payload: vec![2, 3, 4, 5]
+                }
+            ]
+        },
+        4,
+        vec![1, 2, 3, 4, 0, 0, 0, 0, 0, 0]
+    )]    fn test_receive_queue_read_5_wrapped(
+        #[case] mut queue: ReceiveQueue,
+        #[case] expected_after_queue: ReceiveQueue,
+        #[case] expected_data_len: usize,
+        #[case] expected_buf_after: Vec<u8>
+     ) {
+        let mut buf = [0; 5];
+        let data_len = queue.read(&mut buf).unwrap();
+
+        assert_eq!(buf, expected_buf_after[..5]);
+        assert_eq!(data_len, expected_data_len);
+        assert_eq!(queue, expected_after_queue);
     }
 }
