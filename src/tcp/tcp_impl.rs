@@ -1,6 +1,6 @@
 use crate::{
     l2_l3::{defs::Ipv4Type, ip::{get_global_l3stack, Ipv4Packet, L3Stack, NetworkConfiguration}},
-    tcp::{defs::{TcpStatus, TcpError}, packet::TcpPacket, timer::TcpTimer}
+    tcp::{defs::{TcpStatus, TcpError}, packet::{TcpPacket, TcpFlag}, timer::TcpTimer}
 };
 use anyhow::{Context, Result};
 use log;
@@ -11,8 +11,6 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc::channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Instant};
 
-use super::packet::TcpFlag;
-
 const TCP_MAX_SOCKET: usize = 100;
 // "the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)" rfc6335
 const TCP_EPHEMERAL_PORT_RANGE: Range<u16> = 49152..65535;
@@ -20,9 +18,10 @@ const TCP_EPHEMERAL_PORT_RANGE: Range<u16> = 49152..65535;
 const TCP_OPEN_TIMEOUT: Duration = Duration::from_secs(300);
 const TCP_MAX_CONCURRENT_SESSION: usize = 10;
 const TCP_MAX_LISTEN_QUEUE: usize = TCP_MAX_CONCURRENT_SESSION * 3 / 2;
-const TCP_SEND_QUEUE_LENGTH: usize = 4096;
-const TCP_RECV_QUEUE_LENGTH: usize = 4096;
+const TCP_DEFAULT_SEND_QUEUE_LENGTH: usize = 4096;
+const TCP_DEFAULT_RECV_QUEUE_LENGTH: usize = 4096;
 const TCP_RECV_QUEUE_WRAP: usize = 1 << 32;
+const TCP_NO_DELAY: bool = true;
 
 static TCP_STACK_GLOBAL: OnceLock<Arc<TcpStack>> = OnceLock::new();
 
@@ -310,28 +309,20 @@ impl TcpStack {
     pub fn connect(&self, socket_id: usize, addr: SocketAddrV4) -> Result<()> {
         let mut conns = self.connections.lock().unwrap();
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-            let mut tcp_packet = TcpPacket::new();
+            //
             let seq = self.generate_initial_sequence();
-            tcp_packet.src_addr = conn.src_addr.octets();
-            tcp_packet.dst_addr = addr.ip().octets();
-            tcp_packet.protocol = u8::from(Ipv4Type::TCP);
-            tcp_packet.local_port = conn.local_port;
-            tcp_packet.remote_port = addr.port();
-            tcp_packet.flag = TcpFlag::SYN;
-            tcp_packet.seq_number = seq;
-            tcp_packet.windows_size = 4096; // todo: adjust
-            tcp_packet.option.mss = Some(1460); // todo: adjust
-            if let Err(e) = self.send_tcp_packet(tcp_packet) {
-                log::warn!("Failed to send SYN. Err: {:?}", e);
-            }
-            conn.timer.retransmission.fire_syn();
             conn.dst_addr = *addr.ip();
             conn.remote_port = addr.port();
             conn.status = TcpStatus::SynSent;
             conn.parent_id = None;
             conn.send_vars.initial_sequence_num = seq;
+            conn.send_vars.unacknowledged = seq;
             conn.send_vars.next_sequence_num = seq.wrapping_add(1);
             conn.recv_vars.window_size = 4096; // todo: adjust
+            if let Err(e) = self.send_handler(conn) {
+                log::warn!("Failed to send SYN. (1st time) Err: {:?}", e);
+            }
+            conn.timer.retransmission.fire_syn();
             log::debug!("Socket (id={}) status changed from CLOSED to SYN-SENT. Sent syn to {}:{}. SEQ={}", socket_id, addr.ip(), addr.port(), seq);
         } else {
             anyhow::bail!("Socket (id={}) is not bound.", socket_id);
@@ -381,24 +372,69 @@ impl TcpStack {
         socket_id: usize,
         payload: &[u8]
     ) -> Result<usize> {
-        let mut conns = self.connections.lock().unwrap();
-        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-            Ok(self.send_handler( payload, conn)?)
-        } else {
-            anyhow::bail!("Cannot find the socket (id={}).", socket_id);
+        let mut current_offset: usize = 0;
+        let payload_len = payload.len();
+        loop {
+            let mut conns = self.connections.lock().unwrap();
+            if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+                let current_queue_free = conn.send_queue.queue_length - conn.send_queue.payload.len();
+                if current_queue_free == 0 {
+                    // Unix system returns EAGAIN in this situation.
+                    anyhow::bail!("No free space in send queue. length: {}", conn.send_queue.queue_length);
+                }
+                if (payload_len - current_offset) <= current_queue_free {
+                    conn.send_queue.payload.extend_from_slice(&payload[current_offset..]);
+                    current_offset += payload_len;
+                } else {
+                    conn.send_queue.payload.extend_from_slice(&payload[current_offset..current_offset+current_queue_free]);
+                    current_offset += current_queue_free
+                }
+                if let Err(e) = self.send_handler(conn) {
+                    log::warn!("Failed to send datagram. Err: {e}");
+                }
+            } else {
+                anyhow::bail!("Cannot find the socket (id={}).", socket_id);
+            }
+            if current_offset == payload_len {
+                return Ok(current_offset);
+            } else {
+                drop(conns);
+                if let (_valid, Some(event)) = self.wait_events_with_timeout(
+                    vec![
+                        TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived },
+                        TcpEvent { socket_id: socket_id, event: TcpEventType::Refused },
+                        TcpEvent { socket_id: socket_id, event: TcpEventType::Closed }
+                    ],
+                    Duration::from_millis(100)
+                ) {
+                    match event.event {
+                        TcpEventType::DatagramReceived => {
+                            continue;
+                        }
+                        TcpEventType::Refused => {
+                            log::warn!("While waiting for the socket (id={}) sending datagram, the connection refused.", socket_id);
+                        }
+                        TcpEventType::Closed => {
+                            log::warn!("While waiting for the socket (id={}) sending datagram, the connection closed.", socket_id);
+                        }
+                        other => {
+                            anyhow::bail!("Wake up from unexpected event ({:?}). Expected Established/Refused/Closed.", other);
+                        }
+                    }
+                }
+            }
         }
     }
 
     // It behaves as an entry point for sending packets, like tcp_output in BSD.
     pub fn send_handler(
         &self,
-        payload: &[u8],
         conn: &mut TcpConnection
     ) -> Result<usize> {
         match &conn.status {
-            TcpStatus::SynSent => { Ok(self.send_handler_syn_sent(payload, conn).context("send_handler_syn_sent failed.")?) }
-            TcpStatus::SynRcvd => { Ok(self.send_handler_syn_rcvd(payload, conn).context("send_handler_syn_rcvd failed.")?) }
-            TcpStatus::Established => { Ok(self.send_handler_established(payload, conn).context("send_handler_established failed.")?) }
+            TcpStatus::SynSent => { Ok(self.send_handler_syn_sent(conn).context("send_handler_syn_sent failed.")?) }
+            TcpStatus::SynRcvd => { Ok(self.send_handler_syn_rcvd(conn).context("send_handler_syn_rcvd failed.")?) }
+            TcpStatus::Established => { Ok(self.send_handler_established(conn).context("send_handler_established failed.")?) }
             other => {
                 anyhow::bail!("Send handler for {} is not implemented.", other);
             }
@@ -407,12 +443,8 @@ impl TcpStack {
 
     pub fn send_handler_syn_sent(
         &self,
-        payload: &[u8],
         conn: &mut TcpConnection
     ) -> Result<usize> {
-        if payload.len() > 0 {
-            log::debug!("Currently we don't send datagram from a SYN-SENT socket, but payload.len()={}.", payload.len());
-        }
         let syn_packet = TcpPacket::new_out_packet(conn)?;
         self.send_tcp_packet(syn_packet)?;
         Ok(0)
@@ -420,12 +452,8 @@ impl TcpStack {
 
     pub fn send_handler_syn_rcvd(
         &self,
-        payload: &[u8],
         conn: &mut TcpConnection
     ) -> Result<usize> {
-        if payload.len() > 0 {
-            log::debug!("Currently we don't send datagram from a SYN-RCVD socket, but payload.len()={}.", payload.len());
-        }
         let syn_ack_packet = TcpPacket::new_out_packet(conn)?;
         self.send_tcp_packet(syn_ack_packet)?;
         Ok(0)
@@ -433,10 +461,29 @@ impl TcpStack {
 
     pub fn send_handler_established(
         &self,
-        payload: &[u8],
         conn: &mut TcpConnection
     ) -> Result<usize> {
-        Ok(0)
+        let send_una = conn.send_vars.unacknowledged;
+        let send_nxt = conn.send_vars.next_sequence_num;
+        let send_wnd = conn.send_vars.window_size;
+        let send_mss = conn.send_vars.send_mss;
+        let new_data = conn.send_queue.payload.len() - send_nxt.wrapping_sub(send_una) as usize;
+        let next_send_nxt = send_una.wrapping_add(conn.send_queue.payload.len() as u32);
+        if !TCP_NO_DELAY && send_una != send_nxt && ((new_data as u16) < send_mss || send_wnd < send_mss) {
+            log::debug!(
+                "We won't send a datagram here based on Nagle's algo. SND.UNA={} SND.NXT={} SND.WND={} SND.MSS={} PENDING_DATAGRAM_LENGTH={}",
+                send_una, send_nxt, send_wnd, send_mss, new_data
+            );
+            Ok(0)
+        } else {
+            while next_send_nxt != conn.send_vars.next_sequence_num {
+                let datagram = TcpPacket::new_established_1st(conn).context("Failed to create a datagram packet.")?;
+                let datagram_size = datagram.payload.len() as u32;
+                self.send_tcp_packet_safe(datagram)?;
+                conn.send_vars.next_sequence_num = conn.send_vars.next_sequence_num.wrapping_add(datagram_size);
+            }
+            Ok(0)
+        }
     }
 
     pub fn send_tcp_packet(&self, mut tcp_packet: TcpPacket) -> Result<()> {
@@ -562,8 +609,8 @@ impl TcpStack {
                 syn_replied: _syn_replied,
                 send_vars: _send_vars,
                 recv_vars: _recv_vars,
-                send_buffer: _send_buffer,
-                recv_buffer: _recv_buffer,
+                send_queue: _send_buffer,
+                recv_queue: _recv_buffer,
                 timer: _timer,
                 rtt_start: _rtt_start,
             }) = connection_info {
@@ -650,9 +697,12 @@ impl TcpStack {
                         send_vars.send_mss = 536;
                     }
                     let mut recv_vars = ReceiveVariables::new();
-                    recv_vars.next_sequence_num = tcp_packet.seq_number.wrapping_add(1);
+                    let mut recv_queue = ReceiveQueue::new();
+                    let recv_nxt = tcp_packet.seq_number.wrapping_add(1);
+                    recv_vars.next_sequence_num = recv_nxt;
                     recv_vars.window_size = 4096; // todo: adjust window size
                     recv_vars.initial_sequence_num = tcp_packet.seq_number;
+                    recv_queue.complete_datagram.sequence_num = recv_nxt as usize;
                     let src_addr = Ipv4Addr::from(tcp_packet.dst_addr);
                     let dst_addr = Ipv4Addr::from(tcp_packet.src_addr);
                     let mut new_conn = TcpConnection {
@@ -665,8 +715,8 @@ impl TcpStack {
                         syn_replied: false,
                         send_vars: send_vars,
                         recv_vars: recv_vars,
-                        send_buffer: VecDeque::new(),
-                        recv_buffer: VecDeque::new(),
+                        send_queue: SendQueue::new(),
+                        recv_queue: recv_queue,
                         timer: TcpTimer::new(),
                         rtt_start: Instant::now(),
                     };
@@ -767,6 +817,7 @@ impl TcpStack {
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
                     conn.recv_vars.initial_sequence_num = tcp_packet.seq_number;
                     conn.recv_vars.next_sequence_num = next_ack;
+                    conn.recv_queue.complete_datagram.sequence_num = next_ack as usize;
                     conn.status = TcpStatus::Established;
                     conn.timer.retransmission.init();
                     self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Established });
@@ -793,6 +844,7 @@ impl TcpStack {
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
                     conn.recv_vars.next_sequence_num = next_ack;
+                    conn.recv_queue.complete_datagram.sequence_num = next_ack as usize;
                     conn.status = TcpStatus::SynRcvd;
                     log::debug!(
                         "Socket (id={}) status changed from SYN-SENT to SYN-RECEIVED. This is a Simultaneous Connection situation. remote={}:{}",
@@ -802,8 +854,8 @@ impl TcpStack {
                 }
             }
             log::debug!(
-                "SYN-SENT socket ignores packet. socket_id={} remote={}:{}",
-                socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
+                "SYN-SENT socket ignores packet. socket_id={} remote={}:{} flag={:?}",
+                socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.flag
             );
             Ok(())
         } else {
@@ -1033,6 +1085,14 @@ impl TcpStack {
     }
 }
 
+pub fn tcp_seq_plus(base: u32, plus: u32) -> u32 {
+    base.wrapping_add(plus)
+}
+
+pub fn tcp_seq_minus(base: u32, minus: u32) -> u32 {
+    base.wrapping_sub(minus)
+}
+
 #[derive(Debug)]
 pub struct ListenQueue {
     pub pending: VecDeque<usize>,                 // Received SYN but not replied SYN/ACK
@@ -1053,8 +1113,8 @@ pub struct TcpConnection {
     pub syn_replied: bool,
     pub send_vars: SendVariables,
     pub recv_vars: ReceiveVariables,
-    pub send_buffer: VecDeque<u8>,
-    pub recv_buffer: VecDeque<u8>,
+    pub send_queue: SendQueue,
+    pub recv_queue: ReceiveQueue,
     pub timer: TcpTimer,
     pub rtt_start: Instant,
 }
@@ -1071,8 +1131,8 @@ impl TcpConnection {
             syn_replied: false,
             send_vars: Default::default(),
             recv_vars: Default::default(),
-            send_buffer: VecDeque::new(),
-            recv_buffer: VecDeque::new(),
+            send_queue: SendQueue::new(),
+            recv_queue: ReceiveQueue::new(),
             timer: TcpTimer::new(),
             rtt_start: Instant::now(),
         }
@@ -1115,6 +1175,21 @@ impl SendVariables {
     }
 }
 
+#[derive(Debug, Default, PartialEq)]
+pub struct SendQueue {
+    pub payload: Vec<u8>,
+    pub queue_length: usize
+}
+
+impl SendQueue {
+    pub fn new() -> Self {
+        Self {
+            queue_length: TCP_DEFAULT_SEND_QUEUE_LENGTH,
+            ..Default::default()
+        }
+    }
+}
+
 //
 //      1         2          3
 // ----------|----------|----------
@@ -1144,7 +1219,6 @@ impl ReceiveVariables {
 
 #[derive(Debug, Default, PartialEq)]
 pub struct ReceiveQueue {
-    pub begin_sequence_num: usize, // Start SEQ of complete_datagram or RCV.NXT if complete_datagram dosen't exists.
     pub queue_length: usize,
     pub complete_datagram: ReceiveFragment,
     pub fragmented_datagram: Vec<ReceiveFragment>,
@@ -1152,7 +1226,7 @@ pub struct ReceiveQueue {
 
 #[derive(Debug, Default, PartialEq)]
 pub struct ReceiveFragment {
-    pub sequence_num: usize,
+    pub sequence_num: usize, // Start SEQ of complete_datagram or RCV.NXT if complete_datagram dosen't exists.
     pub payload: Vec<u8>,
 }
 
@@ -1167,25 +1241,28 @@ impl ReceiveFragment {
 impl ReceiveQueue {
     pub fn new() -> Self {
         Self {
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             ..Default::default()
         }
     }
 
     pub fn convert_virtual_sequence_num(&self, seq: usize) -> Result<usize> {
-        if self.begin_sequence_num <= seq && seq <= self.begin_sequence_num + self.queue_length {
+        let begin = self.complete_datagram.sequence_num;
+        if begin <= seq && seq <= begin + self.queue_length {
             Ok(seq)
-        } else if self.begin_sequence_num <= seq + TCP_RECV_QUEUE_WRAP && seq + TCP_RECV_QUEUE_WRAP <= self.begin_sequence_num + self.queue_length {
+        } else if begin <= seq + TCP_RECV_QUEUE_WRAP && seq + TCP_RECV_QUEUE_WRAP <= begin + self.queue_length {
             Ok(seq + TCP_RECV_QUEUE_WRAP)
         } else {
-            anyhow::bail!("Unacceptable sequence number. SEQ: {} QUEUE.BEGIN: {} QUEUE.LENGTH: {}", seq, self.begin_sequence_num, self.queue_length);
+            anyhow::bail!("Unacceptable sequence number. SEQ: {} QUEUE.BEGIN: {} QUEUE.LENGTH: {}", seq, begin, self.queue_length);
         }
     }
 
     pub fn get_real_begin_sequence_num(&self) -> usize {
-        if self.begin_sequence_num >= TCP_RECV_QUEUE_WRAP {
-            self.begin_sequence_num - TCP_RECV_QUEUE_WRAP
+        let begin = self.complete_datagram.sequence_num;
+        if begin >= TCP_RECV_QUEUE_WRAP {
+            begin - TCP_RECV_QUEUE_WRAP
         } else {
-            self.begin_sequence_num
+            begin
         }
     }
 
@@ -1194,8 +1271,8 @@ impl ReceiveQueue {
         let virtual_seq = self.convert_virtual_sequence_num(seq).context("Failed to add segment, possibly it is out of the receive queue.")?;
         let new_start = virtual_seq;
         let new_end = virtual_seq + payload.len() -1;
-        let complete_start = self.begin_sequence_num;
-        let complete_end = self.begin_sequence_num + max(self.complete_datagram.payload.len(), 1) - 1;
+        let complete_start = self.complete_datagram.sequence_num;
+        let complete_end = self.complete_datagram.sequence_num + max(self.complete_datagram.payload.len(), 1) - 1;
         let complete_max = complete_start + self.queue_length - 1;
         let pending_start = max(complete_end + 1, new_start);
         anyhow::ensure!(
@@ -1260,13 +1337,11 @@ impl ReceiveQueue {
                 // tmp      :   <---------O--------->
                 // result   :   <---------O---------> (add marged fragment as tmp)
                 } else if tmp_start < current_start && current_end < tmp_end {
-                    println!("current_start: {} current_end: {} tmp_start: {} tmp_end: {}", current_start, current_end, tmp_start, tmp_end);
                     let mut fragment_marged = Vec::new();
                     fragment_marged.append(&mut tmp_payload[..current_start-tmp_start].to_vec());
                     fragment_marged.append(&mut current_payload.to_vec());
                     fragment_marged.append(&mut tmp_payload[1+current_end-tmp_start..].to_vec());
                     tmp_fragment = Some( ReceiveFragment {sequence_num: tmp_start, payload: fragment_marged} );
-                    println!("tmp_fragment {:?}", tmp_fragment);
                     continue;
                 //                      current
                 //                         |
@@ -1274,7 +1349,6 @@ impl ReceiveQueue {
                 // tmp      :             <-----O---->
                 // result   :          <-----O-------> (add marged fragment as tmp)
                 } else if current_start <= tmp_start && tmp_start < current_end + 1 {
-                    println!("current_start: {} current_end: {} tmp_start: {} tmp_end: {}", current_start, current_end, tmp_start, tmp_end);
                     let mut fragment_marged = Vec::new();
                     fragment_marged.append(&mut current_payload.to_vec());
                     fragment_marged.append(&mut tmp_payload[1+current_end-tmp_start..].to_vec());
@@ -1332,13 +1406,11 @@ impl ReceiveQueue {
                 // new      :       <-------O-------->
                 // result   :       <--------O-------> (add marged fragment as tmp)
                 } else if pending_start < current_start && current_end < new_end {
-                    println!("current_end {} pending_start {} new_start {} new_end {}", current_end, pending_start, new_start, new_end);
                     let mut fragment_marged = Vec::new();
                     fragment_marged.append(&mut payload[max(pending_start-new_start, 0)..current_start-new_start].to_vec());
                     fragment_marged.append(&mut current_payload.to_vec());
                     fragment_marged.append(&mut payload[1+current_end-new_start..].to_vec());
                     tmp_fragment = Some( ReceiveFragment {sequence_num: pending_start, payload: fragment_marged} );
-                    println!("tmp_fragment {:?}", tmp_fragment);
                     continue;
                 //                      current
                 //                         |
@@ -1346,7 +1418,6 @@ impl ReceiveQueue {
                 // new      :             <-----O---->
                 // result   :          <-----O-------> (add marged fragment as tmp)
                 } else if current_start <= pending_start && pending_start <= current_end + 1 {
-                    println!("current_end {} new_start {}", current_end, new_start);
                     let mut fragment_marged = Vec::new();
                     fragment_marged.append(&mut current_payload.to_vec());
                     fragment_marged.append(&mut payload[1+current_end-new_start..].to_vec());
@@ -1373,7 +1444,6 @@ impl ReceiveQueue {
                 pending_new.push(tmp);
             }
         }
-        println!("pending_new: {:?}", pending_new);
         if let Some(first) = pending_new.first() {
             if first.sequence_num == complete_end + 1 {
                 self.complete_datagram.payload.append(&mut first.payload.clone());
@@ -1389,16 +1459,14 @@ impl ReceiveQueue {
         buf[..copy_len].copy_from_slice(&self.complete_datagram.payload[..copy_len]);
         self.complete_datagram.payload.drain(..copy_len);
 
-        let new_begin_sequence_num = self.begin_sequence_num + copy_len;
-        if new_begin_sequence_num >= TCP_RECV_QUEUE_WRAP {
-            self.begin_sequence_num = new_begin_sequence_num - TCP_RECV_QUEUE_WRAP;
-            self.complete_datagram.sequence_num = new_begin_sequence_num - TCP_RECV_QUEUE_WRAP;
+        let new_begin = self.complete_datagram.sequence_num + copy_len;
+        if new_begin >= TCP_RECV_QUEUE_WRAP {
+            self.complete_datagram.sequence_num = new_begin - TCP_RECV_QUEUE_WRAP;
             self.fragmented_datagram.iter_mut().for_each(|frag| {
                 frag.sequence_num -= TCP_RECV_QUEUE_WRAP;
             });
         } else {
-            self.begin_sequence_num = new_begin_sequence_num;
-            self.complete_datagram.sequence_num = new_begin_sequence_num;
+            self.complete_datagram.sequence_num = new_begin;
         }
         Ok(copy_len)
     }
@@ -1412,6 +1480,7 @@ pub enum TcpEventType {
     Established,
     Closed,
     Refused,
+    DatagramReceived,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1677,8 +1746,7 @@ mod tcp_tests {
             }
         ];
         let mut queue = ReceiveQueue {
-            begin_sequence_num: initial_complete.sequence_num,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: initial_complete,
             fragmented_datagram: initial_pending
         };
@@ -1849,8 +1917,80 @@ mod tcp_tests {
             }
         ];
         let mut queue = ReceiveQueue {
-            begin_sequence_num: initial_complete.sequence_num,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
+            complete_datagram: initial_complete,
+            fragmented_datagram: initial_pending
+        };
+        let result = queue.add(new_fragment_seq, &new_fragment_payload).expect("Failed to add fragment to queue.");
+
+        assert_eq!(queue.complete_datagram, expected_complete);
+        assert_eq!(queue.fragmented_datagram, expected_pending);
+        assert_eq!(result, ());
+    }
+
+    #[rstest]
+    #[case(
+        13,
+        vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 13,
+                payload: vec![9, 9]
+            },
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 25,
+                payload: vec![2, 3, 4, 5]
+            }
+        ]
+    )]
+    #[case(
+        13,
+        vec![9; 5],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![]
+        },
+        vec![
+            ReceiveFragment {
+                sequence_num: 13,
+                payload: vec![9, 9, 9, 9, 9, 6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 25,
+                payload: vec![2, 3, 4, 5]
+            }
+        ]
+    )]
+    fn test_receive_queue_add_no_complete(
+        #[case] new_fragment_seq: usize,
+        #[case] new_fragment_payload: Vec<u8>,
+        #[case] expected_complete: ReceiveFragment,
+        #[case] expected_pending: Vec<ReceiveFragment>,
+     ) {
+        let initial_complete = ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![]
+        };
+        let initial_pending = vec![
+            ReceiveFragment {
+                sequence_num: 18,
+                payload: vec![6, 7, 8, 6]
+            },
+            ReceiveFragment {
+                sequence_num: 25,
+                payload: vec![2, 3, 4, 5]
+            }
+        ];
+        let mut queue = ReceiveQueue {
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: initial_complete,
             fragmented_datagram: initial_pending
         };
@@ -1864,8 +2004,7 @@ mod tcp_tests {
     #[rstest]
     #[case(
         ReceiveQueue {
-            begin_sequence_num: 10,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: ReceiveFragment {
                 sequence_num: 10,
                 payload: vec![1, 2, 3, 4, 5]
@@ -1882,8 +2021,7 @@ mod tcp_tests {
             ]
         },
         ReceiveQueue {
-            begin_sequence_num: 15,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: ReceiveFragment {
                 sequence_num: 15,
                 payload: vec![]
@@ -1904,8 +2042,7 @@ mod tcp_tests {
     )]
     #[case(
         ReceiveQueue {
-            begin_sequence_num: 5,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: ReceiveFragment {
                 sequence_num: 5,
                 payload: vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1]
@@ -1922,8 +2059,7 @@ mod tcp_tests {
             ]
         },
         ReceiveQueue {
-            begin_sequence_num: 15,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: ReceiveFragment {
                 sequence_num: 15,
                 payload: vec![1]
@@ -1959,8 +2095,7 @@ mod tcp_tests {
     #[rstest]
     #[case(
         ReceiveQueue {
-            begin_sequence_num: TCP_RECV_QUEUE_WRAP - 3,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: ReceiveFragment {
                 sequence_num: TCP_RECV_QUEUE_WRAP - 3,
                 payload: vec![1, 2, 3, 4, 5, 6, 7]
@@ -1977,8 +2112,7 @@ mod tcp_tests {
             ]
         },
         ReceiveQueue {
-            begin_sequence_num: 2,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: ReceiveFragment {
                 sequence_num: 2,
                 payload: vec![6, 7]
@@ -1999,8 +2133,7 @@ mod tcp_tests {
     )]
     #[case(
         ReceiveQueue {
-            begin_sequence_num: TCP_RECV_QUEUE_WRAP - 3,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: ReceiveFragment {
                 sequence_num: TCP_RECV_QUEUE_WRAP - 3,
                 payload: vec![1, 2, 3, 4]
@@ -2017,8 +2150,7 @@ mod tcp_tests {
             ]
         },
         ReceiveQueue {
-            begin_sequence_num: 1,
-            queue_length: TCP_RECV_QUEUE_LENGTH,
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: ReceiveFragment {
                 sequence_num: 1,
                 payload: vec![]

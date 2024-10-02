@@ -7,7 +7,7 @@ use crate::tcp::{
 };
 use anyhow::{Context, Result};
 use bitflags::bitflags;
-use std::{collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}};
+use std::{cmp::{max, min}, collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}};
 
 // Tcp header max size is 60 (15*4) bytes because Max Data Offset is 15 (0b1111).
 const TCP_HEADER_LENGTH_BASIC: usize = 20;
@@ -227,7 +227,7 @@ impl TcpPacket {
         match &conn.status {
             TcpStatus::SynSent => { Ok(Self::new_syn_sent(conn).context("Failed to create syn_sent packet.")?) }
             TcpStatus::SynRcvd => { Ok(Self::new_syn_rcvd(conn).context("Failed to create syn_rcvd packet.")?) }
-            TcpStatus::Established => { Ok(Self::new_established(conn).context("Failed to create syn_established packet.")?) }
+            TcpStatus::Established => { Ok(Self::new_established_1st(conn).context("Failed to create syn_established packet.")?) }
             other => {
                 anyhow::bail!("Cannot generate packet from connection {}.", other);
             }
@@ -241,7 +241,7 @@ impl TcpPacket {
         syn_sent.protocol = u8::from(Ipv4Type::TCP);
         syn_sent.local_port = conn.local_port;
         syn_sent.remote_port = conn.remote_port;
-        syn_sent.seq_number = conn.send_vars.next_sequence_num;
+        syn_sent.seq_number = conn.send_vars.unacknowledged;
         syn_sent.flag = TcpFlag::SYN;
         syn_sent.windows_size = 4096; // todo: adjust
         Ok(syn_sent)
@@ -261,7 +261,8 @@ impl TcpPacket {
         Ok(syn_rcvd)
     }
 
-    pub fn new_established(conn: &mut TcpConnection) -> Result<Self> {
+    // create datagram packet starting from SND.NXT
+    pub fn new_established_1st(conn: &mut TcpConnection) -> Result<Self> {
         let mut datagram = Self::new();
         datagram.src_addr = conn.src_addr.octets();
         datagram.dst_addr = conn.dst_addr.octets();
@@ -270,8 +271,14 @@ impl TcpPacket {
         datagram.remote_port = conn.remote_port;
         datagram.seq_number = conn.send_vars.next_sequence_num;
         datagram.ack_number = conn.recv_vars.next_sequence_num;
-        datagram.flag = TcpFlag::SYN | TcpFlag::ACK;
-        datagram.windows_size = 4096; // todo: adjust
+        datagram.flag = TcpFlag::ACK;
+        // todo: need to adjust window size to avoid silly window syndrome
+        datagram.windows_size = (
+            conn.recv_queue.queue_length - conn.recv_queue.complete_datagram.payload.len()
+        ) as u16;
+        let start_offset = (conn.send_vars.next_sequence_num - conn.send_vars.unacknowledged) as usize;
+        let end_offset = min(conn.send_queue.payload.len() - start_offset, conn.send_vars.send_mss as usize);
+        datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
         Ok(datagram)
     }
 }

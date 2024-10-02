@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use eui48::MacAddress;
 use hex;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::from_utf8;
 use tcpip_r::{
@@ -50,5 +51,12 @@ fn main() -> Result<()> {
     tcp.connect_with_bind(SocketAddrV4::new(args.dst, args.port), args.lport)?;
     println!("Socket connected!");
     loop {
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if let Err(e) = tcp.write(input.as_bytes()) {
+            println!("Failed to write socket. Err: {:?}", e);
+        } else {
+            println!("Write to socket successfully.")
+        }
     }
 }

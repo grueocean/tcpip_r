@@ -51,7 +51,7 @@ impl TcpStack {
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
             if conn.timer.retransmission.timer_param.rexmt_shift == 0 { return Ok(() ); };
             if conn.timer.retransmission.is_expired()? {
-                if let Err(e) = self.send_handler(&[0; 0], conn) {
+                if let Err(e) = self.send_handler(conn) {
                     conn.timer.retransmission.next_syn();
                     log::debug!(
                         "Failed to retransmit SYN packet. socket_id={} {} next shift={} next delta={} Err: {:?}",
