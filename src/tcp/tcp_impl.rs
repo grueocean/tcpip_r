@@ -4,12 +4,15 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use log;
+use pnet::packet::tcp::Tcp;
 use std::{cmp::{max, min}, collections::{HashMap, VecDeque}, sync::MutexGuard, time::Duration};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc::channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Instant};
+
+const MAX_SEQ: u32 = u32::MAX;
 
 const TCP_MAX_SOCKET: usize = 100;
 // "the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)" rfc6335
@@ -192,16 +195,7 @@ impl TcpStack {
                             // reply syn-ack
                             if let Some(Some(conn)) = conns.get_mut(&syn_recv_id) {
                                 if conn.status != TcpStatus::SynRcvd { continue; }
-                                let mut syn_ack = TcpPacket::new();
-                                syn_ack.src_addr = conn.src_addr.octets();
-                                syn_ack.dst_addr = conn.dst_addr.octets();
-                                syn_ack.protocol = u8::from(Ipv4Type::TCP);
-                                syn_ack.local_port = conn.local_port;
-                                syn_ack.remote_port = conn.remote_port;
-                                syn_ack.seq_number = conn.send_vars.next_sequence_num;
-                                syn_ack.ack_number = conn.recv_vars.next_sequence_num;
-                                syn_ack.flag = TcpFlag::SYN | TcpFlag::ACK;
-                                syn_ack.windows_size = conn.recv_vars.window_size;
+                                let mut syn_ack = TcpPacket::new_syn_rcvd(conn)?;
                                 syn_ack.option.mss = Some((self.config.mtu - 40) as u16);
                                 if let Err(e) = self.send_tcp_packet(syn_ack) {
                                     log::warn!("Sending syn-ack failed. Err: {}", e);
@@ -309,7 +303,6 @@ impl TcpStack {
     pub fn connect(&self, socket_id: usize, addr: SocketAddrV4) -> Result<()> {
         let mut conns = self.connections.lock().unwrap();
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-            //
             let seq = self.generate_initial_sequence();
             conn.dst_addr = *addr.ip();
             conn.remote_port = addr.port();
@@ -318,12 +311,13 @@ impl TcpStack {
             conn.send_vars.initial_sequence_num = seq;
             conn.send_vars.unacknowledged = seq;
             conn.send_vars.next_sequence_num = seq.wrapping_add(1);
-            conn.recv_vars.window_size = 4096; // todo: adjust
+            conn.recv_vars.window_size = conn.get_recv_window_size();
+            conn.recv_vars.recv_mss = self.config.mtu - 40;
             if let Err(e) = self.send_handler(conn) {
                 log::warn!("Failed to send SYN. (1st time) Err: {:?}", e);
             }
             conn.timer.retransmission.fire_syn();
-            log::debug!("Socket (id={}) status changed from CLOSED to SYN-SENT. Sent syn to {}:{}. SEQ={}", socket_id, addr.ip(), addr.port(), seq);
+            log::debug!("Socket (id={}) status changed from CLOSED to SYN-SENT. Sent syn to {}:{}. SEG.SEQ={}", socket_id, addr.ip(), addr.port(), seq);
         } else {
             anyhow::bail!("Socket (id={}) is not bound.", socket_id);
         }
@@ -390,7 +384,7 @@ impl TcpStack {
                     current_offset += current_queue_free
                 }
                 if let Err(e) = self.send_handler(conn) {
-                    log::warn!("Failed to send datagram. Err: {e}");
+                    log::warn!("Failed to send datagram. Err: {e:?}");
                 }
             } else {
                 anyhow::bail!("Cannot find the socket (id={}).", socket_id);
@@ -445,7 +439,8 @@ impl TcpStack {
         &self,
         conn: &mut TcpConnection
     ) -> Result<usize> {
-        let syn_packet = TcpPacket::new_out_packet(conn)?;
+        let mut syn_packet = TcpPacket::new_out_packet(conn)?;
+        syn_packet.option.mss = Some(conn.recv_vars.recv_mss as u16);
         self.send_tcp_packet(syn_packet)?;
         Ok(0)
     }
@@ -465,11 +460,11 @@ impl TcpStack {
     ) -> Result<usize> {
         let send_una = conn.send_vars.unacknowledged;
         let send_nxt = conn.send_vars.next_sequence_num;
-        let send_wnd = conn.send_vars.window_size;
+        let send_wnd = conn.send_vars.get_scaled_send_window_size();
         let send_mss = conn.send_vars.send_mss;
         let new_data = conn.send_queue.payload.len() - send_nxt.wrapping_sub(send_una) as usize;
         let next_send_nxt = send_una.wrapping_add(conn.send_queue.payload.len() as u32);
-        if !TCP_NO_DELAY && send_una != send_nxt && ((new_data as u16) < send_mss || send_wnd < send_mss) {
+        if !TCP_NO_DELAY && send_una != send_nxt && ((new_data as u16) < send_mss || send_wnd < send_mss as usize) && !conn.ack_now {
             log::debug!(
                 "We won't send a datagram here based on Nagle's algo. SND.UNA={} SND.NXT={} SND.WND={} SND.MSS={} PENDING_DATAGRAM_LENGTH={}",
                 send_una, send_nxt, send_wnd, send_mss, new_data
@@ -477,7 +472,7 @@ impl TcpStack {
             Ok(0)
         } else {
             while next_send_nxt != conn.send_vars.next_sequence_num {
-                let datagram = TcpPacket::new_established_1st(conn).context("Failed to create a datagram packet.")?;
+                let datagram = TcpPacket::new_out_packet(conn).context("Failed to create a datagram packet.")?;
                 let datagram_size = datagram.payload.len() as u32;
                 self.send_tcp_packet_safe(datagram)?;
                 if conn.rtt_start.is_none() {
@@ -532,7 +527,7 @@ impl TcpStack {
             let mut tcp_packet = TcpPacket::new();
             match tcp_packet.read(&ipv4_packet) {
                 Err(e) => {
-                    log::warn!("Failed to read tcp packet. Err: {}", e);
+                    log::warn!("Failed to read tcp packet. Err: {:?}", e);
                     continue;
                 }
                 Ok(valid) => {
@@ -544,7 +539,7 @@ impl TcpStack {
             }
             match self.recv_handler(&tcp_packet) {
                 Err(e) => {
-                    log::warn!("Failed to handle tcp packet. Err: {}", e);
+                    log::warn!("Failed to handle tcp packet. Err: {:?}", e);
                     continue;
                 }
                 Ok(_) => {}
@@ -617,6 +612,7 @@ impl TcpStack {
                 recv_queue: _recv_buffer,
                 timer: _timer,
                 rtt_start: _rtt_start,
+                ack_now: _ack_now,
             }) = connection_info {
                 if s_addr == dst_addr && d_addr == src_addr && l_port == remote_port && r_port == local_port {
                     ids.push(*id);
@@ -690,7 +686,6 @@ impl TcpStack {
                     let iss = self.generate_initial_sequence();
                     send_vars.unacknowledged = iss;
                     send_vars.next_sequence_num = iss.wrapping_add(1);
-                    send_vars.window_size = tcp_packet.windows_size;
                     send_vars.last_sequence_num = tcp_packet.seq_number;
                     send_vars.last_acknowledge_num = tcp_packet.ack_number;
                     send_vars.initial_sequence_num = iss;
@@ -700,12 +695,18 @@ impl TcpStack {
                         // "SendMSS is... or the default 536 for IPv4 or 1220 for IPv6, if no MSS Option is received." rfc9293
                         send_vars.send_mss = 536;
                     }
+                    if let Some(scale) = tcp_packet.option.window_scale {
+                        send_vars.window_shift = scale as usize;
+                        send_vars.window_size = tcp_packet.windows_size >> scale;
+                    } else {
+                        send_vars.window_size = tcp_packet.windows_size;
+                    }
                     let mut recv_vars = ReceiveVariables::new();
                     let mut recv_queue = ReceiveQueue::new();
                     let recv_nxt = tcp_packet.seq_number.wrapping_add(1);
                     recv_vars.next_sequence_num = recv_nxt;
-                    recv_vars.window_size = 4096; // todo: adjust window size
                     recv_vars.initial_sequence_num = tcp_packet.seq_number;
+                    recv_vars.recv_mss = self.config.mtu - 40;
                     recv_queue.complete_datagram.sequence_num = recv_nxt as usize;
                     let src_addr = Ipv4Addr::from(tcp_packet.dst_addr);
                     let dst_addr = Ipv4Addr::from(tcp_packet.src_addr);
@@ -723,16 +724,13 @@ impl TcpStack {
                         recv_queue: recv_queue,
                         timer: TcpTimer::new(),
                         rtt_start: None,
+                        ack_now: false,
                     };
                     if queue.accepted > 0 {
                         // socket has already accepted and waiting for new established connection.
-                        let mut syn_ack = tcp_packet.create_reply_base();
+                        let mut syn_ack = TcpPacket::new_syn_rcvd(&new_conn)?;
                         let seq = new_conn.send_vars.initial_sequence_num;
                         let ack = new_conn.recv_vars.next_sequence_num;
-                        syn_ack.seq_number = seq;
-                        syn_ack.ack_number = ack;
-                        syn_ack.flag = TcpFlag::SYN | TcpFlag::ACK;
-                        syn_ack.windows_size = new_conn.recv_vars.window_size;
                         // 40 = ip header size (20) + tcp header size (20)
                         syn_ack.option.mss = Some((self.config.mtu - 40) as u16);
                         new_conn.syn_replied = true;
@@ -798,7 +796,7 @@ impl TcpStack {
                 }
             }
             if tcp_packet.flag.contains(TcpFlag::SYN) {
-                // SYN/ACK, which means Normal 3-way handshake (active and passive)
+                // SYN/ACK, which means Normal 3-way handshake (local: active remote: passive)
                 if tcp_packet.flag.contains(TcpFlag::ACK) {
                     let next_seq = tcp_packet.ack_number;
                     let next_ack = tcp_packet.seq_number.wrapping_add(1); // syn is treated as 1 byte.
@@ -806,7 +804,7 @@ impl TcpStack {
                     ack_packet.seq_number = next_seq;
                     ack_packet.ack_number = next_ack;
                     ack_packet.flag = TcpFlag::ACK;
-                    ack_packet.windows_size = 4096; // todo: adjust
+                    ack_packet.windows_size = conn.get_recv_window_for_pkt();
                     self.send_tcp_packet(ack_packet).context("Failed to reply ACK.")?;
                     if let Some(mss) = tcp_packet.option.mss {
                         conn.send_vars.send_mss = mss;
@@ -814,12 +812,17 @@ impl TcpStack {
                         // "SendMSS is... or the default 536 for IPv4 or 1220 for IPv6, if no MSS Option is received." rfc9293
                         conn.send_vars.send_mss = 536;
                     }
+                    if let Some(scale) = tcp_packet.option.window_scale {
+                        conn.send_vars.window_shift = scale as usize;
+                        conn.send_vars.window_size = tcp_packet.windows_size >> scale;
+                    } else {
+                        conn.send_vars.window_size = tcp_packet.windows_size;
+                    }
                     conn.send_vars.unacknowledged = next_seq;
-                    conn.send_vars.window_size = tcp_packet.windows_size;
                     conn.send_vars.next_sequence_num = next_seq; // change nothing.
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
-                    conn.send_vars.max_window_size = tcp_packet.windows_size;
+                    conn.send_vars.max_window_size = conn.send_vars.get_scaled_send_window_size();
                     conn.recv_vars.initial_sequence_num = tcp_packet.seq_number;
                     conn.recv_vars.next_sequence_num = next_ack;
                     conn.recv_queue.complete_datagram.sequence_num = next_ack as usize;
@@ -832,26 +835,31 @@ impl TcpStack {
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, next_ack, next_seq
                     );
                     return Ok(());
-                // SYN, which means Simultaneous Connection (Both sides trying active open)
+                // SYN, which means Simultaneous Connection (Both sides are trying active open)
                 } else {
                     let next_seq = conn.send_vars.initial_sequence_num; // send same seq that has already sent
                     let next_ack = tcp_packet.seq_number.wrapping_add(1);
-                    let mut syn_ack_packet = tcp_packet.create_reply_base();
-                    syn_ack_packet.seq_number = next_seq;
-                    syn_ack_packet.ack_number = next_ack;
-                    syn_ack_packet.flag = TcpFlag::SYN | TcpFlag::ACK;
-                    syn_ack_packet.windows_size = 4096; // todo: adjust
-                    syn_ack_packet.option.mss = Some(1460); // todo: adjust
-                    self.send_tcp_packet(syn_ack_packet).context("Failed to send SYN/ACK.")?;
+                    if let Some(mss) = tcp_packet.option.mss {
+                        conn.send_vars.send_mss = mss;
+                    } else {
+                        // "SendMSS is... or the default 536 for IPv4 or 1220 for IPv6, if no MSS Option is received." rfc9293
+                        conn.send_vars.send_mss = 536;
+                    }
+                    if let Some(scale) = tcp_packet.option.window_scale {
+                        conn.send_vars.window_shift = scale as usize;
+                        conn.send_vars.window_size = tcp_packet.windows_size >> scale;
+                    } else {
+                        conn.send_vars.window_size = tcp_packet.windows_size;
+                    }
                     conn.syn_replied = true;
                     conn.send_vars.unacknowledged = next_seq;
-                    conn.send_vars.window_size = tcp_packet.windows_size;
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
-                    conn.send_vars.max_window_size = tcp_packet.windows_size;
+                    conn.send_vars.max_window_size = conn.send_vars.window_size as usize;
                     conn.recv_vars.next_sequence_num = next_ack;
                     conn.recv_queue.complete_datagram.sequence_num = next_ack as usize;
                     conn.status = TcpStatus::SynRcvd;
+                    self.send_handler(conn)?;
                     log::debug!(
                         "Socket (id={}) status changed from SYN-SENT to SYN-RECEIVED. This is a Simultaneous Connection situation. remote={}:{}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
@@ -884,23 +892,7 @@ impl TcpStack {
                 return Ok(());
             };
             // check if a segment is acceptable
-            if
-                !(
-                    tcp_packet.tcp_length == 0 && tcp_packet.windows_size == 0 && tcp_packet.seq_number == conn.recv_vars.next_sequence_num
-                ) &&
-                !(
-                    tcp_packet.tcp_length == 0 && tcp_packet.windows_size > 0 && conn.recv_vars.next_sequence_num <= tcp_packet.seq_number &&
-                    tcp_packet.seq_number < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32
-                ) &&
-                (
-                    tcp_packet.tcp_length > 0 && tcp_packet.windows_size == 0
-                ) &&
-                !(
-                    tcp_packet.tcp_length > 0 && tcp_packet.windows_size > 0 && (
-                    (conn.recv_vars.next_sequence_num <= tcp_packet.seq_number && tcp_packet.seq_number < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32) ||
-                    (conn.recv_vars.next_sequence_num <= tcp_packet.seq_number + tcp_packet.tcp_length as u32 - 1 && tcp_packet.seq_number + tcp_packet.tcp_length as u32 - 1 < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32)
-                ))
-            {
+            if !is_segment_acceptable(conn, tcp_packet) {
                 if !tcp_packet.flag.contains(TcpFlag::RST) {
                     let mut ack = tcp_packet.create_reply_base();
                     ack.seq_number = conn.send_vars.next_sequence_num;
@@ -908,15 +900,15 @@ impl TcpStack {
                     ack.flag = TcpFlag::ACK;
                     self.send_tcp_packet(ack).context("Failed to send ACK.")?;
                     log::debug!(
-                        "SYN-RECEIVED socket (id={}) received unacceptable non-RST packet from {}:{} and just send back ACK. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
+                        "SYN-RECEIVED socket (id={}) received unacceptable non-RST packet from {}:{} and just send back ACK. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={} SEG.flag={:?}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port,
-                        tcp_packet.seq_number, tcp_packet.tcp_length, conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
+                        tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size, tcp_packet.flag
                     );
                 } else {
                     log::debug!(
                         "SYN-RECEIVED socket (id={}) received unacceptable RST packet from {}:{} and ignored. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port,
-                        tcp_packet.seq_number, tcp_packet.tcp_length, conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
+                        tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
                     );
                 }
                 return Ok(());
@@ -927,7 +919,7 @@ impl TcpStack {
                     log::debug!(
                         "SYN-RECEIVED socket (id={}) received RST packet from {}:{} that is outside of receive window and ignored. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port,
-                        tcp_packet.seq_number, tcp_packet.tcp_length, conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
+                        tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
                     );
                 // 2) If the RST bit is set and the sequence number exactly matches the next expected sequence number (RCV.NXT) ... rfc9293
                 } else if conn.recv_vars.next_sequence_num == tcp_packet.seq_number {
@@ -980,17 +972,28 @@ impl TcpStack {
             // if the ACK bit is off, drop the segment and return rfc9293
             if !tcp_packet.flag.contains(TcpFlag::ACK) && !tcp_packet.flag.contains(TcpFlag::FIN) {
                 log::debug!(
-                    "SYN-RECEIVED socket (id={}) received a packet from {}:{} with no SYN/RST/ACK flag and ignored.",
-                    socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
+                    "SYN-RECEIVED socket (id={}) received a packet from {}:{} with SEG.FLAG={:?} and ignored.",
+                    socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.flag
                 );
                 return Ok(());
             } else if tcp_packet.flag.contains(TcpFlag::ACK) {
                 // If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED state... rfc9293
                 if conn.send_vars.unacknowledged < tcp_packet.ack_number && tcp_packet.ack_number <= conn.send_vars.next_sequence_num {
-                    conn.send_vars.window_size = tcp_packet.windows_size;
+                    if let Some(mss) = tcp_packet.option.mss {
+                        conn.send_vars.send_mss = mss;
+                    } else {
+                        // "SendMSS is... or the default 536 for IPv4 or 1220 for IPv6, if no MSS Option is received." rfc9293
+                        conn.send_vars.send_mss = 536;
+                    }
+                    if let Some(scale) = tcp_packet.option.window_scale {
+                        conn.send_vars.window_shift = scale as usize;
+                        conn.send_vars.window_size = tcp_packet.windows_size >> scale;
+                    } else {
+                        conn.send_vars.window_size = tcp_packet.windows_size;
+                    }
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
-                    conn.send_vars.max_window_size = tcp_packet.windows_size;
+                    conn.send_vars.max_window_size = conn.send_vars.get_scaled_send_window_size();
                     conn.status = TcpStatus::Established;
                     conn.timer.retransmission.init();
                     let parent_id = conn.parent_id;
@@ -1003,7 +1006,7 @@ impl TcpStack {
                         }
                     }
                     log::debug!(
-                        "Socket (id={}) status changed from SYN-RECEIVED to ESTABLISHED. remote={}:{} flag={:?}",
+                        "Socket (id={}) status changed from SYN-RECEIVED to ESTABLISHED. remote={}:{} SEG.FLAG={:?}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.flag
                     );
                     self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Established });
@@ -1022,8 +1025,8 @@ impl TcpStack {
             if tcp_packet.flag.contains(TcpFlag::FIN) {
                 conn.status = TcpStatus::CloseWait;
                 log::debug!(
-                    "Socket (id={}) status changed from SYN-RECEIVED to CLOSE-WAIT. remote={}:{}",
-                    socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port
+                    "Socket (id={}) status changed from SYN-RECEIVED to CLOSE-WAIT. remote={}:{} SEG.FLAG={:?}",
+                    socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port, tcp_packet.flag
                 );
                 self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::Closed });
                 return Ok(());
@@ -1042,23 +1045,7 @@ impl TcpStack {
     ) -> Result<()> {
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
             // check if a segment is acceptable
-            if
-                !(
-                    tcp_packet.tcp_length == 0 && tcp_packet.windows_size == 0 && tcp_packet.seq_number == conn.recv_vars.next_sequence_num
-                ) &&
-                !(
-                    tcp_packet.tcp_length == 0 && tcp_packet.windows_size > 0 && conn.recv_vars.next_sequence_num <= tcp_packet.seq_number &&
-                    tcp_packet.seq_number < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32
-                ) &&
-                (
-                    tcp_packet.tcp_length > 0 && tcp_packet.windows_size == 0
-                ) &&
-                !(
-                    tcp_packet.tcp_length > 0 && tcp_packet.windows_size > 0 && (
-                    (conn.recv_vars.next_sequence_num <= tcp_packet.seq_number && tcp_packet.seq_number < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32) ||
-                    (conn.recv_vars.next_sequence_num <= tcp_packet.seq_number + tcp_packet.tcp_length as u32 - 1 && tcp_packet.seq_number + tcp_packet.tcp_length as u32 - 1 < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32)
-                ))
-            {
+            if !is_segment_acceptable(conn, tcp_packet) {
                 if !tcp_packet.flag.contains(TcpFlag::RST) {
                     let mut ack = tcp_packet.create_reply_base();
                     ack.seq_number = conn.send_vars.next_sequence_num;
@@ -1068,13 +1055,13 @@ impl TcpStack {
                     log::debug!(
                         "ESTABLISHED socket (id={}) received unacceptable non-RST packet from {}:{} and just send back ACK. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port,
-                        tcp_packet.seq_number, tcp_packet.tcp_length, conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
+                        tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
                     );
                 } else {
                     log::debug!(
                         "ESTABLISHED socket (id={}) received unacceptable RST packet from {}:{} and ignored. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port,
-                        tcp_packet.seq_number, tcp_packet.tcp_length, conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
+                        tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
                     );
                 }
                 return Ok(());
@@ -1085,7 +1072,7 @@ impl TcpStack {
                     log::debug!(
                         "ESTABLISHED socket (id={}) received RST packet from {}:{} that is outside of receive window and ignored. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
                         socket_id, Ipv4Addr::from(tcp_packet.src_addr), tcp_packet.local_port,
-                        tcp_packet.seq_number, tcp_packet.tcp_length, conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
+                        tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
                     );
                 // 2) If the RST bit is set and the sequence number exactly matches the next expected sequence number (RCV.NXT) ... rfc9293
                 } else if conn.recv_vars.next_sequence_num == tcp_packet.seq_number {
@@ -1118,12 +1105,89 @@ impl TcpStack {
                 return Ok(());
             }
             if tcp_packet.flag.contains(TcpFlag::ACK) {
-
+                // TCP stacks that implement RFC 5961 MUST add an input check that the ACK value is acceptable
+                // only if it is in the range of ((SND.UNA - MAX.SND.WND) =< SEG.ACK =< SND.NXT). rfc9293
+                if !seq_in_range(
+                    conn.send_vars.unacknowledged.wrapping_sub(conn.send_vars.max_window_size as u32),
+                    conn.send_vars.next_sequence_num,
+                    tcp_packet.ack_number
+                ) {
+                    // It's a challenge ACK situation too, but I don't implement this now.
+                    return Ok(());
+                }
+                // If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK. ... rfc9293
+                if seq_in_range(
+                    conn.send_vars.unacknowledged.wrapping_add(1),
+                    conn.send_vars.next_sequence_num,
+                    tcp_packet.ack_number
+                ) {
+                    log::debug!(
+                        "SND.UNA advanced ({}->{} SND.NXT={}) for the ESTABLISHED socket (id={} {}).",
+                        conn.send_vars.unacknowledged, tcp_packet.ack_number, conn.send_vars.next_sequence_num, socket_id, conn.print_address()
+                    );
+                    conn.update_snd_una(tcp_packet.ack_number)?;
+                } else if seq_less_equal(tcp_packet.ack_number, conn.send_vars.unacknowledged) {
+                    // If the ACK is a duplicate (SEG.ACK =< SND.UNA), it can be ignored. rfc9293
+                    log::debug!(
+                        "ESTABLISHED socket (id={}) ignored duplicate ack. {} SND.UNA={} SEG.ACK={}",
+                        socket_id, conn.print_address(), conn.send_vars.unacknowledged, tcp_packet.ack_number
+                    );
+                } else if seq_greater_than(tcp_packet.ack_number, conn.send_vars.next_sequence_num) {
+                    // If the ACK acks something not yet sent (SEG.ACK > SND.NXT),
+                    // then send an ACK, drop the segment, and return. rfc9293
+                    conn.ack_now = true;
+                    if let Err(e) = self.send_handler(conn) {
+                        log::debug!(
+                            "ESTABLISHED socket (id={} {}) acked, but failed. SEG.ACK={} SND.NXT={} Err: {:?}",
+                            socket_id, conn.print_address(), tcp_packet.ack_number, conn.send_vars.next_sequence_num, e
+                        );
+                    }
+                    conn.ack_now = false;
+                    return Ok(());
+                }
+                if should_update_window(conn, tcp_packet) {
+                    log::debug!(
+                        "RCV.WND updated ({}->{} shift={} SEG.SEQ={} SEG.ACK={}) for the ESTABLISHED socket (id={} {}).",
+                        conn.send_vars.window_size << conn.send_vars.window_shift , tcp_packet.windows_size << conn.send_vars.window_shift,
+                        conn.send_vars.window_shift, tcp_packet.seq_number, tcp_packet.ack_number, socket_id, conn.print_address()
+                    );
+                    conn.send_vars.window_size = tcp_packet.windows_size;
+                    conn.send_vars.last_sequence_num = tcp_packet.seq_number;
+                    conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
+                }
             }
+            // Seventh, process the segment text: rfc9293
+            if tcp_packet.payload.len() != 0 {
+                conn.recv_queue.add(tcp_packet.seq_number as usize, &tcp_packet.payload)?;
+                let rcv_nxt_advance = conn.recv_queue.complete_datagram.payload.len();
+                let rcv_nxt_next = conn.recv_queue.get_real_begin_sequence_num().wrapping_add(rcv_nxt_advance as u32);
+                log::debug!(
+                    "RCV.NXT advanced ({}->{}) for the ESTABLISHED socket (id={} {}).",
+                    conn.recv_vars.next_sequence_num, rcv_nxt_next, socket_id, conn.print_address()
+                );
+                conn.recv_vars.next_sequence_num = rcv_nxt_next;
+                conn.recv_vars.window_size = conn.get_recv_window_size();
+            }
+            // Enter the CLOSE-WAIT state. rfc9293
+            if tcp_packet.flag.contains(TcpFlag::FIN) {
+                conn.status = TcpStatus::CloseWait;
+                log::debug!(
+                    "Socket (id={}) status changed from ESTABLISHED to CLOSED-WAIT. {} SEG.FLAG={:?}",
+                    socket_id, conn.print_address(), tcp_packet.flag
+                );
+            }
+            conn.ack_now = true;
+            if let Err(e) = self.send_handler(conn) {
+                log::debug!(
+                    "ESTABLISHED socket (id={}) acked, but failed. SEG.ACK={} SND.NXT={} Err: {}",
+                    socket_id, tcp_packet.ack_number, conn.send_vars.next_sequence_num, e
+                );
+            }
+            conn.ack_now = false;
+            return Ok(());
         } else {
             anyhow::bail!("No socket (id={}).", socket_id);
         }
-        Ok(())
     }
 
     fn generate_initial_sequence(&self) -> u32 {
@@ -1184,6 +1248,93 @@ impl TcpStack {
     }
 }
 
+pub fn calc_window_size(conn: &TcpConnection) -> usize {
+    // todo: need to adjust window size to avoid silly window syndrome
+    conn.recv_queue.queue_length - conn.recv_queue.complete_datagram.payload.len()
+}
+
+// true if min <= target <= max
+pub fn seq_in_range(min: u32, max: u32, target: u32) -> bool {
+    if seq_less_equal(min, max) {
+        seq_less_equal(min, target) && seq_less_equal(target, max)
+    } else {
+        seq_less_equal(min, target) || seq_less_equal(target, max)
+    }
+}
+
+// true if seq1 < seq2
+fn seq_less_than(seq1: u32, seq2: u32) -> bool {
+    (seq1 < seq2 && seq2 - seq1 < (MAX_SEQ / 2)) ||
+    (seq1 > seq2 && seq1 - seq2 > (MAX_SEQ / 2))
+}
+
+// true if seq1 <= seq2
+fn seq_less_equal(seq1: u32, seq2: u32) -> bool {
+    seq1 == seq2 || seq_less_than(seq1, seq2)
+}
+
+// true if seq1 > seq2
+fn seq_greater_than(seq1: u32, seq2: u32) -> bool {
+    (seq1 > seq2 && seq1 - seq2 < (MAX_SEQ / 2)) ||
+    (seq1 < seq2 && seq2 - seq1 > (MAX_SEQ / 2))
+}
+
+// true if seq1 >= seq2
+fn seq_greater_equal(seq1: u32, seq2: u32) -> bool {
+    seq1 == seq2 || seq_greater_than(seq1, seq2)
+}
+
+// There are four cases for the acceptability test for an incoming segment: rfc9293
+pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bool {
+    if tcp_packet.payload.len() == 0 && tcp_packet.windows_size << conn.send_vars.window_shift == 0 {
+        if tcp_packet.seq_number == conn.recv_vars.next_sequence_num {
+            return true;
+        }
+    } else if tcp_packet.payload.len() == 0 && tcp_packet.windows_size << conn.send_vars.window_shift > 0 {
+        if seq_in_range(
+            conn.recv_vars.next_sequence_num,
+            conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
+            tcp_packet.seq_number
+        ) {
+            return true;
+        }
+    } else if tcp_packet.payload.len() > 0 && tcp_packet.windows_size << conn.send_vars.window_shift == 0 {
+        return false;
+    } else if tcp_packet.payload.len() > 0 && tcp_packet.windows_size << conn.send_vars.window_shift > 0 {
+        if seq_in_range(
+            conn.recv_vars.next_sequence_num,
+            conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
+            tcp_packet.seq_number
+        ) || seq_in_range(
+            conn.recv_vars.next_sequence_num,
+            conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
+            tcp_packet.seq_number.wrapping_add(tcp_packet.payload.len() as u32 - 1)
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+// If SND.UNA =< SEG.ACK =< SND.NXT, the send window should be updated. rfc9293
+pub fn should_update_window(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bool {
+    if seq_in_range(
+        conn.send_vars.unacknowledged,
+        conn.send_vars.next_sequence_num,
+        tcp_packet.ack_number
+    ) && (
+        seq_greater_than(tcp_packet.seq_number, conn.send_vars.last_sequence_num) ||
+        (
+            tcp_packet.seq_number == conn.send_vars.last_sequence_num &&
+            seq_greater_equal(tcp_packet.ack_number, conn.send_vars.last_acknowledge_num)
+        )
+    ) {
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug)]
 pub struct ListenQueue {
     pub pending: VecDeque<usize>,                 // Received SYN but not replied SYN/ACK
@@ -1208,6 +1359,7 @@ pub struct TcpConnection {
     pub recv_queue: ReceiveQueue,
     pub timer: TcpTimer,
     pub rtt_start: Option<Instant>,
+    pub ack_now: bool,
 }
 
 impl TcpConnection {
@@ -1226,11 +1378,32 @@ impl TcpConnection {
             recv_queue: ReceiveQueue::new(),
             timer: TcpTimer::new(),
             rtt_start: None,
+            ack_now: false,
         }
     }
 
     pub fn print_address(&self) -> String {
         format!("local={}:{} remote={}:{}", self.src_addr, self.local_port, self.dst_addr, self.remote_port)
+    }
+
+    pub fn get_recv_window_size(&self) -> usize {
+        // todo: need to adjust window size to avoid silly window syndrome
+        self.recv_queue.queue_length - self.recv_queue.complete_datagram.payload.len()
+    }
+
+    pub fn get_recv_window_for_pkt(&self) -> u16 {
+        (self.get_recv_window_size() << self.recv_vars.window_shift) as u16
+    }
+
+    pub fn update_snd_una(&mut self, new_snd_una: u32) -> Result<()> {
+        anyhow::ensure!(
+            seq_less_equal(new_snd_una, self.send_vars.next_sequence_num),
+            "New SND.UNA ({}) should be equal or smaller than SND.NXT ({}).",
+            new_snd_una, self.send_vars.next_sequence_num
+        );
+        self.send_queue.payload.drain(..new_snd_una.wrapping_sub(self.send_vars.unacknowledged) as usize);
+        self.send_vars.unacknowledged = new_snd_una;
+        Ok(())
     }
 }
 
@@ -1250,13 +1423,14 @@ impl TcpConnection {
 pub struct SendVariables {
     pub unacknowledged: u32,       // send unacknowledged (oldest unacknowledged sequence number) -> recv packet's ack (UNA)
     pub next_sequence_num: u32,    // send next -> recv packet's ack, next send packet's seq (NXT)
-    pub window_size: u16,          // send window (WND)
+    pub window_size: u16,          // send window received by packet (not scaled!)
     pub urgent_pointer: u16,       // send urgent pointer
     pub last_sequence_num: u32,    // segment sequence number used for last window update (WL1)
     pub last_acknowledge_num: u32, // segment acknowledgment number used for last window update (WL2)
     pub initial_sequence_num: u32, // initial send sequence number (ISS)
-    pub send_mss: u16,             // Maximum Segment Size
-    pub max_window_size: u16,      // maximum windows size that has ever received
+    pub send_mss: u16,             // Maximum Segment Size reported by remote peer
+    pub window_shift: usize,       // received window scale option (Snd.Wind.Shift)
+    pub max_window_size: usize,    // maximum windows size that has ever received (already scaled)
 }
 
 impl SendVariables {
@@ -1264,6 +1438,10 @@ impl SendVariables {
         Self {
             ..Default::default()
         }
+    }
+
+    pub fn get_scaled_send_window_size(&self) -> usize {
+        (self.window_size << self.window_shift) as usize
     }
 }
 
@@ -1296,14 +1474,17 @@ impl SendQueue {
 #[derive(Debug, Default)]
 pub struct ReceiveVariables {
     pub next_sequence_num: u32,    // receive next -> recv packet's seq + data length, next send packet's ack (NXT)
-    pub window_size: u16,          // receive window
+    pub window_size: usize,        // receive window (already scaled, originaly u16)
     pub urgent_pointer: u16,       // receive urgent pointer
-    pub initial_sequence_num: u32  // initial receive sequence number (IRS)
+    pub initial_sequence_num: u32, // initial receive sequence number (IRS)
+    pub window_shift: usize,       // received window scale option (Rcv.Wind.Shift)
+    pub recv_mss: usize,           // mss report to remote peer
 }
 
 impl ReceiveVariables {
     pub fn new() -> Self {
         Self {
+            window_size: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             ..Default::default()
         }
     }
@@ -1349,12 +1530,12 @@ impl ReceiveQueue {
         }
     }
 
-    pub fn get_real_begin_sequence_num(&self) -> usize {
+    pub fn get_real_begin_sequence_num(&self) -> u32 {
         let begin = self.complete_datagram.sequence_num;
         if begin >= TCP_RECV_QUEUE_WRAP {
-            begin - TCP_RECV_QUEUE_WRAP
+            (begin - TCP_RECV_QUEUE_WRAP) as u32
         } else {
-            begin
+            begin as u32
         }
     }
 
