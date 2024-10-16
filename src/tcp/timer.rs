@@ -62,7 +62,7 @@ impl TcpStack {
             if conn.timer.retransmission.is_expired()? {
                 if let Err(e) = self.send_handler(conn) {
                     conn.timer.retransmission.next_syn();
-                    log::debug!(
+                    log::warn!(
                         "[{}] Failed to retransmit a SYN packet. next shift={} next delta={} Err: {:?}",
                         conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta, e
                     );
@@ -78,6 +78,7 @@ impl TcpStack {
                         "[{}] Gave up retransmitting a SYN packet and closing the socket.",
                         conn.print_log_prefix(socket_id),
                     );
+                    conn.timer.retransmission.timer_param.active = false;
                     self.publish_event(TcpEvent {socket_id: socket_id, event: TcpEventType::Closed});
                 }
             }
@@ -95,7 +96,7 @@ impl TcpStack {
                 conn.flag.snd_from_una = true;
                 if let Err(e) = self.send_handler(conn) {
                     conn.timer.retransmission.next_datagram();
-                    log::debug!(
+                    log::warn!(
                         "[{}] Failed to retransmit a datagram packet. next shift={} next delta={} Err: {:?}",
                         conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta, e
                     );
@@ -111,10 +112,12 @@ impl TcpStack {
                 // Based on Karn Algo, we won't mesure rtt.
                 conn.rtt_start = None;
                 if conn.timer.retransmission.is_finished() {
+                    conn.timer.retransmission.init();
                     log::debug!(
                         "[{}] Gave up retransmitting a datagram packet and closing the socket.",
                         conn.print_log_prefix(socket_id),
                     );
+                    conn.status = TcpStatus::Closed;
                     self.publish_event(TcpEvent {socket_id: socket_id, event: TcpEventType::Closed});
                 }
             }
@@ -141,6 +144,7 @@ pub fn update_retransmission_param(conn: &mut TcpConnection, rtt: usize) -> Resu
     }
     timer_param.rtt = rtt;
     timer_param.rexmt_shift = 0;
+    timer_param.active = false;
     conn.timer.retransmission.set_delta(false);
     Ok(())
 }
@@ -212,8 +216,8 @@ impl RetransmissionTimer {
         self.timer_param.active = true;
         self.next_datagram();
         log::debug!(
-            "Retransmission timer for a Datagram packet is fired. MAX={} initial delta={}",
-            TCP_MAXRXTSHIFT, self.timer_param.delta
+            "Retransmission timer for a Datagram packet is fired. MAX={} shift={} initial delta={}",
+            TCP_MAXRXTSHIFT, self.timer_param.rexmt_shift, self.timer_param.delta
         );
     }
 
@@ -231,7 +235,6 @@ impl RetransmissionTimer {
         } else {
             let calc_delta = ((self.timer_param.rtt_smoothed >> TCP_SRTT_SHIFT) + (self.timer_param.rtt_variance >> TCP_RTTVAR_SHIFT) * 4) * TCP_BACKOFF[shift];
             self.timer_param.delta = adjust_delta(calc_delta);
-            println!("set_delta: {} calc_delta: {} param: {:?}", self.timer_param.delta, calc_delta, self.timer_param);
         }
     }
 
@@ -250,7 +253,6 @@ impl RetransmissionTimer {
 
     pub fn is_finished(&mut self) -> bool {
         if self.timer_param.rexmt_shift >= TCP_MAXRXTSHIFT + 1 {
-            self.init();
             true
         } else {
             false

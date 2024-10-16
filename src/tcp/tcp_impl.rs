@@ -382,13 +382,12 @@ impl TcpStack {
                 if (payload_len - current_offset) <= current_queue_free {
                     conn.send_queue.payload.extend_from_slice(&payload[current_offset..]);
                     current_offset += payload_len;
-                    println!("add to queue! send_queue: {:?}", conn.send_queue);
                 } else {
                     conn.send_queue.payload.extend_from_slice(&payload[current_offset..current_offset+current_queue_free]);
                     current_offset += current_queue_free
                 }
                 if let Err(e) = self.send_handler(conn) {
-                    log::warn!("Failed to send datagram. Err: {e:?}");
+                    log::warn!("Failed to send a datagram. Err: {e:?}");
                 }
                 if current_offset == payload_len {
                     if !conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num {
@@ -487,13 +486,16 @@ impl TcpStack {
                 let datagram_size = datagram.payload.len() as u32;
                 let snd_seq = datagram.seq_number;
                 let snd_ack = datagram.ack_number;
-                self.send_tcp_packet_safe(datagram)?;
-                if conn.rtt_start.is_none() {
+                self.send_tcp_packet(datagram).map_err(|e| {
+                    // We need to update SND.NXT even if a packet failed to be sent to trigger retransmission.
+                    conn.send_vars.next_sequence_num = conn.send_vars.next_sequence_num.wrapping_add(datagram_size);
+                    e
+                })?;
+                if conn.rtt_start.is_none() && datagram_size > 0 {
                     conn.rtt_start = Some(Instant::now());
                     conn.rtt_seq = Some(snd_seq);
                 }
                 conn.send_vars.next_sequence_num = conn.send_vars.next_sequence_num.wrapping_add(datagram_size);
-                println!("after datagram_size: {} SND.NXT: {}", datagram_size, conn.send_vars.next_sequence_num);
                 conn.last_snd_ack = snd_ack;
                 if next_send_nxt == conn.send_vars.next_sequence_num { break; };
             }
@@ -509,8 +511,9 @@ impl TcpStack {
                 let datagram_size = datagram.payload.len() as u32;
                 let snd_seq = datagram.seq_number;
                 let snd_ack = datagram.ack_number;
-                self.send_tcp_packet_safe(datagram)?;
-                if conn.rtt_start.is_none() {
+                // We don't need to update SND.NXT because retransmission will trigger anyway.
+                self.send_tcp_packet(datagram)?;
+                if conn.rtt_start.is_none() && datagram_size > 0 {
                     conn.rtt_start = Some(Instant::now());
                     conn.rtt_seq = Some(snd_seq);
                 }
@@ -600,8 +603,8 @@ impl TcpStack {
         if let Some(id) = socket_id {
             if let Some(Some(conn)) = conns.get(&id) {
                 log::trace!(
-                    "Handling packet for {} socket (id={} {}). SEG.SEQ={} SEG.ACK={} SEG.FLAG={:?}",
-                    conn.status, id, conn.print_address(), tcp_packet.seq_number, tcp_packet.ack_number, tcp_packet.flag
+                    "Handling packet for {} socket (id={} {}). SEG.SEQ={} SEG.ACK={} LENGTH={} SEG.FLAG={:?}",
+                    conn.status, id, conn.print_address(), tcp_packet.seq_number, tcp_packet.ack_number, tcp_packet.payload.len(), tcp_packet.flag
                 );
                 match &conn.status {
                     TcpStatus::Listen => { self.recv_handler_listen(id, tcp_packet, conns).context("recv_handler_listen failed.")?; }
@@ -744,8 +747,9 @@ impl TcpStack {
                         send_vars.send_mss = 536;
                     }
                     if let Some(scale) = tcp_packet.option.window_scale {
+                        // I'm sorry... fractions may be rounded down...
                         send_vars.window_shift = scale as usize;
-                        send_vars.window_size = tcp_packet.window_size;
+                        send_vars.window_size = tcp_packet.window_size >> scale;
                         recv_vars.window_shift = TCP_DEFAULT_WINDOW_SCALE as usize;
                     } else {
                         send_vars.window_size = tcp_packet.window_size;
@@ -862,8 +866,9 @@ impl TcpStack {
                         conn.send_vars.send_mss = 536;
                     }
                     if let Some(scale) = tcp_packet.option.window_scale {
+                        // I'm sorry... fractions may be rounded down...
                         conn.send_vars.window_shift = scale as usize;
-                        conn.send_vars.window_size = tcp_packet.window_size;
+                        conn.send_vars.window_size = tcp_packet.window_size >> scale;
                         conn.recv_vars.window_shift = TCP_DEFAULT_WINDOW_SCALE as usize;
                     } else {
                         conn.send_vars.window_size = tcp_packet.window_size;
@@ -872,7 +877,7 @@ impl TcpStack {
                     conn.send_vars.next_sequence_num = next_seq; // change nothing.
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
-                    conn.send_vars.max_window_size = conn.send_vars.get_scaled_send_window_size();
+                    conn.send_vars.max_window_size = tcp_packet.window_size as usize;
                     conn.recv_vars.initial_sequence_num = tcp_packet.seq_number;
                     conn.recv_vars.next_sequence_num = next_ack;
                     conn.recv_queue.complete_datagram.sequence_num = next_ack as usize;
@@ -896,8 +901,9 @@ impl TcpStack {
                         conn.send_vars.send_mss = 536;
                     }
                     if let Some(scale) = tcp_packet.option.window_scale {
+                        // I'm sorry... fractions may be rounded down...
                         conn.send_vars.window_shift = scale as usize;
-                        conn.send_vars.window_size = tcp_packet.window_size;
+                        conn.send_vars.window_size = tcp_packet.window_size >> scale;
                         conn.recv_vars.window_shift = TCP_DEFAULT_WINDOW_SCALE as usize;
                     } else {
                         conn.send_vars.window_size = tcp_packet.window_size;
@@ -906,7 +912,7 @@ impl TcpStack {
                     conn.send_vars.unacknowledged = next_seq;
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
-                    conn.send_vars.max_window_size = conn.send_vars.window_size as usize;
+                    conn.send_vars.max_window_size = tcp_packet.window_size as usize;
                     conn.recv_vars.next_sequence_num = next_ack;
                     conn.recv_queue.complete_datagram.sequence_num = next_ack as usize;
                     conn.status = TcpStatus::SynRcvd;
@@ -1014,22 +1020,11 @@ impl TcpStack {
             } else if tcp_packet.flag.contains(TcpFlag::ACK) {
                 // If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED state... rfc9293
                 if conn.send_vars.unacknowledged < tcp_packet.ack_number && tcp_packet.ack_number <= conn.send_vars.next_sequence_num {
-                    if let Some(mss) = tcp_packet.option.mss {
-                        conn.send_vars.send_mss = mss;
-                    } else {
-                        // "SendMSS is... or the default 536 for IPv4 or 1220 for IPv6, if no MSS Option is received." rfc9293
-                        conn.send_vars.send_mss = 536;
-                    }
-                    if let Some(scale) = tcp_packet.option.window_scale {
-                        conn.send_vars.window_shift = scale as usize;
-                        conn.send_vars.window_size = tcp_packet.window_size;
-                        conn.recv_vars.window_shift = TCP_DEFAULT_WINDOW_SCALE as usize;
-                    } else {
-                        conn.send_vars.window_size = tcp_packet.window_size;
-                    }
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
-                    conn.send_vars.max_window_size = conn.send_vars.get_scaled_send_window_size();
+                    let current_window = conn.send_vars.get_scaled_send_window_size();
+                    conn.send_vars.window_size = tcp_packet.window_size;
+                    conn.send_vars.max_window_size = max(current_window, conn.get_recv_window_size());
                     conn.status = TcpStatus::Established;
                     conn.timer.retransmission.init();
                     let parent_id = conn.parent_id;
@@ -1076,16 +1071,18 @@ impl TcpStack {
             // check if a segment is acceptable
             if !is_segment_acceptable(conn, tcp_packet) {
                 if !tcp_packet.flag.contains(TcpFlag::RST) {
-                    let mut ack = tcp_packet.create_reply_base();
-                    ack.seq_number = conn.send_vars.next_sequence_num;
-                    ack.ack_number = tcp_packet.seq_number;
-                    ack.window_size = conn.get_recv_window_for_pkt();
-                    ack.flag = TcpFlag::ACK;
-                    self.send_tcp_packet(ack).context("Failed to send ACK.")?;
-                    log::debug!(
-                        "[{}] Received an unacceptable non-RST packet and just send back ACK. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={} SEG.FLAG={:?}",
-                        conn.print_log_prefix(socket_id), tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size, tcp_packet.flag
-                    );
+                    conn.flag.ack_now = true;
+                    if let Err(e) = self.send_handler(conn) {
+                        log::warn!(
+                            "[{}] Received an unacceptable non-RST packet and just send back ACK, but failed. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={} SEG.FLAG={:?} Err: {:?}",
+                            conn.print_log_prefix(socket_id), tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size, tcp_packet.flag, e
+                        );
+                    } else {
+                        log::debug!(
+                            "[{}] Received an unacceptable non-RST packet and just send back ACK. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={} SEG.FLAG={:?}",
+                            conn.print_log_prefix(socket_id), tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size, tcp_packet.flag
+                        );
+                    }
                 } else {
                     log::debug!(
                         "[{}] Received an unacceptable RST packet and ignored. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
@@ -1139,14 +1136,12 @@ impl TcpStack {
                     // It's a challenge ACK situation too, but I don't implement this now.
                     return Ok(());
                 }
-                println!("SEG.ACK={} snd_vars: {:?} dup: {}", tcp_packet.ack_number, conn.send_vars, seq_less_equal(tcp_packet.ack_number, conn.send_vars.unacknowledged));
                 // If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK. ... rfc9293
                 if seq_in_range(
                     conn.send_vars.unacknowledged.wrapping_add(1),
                     conn.send_vars.next_sequence_num,
                     tcp_packet.ack_number
                 ) {
-                    println!("here snd una advace");
                     if conn.send_vars.unacknowledged != tcp_packet.ack_number {
                         log::debug!(
                             "[{}] SND.UNA advanced ({}->{} SND.NXT={}).",
@@ -1164,7 +1159,7 @@ impl TcpStack {
                     // If the ACK acks something not yet sent (SEG.ACK > SND.NXT),
                     // then send an ACK, drop the segment, and return. rfc9293
                     if let Err(e) = self.send_handler(conn) {
-                        log::debug!(
+                        log::warn!(
                             "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {:?}",
                             conn.print_log_prefix(socket_id), tcp_packet.ack_number, conn.send_vars.next_sequence_num, e
                         );
@@ -1172,19 +1167,15 @@ impl TcpStack {
                     return Ok(());
                 }
                 if should_update_window(conn, tcp_packet) {
-                    // Hack: Initial received window size is alredy scaled, so avoid shifting for the first packet.
-                    let prev_window_size: u16;
-                    if conn.last_snd_ack == 0 {
-                        prev_window_size = conn.send_vars.window_size;
-                    } else {
-                        prev_window_size = conn.send_vars.window_size << conn.send_vars.window_shift;
-                    }
+                    let current_window = conn.send_vars.get_scaled_send_window_size();
+                    let new_window = (tcp_packet.window_size << conn.send_vars.window_shift) as usize;
                     log::debug!(
-                        "[{}] SND.WND updated. ({}->{} shift={} SEG.SEQ={} SEG.ACK={}).",
-                        conn.print_log_prefix(socket_id), prev_window_size , tcp_packet.window_size << conn.send_vars.window_shift,
+                        "[{}] SND.WND updated. ({}->{} window_shift={} SEG.SEQ={} SEG.ACK={}).",
+                        conn.print_log_prefix(socket_id), current_window, new_window,
                         conn.send_vars.window_shift, tcp_packet.seq_number, tcp_packet.ack_number
                     );
                     conn.send_vars.window_size = tcp_packet.window_size;
+                    conn.send_vars.max_window_size = max(current_window, new_window);
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
                 }
@@ -1217,22 +1208,24 @@ impl TcpStack {
                 conn.status = TcpStatus::CloseWait;
                 log::debug!("[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}", conn.print_log_prefix(socket_id), tcp_packet.flag);
             }
+            conn.flag.ack_now = true;
             if let Err(e) = self.send_handler(conn) {
-                log::debug!(
+                log::warn!(
                     "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {}",
                     conn.print_log_prefix(socket_id), tcp_packet.ack_number, conn.send_vars.next_sequence_num, e
                 );
             }
+            conn.flag.ack_now = false;
             if !conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num {
                 conn.timer.retransmission.fire_datagram();
                 log::debug!(
-                    "Enabled retransmission timer. shift={} SND.UNA={} SND.NXT={}",
+                    "Enabled retransmission timer in recv_handler_established. shift={} SND.UNA={} SND.NXT={}",
                     conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged, conn.send_vars.next_sequence_num
                 );
             } else if conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged == conn.send_vars.next_sequence_num {
                 conn.timer.retransmission.timer_param.active = false;
                 log::debug!(
-                    "Disabled retransmission timer. shift={} SND.UNA=SND.NXT={}",
+                    "Disabled retransmission timer in recv_handler_established. shift={} SND.UNA=SND.NXT={}",
                     conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged
                 );
             }

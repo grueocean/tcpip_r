@@ -297,7 +297,6 @@ impl TcpPacket {
         let payload_len = min(conn.send_queue.payload.len() - start_offset, conn.send_vars.send_mss as usize);
         let end_offset = start_offset + payload_len;
         datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
-        println!("next offset: {}~{} payload: {:?}", start_offset, end_offset, datagram.payload);
         Ok(datagram)
     }
 
@@ -318,7 +317,6 @@ impl TcpPacket {
         let payload_len = min(conn.send_queue.payload.len() - start_offset, conn.send_vars.send_mss as usize);
         let end_offset = start_offset + payload_len;
         datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
-        println!("rexmt offset: {}~{} payload: {:?}", start_offset, end_offset, datagram.payload);
         Ok(datagram)
     }
 }
