@@ -1,6 +1,9 @@
 use crate::{
     l2_l3::{defs::Ipv4Type, ip::{get_global_l3stack, Ipv4Packet, L3Stack, NetworkConfiguration}},
-    tcp::{self, defs::{TcpError, TcpStatus}, packet::{TcpFlag, TcpPacket}, timer::TcpTimer}
+    tcp::{
+        self, defs::{TcpError, TcpStatus}, packet::{TcpFlag, TcpPacket, TCP_DEFAULT_WINDOW_SCALE},
+        timer::{TcpTimer, update_retransmission_param, TCP_SRTT_SHIFT, TCP_RTTVAR_SHIFT}
+}
 };
 use anyhow::{Context, Result};
 use log;
@@ -24,7 +27,7 @@ const TCP_MAX_LISTEN_QUEUE: usize = TCP_MAX_CONCURRENT_SESSION * 3 / 2;
 const TCP_DEFAULT_SEND_QUEUE_LENGTH: usize = 4096;
 const TCP_DEFAULT_RECV_QUEUE_LENGTH: usize = 4096;
 const TCP_RECV_QUEUE_WRAP: usize = 1 << 32;
-const TCP_NO_DELAY: bool = true;
+const TCP_NO_DELAY: bool = false;
 
 static TCP_STACK_GLOBAL: OnceLock<Arc<TcpStack>> = OnceLock::new();
 
@@ -379,6 +382,7 @@ impl TcpStack {
                 if (payload_len - current_offset) <= current_queue_free {
                     conn.send_queue.payload.extend_from_slice(&payload[current_offset..]);
                     current_offset += payload_len;
+                    println!("add to queue! send_queue: {:?}", conn.send_queue);
                 } else {
                     conn.send_queue.payload.extend_from_slice(&payload[current_offset..current_offset+current_queue_free]);
                     current_offset += current_queue_free
@@ -386,37 +390,40 @@ impl TcpStack {
                 if let Err(e) = self.send_handler(conn) {
                     log::warn!("Failed to send datagram. Err: {e:?}");
                 }
+                if current_offset == payload_len {
+                    if !conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num {
+                        conn.timer.retransmission.fire_datagram();
+                    }
+                    return Ok(current_offset);
+                }
             } else {
                 anyhow::bail!("Cannot find the socket (id={}).", socket_id);
             }
-            if current_offset == payload_len {
-                return Ok(current_offset);
-            } else {
-                drop(conns);
-                if let (_valid, Some(event)) = self.wait_events_with_timeout(
-                    vec![
-                        TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived },
-                        TcpEvent { socket_id: socket_id, event: TcpEventType::Refused },
-                        TcpEvent { socket_id: socket_id, event: TcpEventType::Closed }
-                    ],
-                    Duration::from_millis(100)
-                ) {
-                    match event.event {
-                        TcpEventType::DatagramReceived => {
-                            continue;
-                        }
-                        TcpEventType::Refused => {
-                            log::warn!("While waiting for the socket (id={}) sending datagram, the connection refused.", socket_id);
-                        }
-                        TcpEventType::Closed => {
-                            log::warn!("While waiting for the socket (id={}) sending datagram, the connection closed.", socket_id);
-                        }
-                        other => {
-                            anyhow::bail!("Wake up from unexpected event ({:?}). Expected Established/Refused/Closed.", other);
-                        }
+            drop(conns);
+            if let (_valid, Some(event)) = self.wait_events_with_timeout(
+                vec![
+                    TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived },
+                    TcpEvent { socket_id: socket_id, event: TcpEventType::Refused },
+                    TcpEvent { socket_id: socket_id, event: TcpEventType::Closed }
+                ],
+                Duration::from_millis(100)
+            ) {
+                match event.event {
+                    TcpEventType::DatagramReceived => {
+                        continue;
+                    }
+                    TcpEventType::Refused => {
+                        log::warn!("While waiting for the socket (id={}) sending datagram, the connection refused.", socket_id);
+                    }
+                    TcpEventType::Closed => {
+                        log::warn!("While waiting for the socket (id={}) sending datagram, the connection closed.", socket_id);
+                    }
+                    other => {
+                        anyhow::bail!("Wake up from unexpected event ({:?}). Expected Established/Refused/Closed.", other);
                     }
                 }
             }
+
         }
     }
 
@@ -439,7 +446,7 @@ impl TcpStack {
         &self,
         conn: &mut TcpConnection
     ) -> Result<usize> {
-        let mut syn_packet = TcpPacket::new_out_packet(conn)?;
+        let mut syn_packet = TcpPacket::new_out_packet(conn, None)?;
         syn_packet.option.mss = Some(conn.recv_vars.recv_mss as u16);
         self.send_tcp_packet(syn_packet)?;
         Ok(0)
@@ -449,7 +456,7 @@ impl TcpStack {
         &self,
         conn: &mut TcpConnection
     ) -> Result<usize> {
-        let syn_ack_packet = TcpPacket::new_out_packet(conn)?;
+        let syn_ack_packet = TcpPacket::new_out_packet(conn, None)?;
         self.send_tcp_packet(syn_ack_packet)?;
         Ok(0)
     }
@@ -464,21 +471,54 @@ impl TcpStack {
         let send_mss = conn.send_vars.send_mss;
         let new_data = conn.send_queue.payload.len() - send_nxt.wrapping_sub(send_una) as usize;
         let next_send_nxt = send_una.wrapping_add(conn.send_queue.payload.len() as u32);
-        if !TCP_NO_DELAY && send_una != send_nxt && ((new_data as u16) < send_mss || send_wnd < send_mss as usize) && !conn.ack_now {
+        if !conn.flag.no_delay && send_una != send_nxt && ((new_data as u16) < send_mss || send_wnd < send_mss as usize) && !conn.flag.ack_now {
             log::debug!(
                 "[status={} {}] We won't send a datagram here based on Nagle's algo. SND.UNA={} SND.NXT={} SND.WND={} SND.MSS={} PENDING_DATAGRAM_LENGTH={}",
                 conn.status, conn.print_address(), send_una, send_nxt, send_wnd, send_mss, new_data
             );
             Ok(0)
-        } else {
+        } else if !conn.flag.snd_from_una {
             loop {
-                let datagram = TcpPacket::new_out_packet(conn).context("Failed to create a datagram packet.")?;
+                if next_send_nxt == conn.send_vars.next_sequence_num && conn.last_snd_ack == conn.recv_vars.next_sequence_num && !conn.flag.ack_now {
+                    log::debug!("Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} RCV.NXT={}", conn.flag.snd_from_una, next_send_nxt, conn.last_snd_ack);
+                    break;
+                }
+                let datagram = TcpPacket::new_out_packet(conn, None).context("Failed to create a datagram packet.")?;
                 let datagram_size = datagram.payload.len() as u32;
+                let snd_seq = datagram.seq_number;
+                let snd_ack = datagram.ack_number;
                 self.send_tcp_packet_safe(datagram)?;
                 if conn.rtt_start.is_none() {
                     conn.rtt_start = Some(Instant::now());
+                    conn.rtt_seq = Some(snd_seq);
                 }
                 conn.send_vars.next_sequence_num = conn.send_vars.next_sequence_num.wrapping_add(datagram_size);
+                println!("after datagram_size: {} SND.NXT: {}", datagram_size, conn.send_vars.next_sequence_num);
+                conn.last_snd_ack = snd_ack;
+                if next_send_nxt == conn.send_vars.next_sequence_num { break; };
+            }
+            Ok(0)
+        } else {
+            let mut start_seq = conn.send_vars.unacknowledged;
+            loop {
+                if next_send_nxt == conn.send_vars.next_sequence_num && conn.last_snd_ack == conn.recv_vars.next_sequence_num && !conn.flag.ack_now {
+                    log::debug!("Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} RCV.NXT={}", conn.flag.snd_from_una, next_send_nxt, conn.last_snd_ack);
+                    break;
+                }
+                let datagram = TcpPacket::new_out_packet(conn, Some(start_seq)).context("Failed to create a datagram packet.")?;
+                let datagram_size = datagram.payload.len() as u32;
+                let snd_seq = datagram.seq_number;
+                let snd_ack = datagram.ack_number;
+                self.send_tcp_packet_safe(datagram)?;
+                if conn.rtt_start.is_none() {
+                    conn.rtt_start = Some(Instant::now());
+                    conn.rtt_seq = Some(snd_seq);
+                }
+                start_seq = start_seq.wrapping_add(datagram_size);
+                if seq_greater_equal(start_seq, conn.send_vars.next_sequence_num) {
+                    conn.send_vars.next_sequence_num = start_seq;
+                }
+                conn.last_snd_ack = snd_ack;
                 if next_send_nxt == conn.send_vars.next_sequence_num { break; };
             }
             Ok(0)
@@ -559,12 +599,15 @@ impl TcpStack {
         )?;
         if let Some(id) = socket_id {
             if let Some(Some(conn)) = conns.get(&id) {
-                log::trace!("Handling packet for {} socket (id={} {}).", conn.status, id, conn.print_address());
+                log::trace!(
+                    "Handling packet for {} socket (id={} {}). SEG.SEQ={} SEG.ACK={} SEG.FLAG={:?}",
+                    conn.status, id, conn.print_address(), tcp_packet.seq_number, tcp_packet.ack_number, tcp_packet.flag
+                );
                 match &conn.status {
-                    TcpStatus::Listen => { self.recv_handler_listen(id, tcp_packet, conns).context("listen_handler failed.")?; }
-                    TcpStatus::SynSent => { self.recv_handler_syn_sent(id, tcp_packet, conns).context("syn_sent_handler failed.")?; }
-                    TcpStatus::SynRcvd => { self.recv_handler_syn_rcvd(id, tcp_packet, conns).context("syn_rcvd_handler failed.")?; }
-                    TcpStatus::Established => { self.recv_handler_established(id, tcp_packet, conns).context("established_handler failed.")?; }
+                    TcpStatus::Listen => { self.recv_handler_listen(id, tcp_packet, conns).context("recv_handler_listen failed.")?; }
+                    TcpStatus::SynSent => { self.recv_handler_syn_sent(id, tcp_packet, conns).context("recv_handler_syn_sent failed.")?; }
+                    TcpStatus::SynRcvd => { self.recv_handler_syn_rcvd(id, tcp_packet, conns).context("recv_handler_syn_rcvd failed.")?; }
+                    TcpStatus::Established => { self.recv_handler_established(id, tcp_packet, conns).context("recv_handler_established failed.")?; }
                     other => {
                         anyhow::bail!("Recv handler for TcpStatus {} is not implemented.", other);
                     }
@@ -613,7 +656,9 @@ impl TcpStack {
                 recv_queue: _recv_buffer,
                 timer: _timer,
                 rtt_start: _rtt_start,
-                ack_now: _ack_now,
+                rtt_seq: _rtt_seq,
+                last_snd_ack: _last_snd_ack,
+                flag: _flag,
             }) = connection_info {
                 if s_addr == dst_addr && d_addr == src_addr && l_port == remote_port && r_port == local_port {
                     ids.push(*id);
@@ -684,6 +729,8 @@ impl TcpStack {
                     continue;
                 } else {
                     let mut send_vars = SendVariables::new();
+                    let mut recv_vars = ReceiveVariables::new();
+                    let mut recv_queue = ReceiveQueue::new();
                     let iss = self.generate_initial_sequence();
                     send_vars.unacknowledged = iss;
                     send_vars.next_sequence_num = iss.wrapping_add(1);
@@ -698,12 +745,11 @@ impl TcpStack {
                     }
                     if let Some(scale) = tcp_packet.option.window_scale {
                         send_vars.window_shift = scale as usize;
-                        send_vars.window_size = tcp_packet.windows_size >> scale;
+                        send_vars.window_size = tcp_packet.window_size;
+                        recv_vars.window_shift = TCP_DEFAULT_WINDOW_SCALE as usize;
                     } else {
-                        send_vars.window_size = tcp_packet.windows_size;
+                        send_vars.window_size = tcp_packet.window_size;
                     }
-                    let mut recv_vars = ReceiveVariables::new();
-                    let mut recv_queue = ReceiveQueue::new();
                     let recv_nxt = tcp_packet.seq_number.wrapping_add(1);
                     recv_vars.next_sequence_num = recv_nxt;
                     recv_vars.initial_sequence_num = tcp_packet.seq_number;
@@ -725,7 +771,9 @@ impl TcpStack {
                         recv_queue: recv_queue,
                         timer: TcpTimer::new(),
                         rtt_start: None,
-                        ack_now: false,
+                        rtt_seq: None,
+                        last_snd_ack: 0,
+                        flag: TcpConnectionFlag::new(),
                     };
                     if queue.accepted > 0 {
                         // socket has already accepted and waiting for new established connection.
@@ -805,7 +853,7 @@ impl TcpStack {
                     ack_packet.seq_number = next_seq;
                     ack_packet.ack_number = next_ack;
                     ack_packet.flag = TcpFlag::ACK;
-                    ack_packet.windows_size = conn.get_recv_window_for_pkt();
+                    ack_packet.window_size = conn.get_recv_window_for_pkt();
                     self.send_tcp_packet(ack_packet).context("Failed to reply ACK.")?;
                     if let Some(mss) = tcp_packet.option.mss {
                         conn.send_vars.send_mss = mss;
@@ -815,9 +863,10 @@ impl TcpStack {
                     }
                     if let Some(scale) = tcp_packet.option.window_scale {
                         conn.send_vars.window_shift = scale as usize;
-                        conn.send_vars.window_size = tcp_packet.windows_size >> scale;
+                        conn.send_vars.window_size = tcp_packet.window_size;
+                        conn.recv_vars.window_shift = TCP_DEFAULT_WINDOW_SCALE as usize;
                     } else {
-                        conn.send_vars.window_size = tcp_packet.windows_size;
+                        conn.send_vars.window_size = tcp_packet.window_size;
                     }
                     conn.send_vars.unacknowledged = next_seq;
                     conn.send_vars.next_sequence_num = next_seq; // change nothing.
@@ -848,9 +897,10 @@ impl TcpStack {
                     }
                     if let Some(scale) = tcp_packet.option.window_scale {
                         conn.send_vars.window_shift = scale as usize;
-                        conn.send_vars.window_size = tcp_packet.windows_size >> scale;
+                        conn.send_vars.window_size = tcp_packet.window_size;
+                        conn.recv_vars.window_shift = TCP_DEFAULT_WINDOW_SCALE as usize;
                     } else {
-                        conn.send_vars.window_size = tcp_packet.windows_size;
+                        conn.send_vars.window_size = tcp_packet.window_size;
                     }
                     conn.syn_replied = true;
                     conn.send_vars.unacknowledged = next_seq;
@@ -860,11 +910,13 @@ impl TcpStack {
                     conn.recv_vars.next_sequence_num = next_ack;
                     conn.recv_queue.complete_datagram.sequence_num = next_ack as usize;
                     conn.status = TcpStatus::SynRcvd;
+                    conn.timer.retransmission.init();
                     self.send_handler(conn)?;
                     log::debug!(
                         "[{}] Status changed from SYN-SENT to SYN-RECEIVED. This is a Simultaneous Connection situation.",
                         conn.print_log_prefix(socket_id)
                     );
+                    conn.timer.retransmission.fire_syn();
                     return Ok(());
                 }
             }
@@ -970,9 +1022,10 @@ impl TcpStack {
                     }
                     if let Some(scale) = tcp_packet.option.window_scale {
                         conn.send_vars.window_shift = scale as usize;
-                        conn.send_vars.window_size = tcp_packet.windows_size >> scale;
+                        conn.send_vars.window_size = tcp_packet.window_size;
+                        conn.recv_vars.window_shift = TCP_DEFAULT_WINDOW_SCALE as usize;
                     } else {
-                        conn.send_vars.window_size = tcp_packet.windows_size;
+                        conn.send_vars.window_size = tcp_packet.window_size;
                     }
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
@@ -1026,7 +1079,7 @@ impl TcpStack {
                     let mut ack = tcp_packet.create_reply_base();
                     ack.seq_number = conn.send_vars.next_sequence_num;
                     ack.ack_number = tcp_packet.seq_number;
-                    ack.windows_size = conn.get_recv_window_for_pkt();
+                    ack.window_size = conn.get_recv_window_for_pkt();
                     ack.flag = TcpFlag::ACK;
                     self.send_tcp_packet(ack).context("Failed to send ACK.")?;
                     log::debug!(
@@ -1086,12 +1139,14 @@ impl TcpStack {
                     // It's a challenge ACK situation too, but I don't implement this now.
                     return Ok(());
                 }
+                println!("SEG.ACK={} snd_vars: {:?} dup: {}", tcp_packet.ack_number, conn.send_vars, seq_less_equal(tcp_packet.ack_number, conn.send_vars.unacknowledged));
                 // If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK. ... rfc9293
                 if seq_in_range(
                     conn.send_vars.unacknowledged.wrapping_add(1),
                     conn.send_vars.next_sequence_num,
                     tcp_packet.ack_number
                 ) {
+                    println!("here snd una advace");
                     if conn.send_vars.unacknowledged != tcp_packet.ack_number {
                         log::debug!(
                             "[{}] SND.UNA advanced ({}->{} SND.NXT={}).",
@@ -1108,25 +1163,44 @@ impl TcpStack {
                 } else if seq_greater_than(tcp_packet.ack_number, conn.send_vars.next_sequence_num) {
                     // If the ACK acks something not yet sent (SEG.ACK > SND.NXT),
                     // then send an ACK, drop the segment, and return. rfc9293
-                    conn.ack_now = true;
                     if let Err(e) = self.send_handler(conn) {
                         log::debug!(
                             "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {:?}",
                             conn.print_log_prefix(socket_id), tcp_packet.ack_number, conn.send_vars.next_sequence_num, e
                         );
                     }
-                    conn.ack_now = false;
                     return Ok(());
                 }
                 if should_update_window(conn, tcp_packet) {
+                    // Hack: Initial received window size is alredy scaled, so avoid shifting for the first packet.
+                    let prev_window_size: u16;
+                    if conn.last_snd_ack == 0 {
+                        prev_window_size = conn.send_vars.window_size;
+                    } else {
+                        prev_window_size = conn.send_vars.window_size << conn.send_vars.window_shift;
+                    }
                     log::debug!(
-                        "[{}] RCV.WND updated ({}->{} shift={} SEG.SEQ={} SEG.ACK={}).",
-                        conn.print_log_prefix(socket_id), conn.send_vars.window_size << conn.send_vars.window_shift , tcp_packet.windows_size << conn.send_vars.window_shift,
+                        "[{}] SND.WND updated. ({}->{} shift={} SEG.SEQ={} SEG.ACK={}).",
+                        conn.print_log_prefix(socket_id), prev_window_size , tcp_packet.window_size << conn.send_vars.window_shift,
                         conn.send_vars.window_shift, tcp_packet.seq_number, tcp_packet.ack_number
                     );
-                    conn.send_vars.window_size = tcp_packet.windows_size;
+                    conn.send_vars.window_size = tcp_packet.window_size;
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
+                }
+                // todo: use timestamp option
+                if let (Some(rtt_start), Some(rtt_seq)) = (conn.rtt_start, conn.rtt_seq) {
+                    if seq_greater_equal(tcp_packet.ack_number, rtt_seq) {
+                        update_retransmission_param(conn, rtt_start.elapsed().as_millis() as usize)?;
+                        let timer_param = &conn.timer.retransmission.timer_param;
+                        log::debug!(
+                            "[{}] Retransmission param updated. rtt={} rtt_smoothed={}({}) rtt_variance={}({}) shift={} delta={}",
+                            conn.print_log_prefix(socket_id), timer_param.rtt, timer_param.rtt_smoothed, timer_param.rtt_smoothed >> TCP_SRTT_SHIFT,
+                            timer_param.rtt_variance, timer_param.rtt_variance >> TCP_RTTVAR_SHIFT, timer_param.rexmt_shift, timer_param.delta
+                        );
+                        conn.rtt_start = None;
+                        conn.rtt_seq = None;
+                    }
                 }
             }
             // Seventh, process the segment text: rfc9293
@@ -1134,7 +1208,7 @@ impl TcpStack {
                 conn.recv_queue.add(tcp_packet.seq_number as usize, &tcp_packet.payload)?;
                 let rcv_nxt_advance = conn.recv_queue.complete_datagram.payload.len();
                 let rcv_nxt_next = conn.recv_queue.get_real_begin_sequence_num().wrapping_add(rcv_nxt_advance as u32);
-                log::debug!("[{}] RCV.NXT advanced ({}->{}).", conn.print_log_prefix(socket_id), conn.recv_vars.next_sequence_num, rcv_nxt_next);
+                log::debug!("[{}] RCV.NXT advanced. ({}->{}).", conn.print_log_prefix(socket_id), conn.recv_vars.next_sequence_num, rcv_nxt_next);
                 conn.recv_vars.next_sequence_num = rcv_nxt_next;
                 conn.recv_vars.window_size = conn.get_recv_window_size();
             }
@@ -1143,14 +1217,25 @@ impl TcpStack {
                 conn.status = TcpStatus::CloseWait;
                 log::debug!("[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}", conn.print_log_prefix(socket_id), tcp_packet.flag);
             }
-            conn.ack_now = true;
             if let Err(e) = self.send_handler(conn) {
                 log::debug!(
                     "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {}",
                     conn.print_log_prefix(socket_id), tcp_packet.ack_number, conn.send_vars.next_sequence_num, e
                 );
             }
-            conn.ack_now = false;
+            if !conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num {
+                conn.timer.retransmission.fire_datagram();
+                log::debug!(
+                    "Enabled retransmission timer. shift={} SND.UNA={} SND.NXT={}",
+                    conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged, conn.send_vars.next_sequence_num
+                );
+            } else if conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged == conn.send_vars.next_sequence_num {
+                conn.timer.retransmission.timer_param.active = false;
+                log::debug!(
+                    "Disabled retransmission timer. shift={} SND.UNA=SND.NXT={}",
+                    conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged
+                );
+            }
             return Ok(());
         } else {
             anyhow::bail!("No socket (id={}).", socket_id);
@@ -1225,7 +1310,11 @@ pub fn seq_in_range(min: u32, max: u32, target: u32) -> bool {
     if seq_less_equal(min, max) {
         seq_less_equal(min, target) && seq_less_equal(target, max)
     } else {
-        seq_less_equal(min, target) || seq_less_equal(target, max)
+        if seq_greater_than(min, max) {
+            false
+        } else {
+            seq_less_equal(min, target) || seq_less_equal(target, max)
+        }
     }
 }
 
@@ -1253,11 +1342,11 @@ fn seq_greater_equal(seq1: u32, seq2: u32) -> bool {
 
 // There are four cases for the acceptability test for an incoming segment: rfc9293
 pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bool {
-    if tcp_packet.payload.len() == 0 && tcp_packet.windows_size << conn.send_vars.window_shift == 0 {
+    if tcp_packet.payload.len() == 0 && tcp_packet.window_size << conn.send_vars.window_shift == 0 {
         if tcp_packet.seq_number == conn.recv_vars.next_sequence_num {
             return true;
         }
-    } else if tcp_packet.payload.len() == 0 && tcp_packet.windows_size << conn.send_vars.window_shift > 0 {
+    } else if tcp_packet.payload.len() == 0 && tcp_packet.window_size << conn.send_vars.window_shift > 0 {
         if seq_in_range(
             conn.recv_vars.next_sequence_num,
             conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
@@ -1265,9 +1354,9 @@ pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bo
         ) {
             return true;
         }
-    } else if tcp_packet.payload.len() > 0 && tcp_packet.windows_size << conn.send_vars.window_shift == 0 {
+    } else if tcp_packet.payload.len() > 0 && tcp_packet.window_size << conn.send_vars.window_shift == 0 {
         return false;
-    } else if tcp_packet.payload.len() > 0 && tcp_packet.windows_size << conn.send_vars.window_shift > 0 {
+    } else if tcp_packet.payload.len() > 0 && tcp_packet.window_size << conn.send_vars.window_shift > 0 {
         // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
         if seq_in_range(
             conn.recv_vars.next_sequence_num,
@@ -1327,8 +1416,10 @@ pub struct TcpConnection {
     pub send_queue: SendQueue,
     pub recv_queue: ReceiveQueue,
     pub timer: TcpTimer,
-    pub rtt_start: Option<Instant>,
-    pub ack_now: bool,
+    pub rtt_start: Option<Instant>,      // BSD: t_rtttime
+    pub rtt_seq: Option<u32>,            // BSD: t_rtseq
+    pub last_snd_ack: u32,               // BSD: last_ack_sent
+    pub flag: TcpConnectionFlag,
 }
 
 impl TcpConnection {
@@ -1347,7 +1438,9 @@ impl TcpConnection {
             recv_queue: ReceiveQueue::new(),
             timer: TcpTimer::new(),
             rtt_start: None,
-            ack_now: false,
+            rtt_seq: None,
+            last_snd_ack: 0,
+            flag: TcpConnectionFlag::new(),
         }
     }
 
@@ -1365,7 +1458,7 @@ impl TcpConnection {
     }
 
     pub fn get_recv_window_for_pkt(&self) -> u16 {
-        (self.get_recv_window_size() << self.recv_vars.window_shift) as u16
+        (self.get_recv_window_size() >> self.recv_vars.window_shift) as u16
     }
 
     pub fn update_snd_una(&mut self, new_snd_una: u32) -> Result<()> {
@@ -1377,6 +1470,28 @@ impl TcpConnection {
         self.send_queue.payload.drain(..new_snd_una.wrapping_sub(self.send_vars.unacknowledged) as usize);
         self.send_vars.unacknowledged = new_snd_una;
         Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TcpConnectionFlag {
+    pub ack_now: bool,            // BSD: TF_ACKNOW
+    pub no_delay: bool,           // BSD: TF_NODELAY
+    pub snd_from_una : bool,
+}
+
+impl TcpConnectionFlag {
+    pub fn new() -> Self {
+        Self {
+            no_delay: TCP_NO_DELAY,
+            ..Default::default()
+        }
+    }
+
+    pub fn init(&mut self) {
+        self.ack_now = false;
+        self.no_delay = TCP_NO_DELAY;
+        self.snd_from_una = false;
     }
 }
 
@@ -1684,6 +1799,9 @@ impl ReceiveQueue {
                     pending_start, new_start, new_end, current_start, current_end
                 );
             }
+        }
+        if self.fragmented_datagram.len() == 0 {
+            pending_new.push(ReceiveFragment { sequence_num: new_start, payload: payload.clone() });
         }
         if let Some(tmp) = tmp_fragment {
             if !complete_marge {
@@ -2235,6 +2353,39 @@ mod tcp_tests {
                 payload: vec![2, 3, 4, 5]
             }
         ];
+        let mut queue = ReceiveQueue {
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
+            complete_datagram: initial_complete,
+            fragmented_datagram: initial_pending
+        };
+        let result = queue.add(new_fragment_seq, &new_fragment_payload).expect("Failed to add fragment to queue.");
+
+        assert_eq!(queue.complete_datagram, expected_complete);
+        assert_eq!(queue.fragmented_datagram, expected_pending);
+        assert_eq!(result, ());
+    }
+
+    #[rstest]
+    #[case(
+        13,
+        vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 9, 9]
+        },
+        vec![]
+    )]
+    fn test_receive_queue_add_simple(
+        #[case] new_fragment_seq: usize,
+        #[case] new_fragment_payload: Vec<u8>,
+        #[case] expected_complete: ReceiveFragment,
+        #[case] expected_pending: Vec<ReceiveFragment>,
+     ) {
+        let initial_complete = ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3]
+        };
+        let initial_pending = vec![];
         let mut queue = ReceiveQueue {
             queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: initial_complete,

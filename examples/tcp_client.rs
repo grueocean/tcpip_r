@@ -53,6 +53,7 @@ fn main() -> Result<()> {
     loop {
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
+        println!("Write to socket.");
         if let Err(e) = tcp.write(input.as_bytes()) {
             println!("Failed to write socket. Err: {:?}", e);
         } else {
