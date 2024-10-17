@@ -43,8 +43,23 @@ fn main() -> Result<()> {
     let tcp = TcpListener::new(config)?;
     tcp.bind(SocketAddrV4::new(args.network.address, args.port))?;
     println!("Start accepting connections.");
+    let (stream, addr) = tcp.accept()?;
+    println!("accepted: {}", addr);
     loop {
-        let (_stream, addr) = tcp.accept()?;
-        println!("accepted: {}", addr);
+        let mut buf = [0; 1024];
+        match stream.read(&mut buf) {
+            Ok(amt) => {
+                let data = &buf[..amt];
+                let ascii = from_utf8(data)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|_| String::from("Data contains non-ASCII characters"));
+                let hex = hex::encode(data);
+                println!("Tcp packet received ({} bytes).", amt);
+                println!("hex: {} ascii: {}", hex, ascii);
+            }
+            Err(e) => {
+                println!("Tcp recv error. Err: {}", e);
+            }
+        }
     }
 }

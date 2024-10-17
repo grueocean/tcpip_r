@@ -392,6 +392,47 @@ impl TcpStack {
             drop(conns);
             if let (_valid, Some(event)) = self.wait_events_with_timeout(
                 vec![
+                    TcpEvent { socket_id: socket_id, event: TcpEventType::SendMore },
+                    TcpEvent { socket_id: socket_id, event: TcpEventType::Refused },
+                    TcpEvent { socket_id: socket_id, event: TcpEventType::Closed }
+                ],
+                Duration::from_millis(100)
+            ) {
+                match event.event {
+                    TcpEventType::SendMore => {
+                        continue;
+                    }
+                    TcpEventType::Refused => {
+                        log::warn!("While waiting for the socket (id={}) sending datagram, the connection refused.", socket_id);
+                    }
+                    TcpEventType::Closed => {
+                        log::warn!("While waiting for the socket (id={}) sending datagram, the connection closed.", socket_id);
+                    }
+                    other => {
+                        anyhow::bail!("Wake up from unexpected event ({:?}). Expected SendMore/Refused/Closed.", other);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn read(
+        &self,
+        socket_id: usize,
+        payload: &mut [u8]
+    ) -> Result<usize> {
+        loop {
+            let mut conns = self.connections.lock().unwrap();
+            if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+                if conn.recv_queue.complete_datagram.payload.len() != 0 {
+                    return Ok(conn.recv_queue.read(payload)?);
+                }
+            } else {
+                anyhow::bail!("Cannot find the socket (id={}).", socket_id);
+            }
+            drop(conns);
+            if let (_valid, Some(event)) = self.wait_events_with_timeout(
+                vec![
                     TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived },
                     TcpEvent { socket_id: socket_id, event: TcpEventType::Refused },
                     TcpEvent { socket_id: socket_id, event: TcpEventType::Closed }
@@ -409,82 +450,10 @@ impl TcpStack {
                         log::warn!("While waiting for the socket (id={}) sending datagram, the connection closed.", socket_id);
                     }
                     other => {
-                        anyhow::bail!("Wake up from unexpected event ({:?}). Expected Established/Refused/Closed.", other);
+                        anyhow::bail!("Wake up from unexpected event ({:?}). Expected DatagramReceived/Refused/Closed.", other);
                     }
                 }
             }
-
-        }
-    }
-
-    fn receive_thread(&self) -> Result<()> {
-        log::info!("Starting TcpStack receive_thread.");
-        let l3 = get_global_l3stack(self.config.clone())?;
-        let (tcp_send_channel, tcp_recv_channel) = channel();
-        l3.register_protocol(u8::from(Ipv4Type::TCP), tcp_send_channel)?;
-        loop {
-            let ipv4_packet = tcp_recv_channel.recv()?;
-            let mut tcp_packet = TcpPacket::new();
-            match tcp_packet.read(&ipv4_packet) {
-                Err(e) => {
-                    log::warn!("Failed to read tcp packet. Err: {:?}", e);
-                    continue;
-                }
-                Ok(valid) => {
-                    if !valid {
-                        log::warn!("Discarding invalid tcp packet.");
-                        continue;
-                    }
-                }
-            }
-            match self.recv_handler(&tcp_packet) {
-                Err(e) => {
-                    log::warn!("Failed to handle tcp packet. Err: {:?}", e);
-                    continue;
-                }
-                Ok(_) => {}
-            }
-        }
-    }
-
-    pub fn recv_handler(&self, tcp_packet: &TcpPacket) -> Result<()> {
-        let src_addr = &Ipv4Addr::from(tcp_packet.src_addr);
-        let dst_addr = &Ipv4Addr::from(tcp_packet.dst_addr);
-        let (socket_id, conns) = self.get_socket_id(
-            src_addr,
-            dst_addr,
-            &tcp_packet.local_port,
-            &tcp_packet.remote_port
-        )?;
-        if let Some(id) = socket_id {
-            if let Some(Some(conn)) = conns.get(&id) {
-                log::trace!(
-                    "Handling packet for {} socket (id={} {}). SEG.SEQ={} SEG.ACK={} LENGTH={} SEG.FLAG={:?}",
-                    conn.status, id, conn.print_address(), tcp_packet.seq_number, tcp_packet.ack_number, tcp_packet.payload.len(), tcp_packet.flag
-                );
-                match &conn.status {
-                    TcpStatus::Listen => { self.recv_handler_listen(id, tcp_packet, conns).context("recv_handler_listen failed.")?; }
-                    TcpStatus::SynSent => { self.recv_handler_syn_sent(id, tcp_packet, conns).context("recv_handler_syn_sent failed.")?; }
-                    TcpStatus::SynRcvd => { self.recv_handler_syn_rcvd(id, tcp_packet, conns).context("recv_handler_syn_rcvd failed.")?; }
-                    TcpStatus::Established => { self.recv_handler_established(id, tcp_packet, conns).context("recv_handler_established failed.")?; }
-                    other => {
-                        anyhow::bail!("Recv handler for TcpStatus {} is not implemented.", other);
-                    }
-                }
-                return Ok(());
-            } else {
-                anyhow::bail!("No TcpConnection Data for the socket (id={}). This should be impossible if locking logic is correct.", id);
-            }
-        } else {
-            // "An incoming segment not containing a RST causes a RST to be sent in response." rfc9293
-            if !tcp_packet.flag.contains(TcpFlag::RST) {
-                self.send_back_rst_syn(tcp_packet)?;
-                log::debug!("No socket bound for the packet to {}:{}, send back rst packet.", dst_addr, tcp_packet.remote_port);
-            // "An incoming segment containing a RST is discarded." rfc9293
-            } else {
-                log::debug!("No socket bound for the rst packet to {}:{}, ignored it.", dst_addr, tcp_packet.remote_port);
-            }
-            Ok(())
         }
     }
 

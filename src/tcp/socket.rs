@@ -102,7 +102,8 @@ impl TcpStream {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        Ok(0)
+        let tcp = get_global_tcpstack(self.config.clone())?;
+        Ok(tcp.read(self.socket_id, buf)?)
     }
 
     pub fn close(&self) {

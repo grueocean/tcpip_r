@@ -3,7 +3,7 @@ use crate::tcp::{
     input::{TcpConnection, TcpEvent, TcpEventType}
 };
 use anyhow::{Context, Result};
-use std::{cmp::max, collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}};
+use std::{cmp::max, collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}, thread};
 
 // From FreeBSD 14.1.0 implementation.
 const TCP_MAXRXTSHIFT: usize = 12;
@@ -20,8 +20,8 @@ const TCP_REXMT_MIN: usize = 30;       // BSD: tcp_rexmit_min
 const TCP_REXMT_MAX: usize = 64_000;   // BSD: TCPTV_REXMTMAX
 const TCP_REXMT_RTTVAR_INIT: usize = 400;
 // A: srtt  M: rtt  D: rttvar
-const TCP_REXMT_GAIN_SHIFT: usize = 3; // α = 1/8 : A <- (1-α)A + α*M
-const TCP_REXMT_MEAN_SHIFT: usize = 2; // β = 1/4 : D <- D + β*(|M-A|-D)
+const TCP_REXMT_GAIN_SHIFT: usize = 3;     // α = 1/8 : A <- (1-α)A + α*M
+const TCP_REXMT_MEAN_SHIFT: usize = 2;     // β = 1/4 : D <- D + β*(|M-A|-D)
 pub const TCP_SRTT_SHIFT: usize = 5;       // srtt is scaled by 32 (2^5).
 pub const TCP_RTTVAR_SHIFT: usize = 4;     // rttvar is scaled by 16 (2^4).
 

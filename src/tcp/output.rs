@@ -73,7 +73,7 @@ impl TcpStack {
                     self.send_tcp_packet(datagram).map_err(|e| {
                         // We need to update SND.NXT even if a packet failed to be sent to trigger retransmission.
                         conn.send_vars.next_sequence_num = conn.send_vars.next_sequence_num.wrapping_add(datagram_size);
-                        e
+                        anyhow::anyhow!(e)
                     })?;
                     if conn.rtt_start.is_none() && datagram_size > 0 {
                         conn.rtt_start = Some(Instant::now());
@@ -119,6 +119,10 @@ impl TcpStack {
             ipv4_packet.payload = tcp_packet.create_packet();
             let l3 = get_global_l3stack(self.config.clone())?;
             l3.l3interface.send(ipv4_packet)?;
+            log::trace!(
+                "Send a tcp packet. SEG.SEQ={} SEG.ACK={} LENGTH={} SEG.FLAG={:?}",
+                tcp_packet.seq_number, tcp_packet.ack_number, tcp_packet.payload.len(), tcp_packet.flag
+            );
             Ok(())
         }
 
