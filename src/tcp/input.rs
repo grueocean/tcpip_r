@@ -1925,7 +1925,8 @@ mod tcp_tests {
         },
         4,
         vec![1, 2, 3, 4, 0, 0, 0, 0, 0, 0]
-    )]    fn test_receive_queue_read_5_wrapped(
+    )]
+    fn test_receive_queue_read_5_wrapped(
         #[case] mut queue: ReceiveQueue,
         #[case] expected_after_queue: ReceiveQueue,
         #[case] expected_data_len: usize,
@@ -1937,5 +1938,31 @@ mod tcp_tests {
         assert_eq!(buf, expected_buf_after[..5]);
         assert_eq!(data_len, expected_data_len);
         assert_eq!(queue, expected_after_queue);
+    }
+
+    #[rstest]
+    #[case(1, 3, 2, true)]
+    #[case(MAX_SEQ - 1, 2, 1, true)]
+    #[case(MAX_SEQ - 1, 2, 2, true)]
+    #[case(MAX_SEQ - 1, 2, MAX_SEQ, true)]
+    #[case(MAX_SEQ - 1, 2, MAX_SEQ - 1, true)]
+    #[case(MAX_SEQ - 1, 2, MAX_SEQ - 2, false)]
+    #[case(MAX_SEQ - 1, 2, 3, false)]
+    #[case(12, 10, 9, false)]
+    #[case(12, 10, 10, false)]
+    #[case(12, 10, 11, false)]
+    #[case(12, 10, 12, false)]
+    #[case(11, 10, 9, false)]
+    #[case(11, 10, 10, false)]
+    #[case(11, 10, 11, false)]
+    #[case(11, 10, 12, false)]
+    #[case(11, 11, 11, true)]
+    fn test_seq_in_range(
+        #[case] min: u32,
+        #[case] max: u32,
+        #[case] target: u32,
+        #[case] expected_result: bool,
+    ) {
+        assert_eq!(seq_in_range(min, max, target), expected_result)
     }
 }
