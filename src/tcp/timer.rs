@@ -1,5 +1,6 @@
 use crate::tcp::{
-    defs::TcpStatus, tcp_impl::{TcpStack, TcpConnection, TcpEvent, TcpEventType}, packet::TcpPacket
+    defs::TcpStatus, usrreq::{TcpStack}, packet::TcpPacket,
+    input::{TcpConnection, TcpEvent, TcpEventType}
 };
 use anyhow::{Context, Result};
 use std::{cmp::max, collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}};

@@ -3,7 +3,7 @@ use crate::l2_l3::{
     ip::Ipv4Packet,
 };
 use crate::tcp::{
-    defs::{TcpStatus, TcpOptionKind}, tcp_impl::{TcpConnection}
+    defs::{TcpStatus, TcpOptionKind}, input::{TcpConnection}
 };
 use anyhow::{Context, Result};
 use bitflags::bitflags;

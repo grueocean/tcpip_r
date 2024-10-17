@@ -1,13 +1,13 @@
 use crate::{
     l2_l3::{defs::Ipv4Type, ip::{get_global_l3stack, Ipv4Packet, L3Stack, NetworkConfiguration}},
-    tcp::{defs, packet::TcpPacket, tcp_impl}
+    tcp::{defs, packet::TcpPacket, usrreq}
 };
 use anyhow::{Context, Result};
 use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs}, sync::MutexGuard,};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc::channel};
 use std::thread::{self, JoinHandle};
 
-use super::tcp_impl::get_global_tcpstack;
+use super::usrreq::get_global_tcpstack;
 
 pub struct TcpListener {
     config: NetworkConfiguration,
