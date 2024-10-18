@@ -57,6 +57,7 @@ impl TcpListener {
     }
 }
 
+#[derive(Clone)]
 pub struct TcpStream {
     config: NetworkConfiguration,
     socket_id: usize,

@@ -67,10 +67,7 @@ impl TcpStack {
         )?;
         if let Some(id) = socket_id {
             if let Some(Some(conn)) = conns.get(&id) {
-                log::trace!(
-                    "Handling packet for {} socket (id={} {}). SEG.SEQ={} SEG.ACK={} LENGTH={} SEG.FLAG={:?}",
-                    conn.status, id, conn.print_address(), tcp_packet.seq_number, tcp_packet.ack_number, tcp_packet.payload.len(), tcp_packet.flag
-                );
+                log::trace!("Handling packet for {} socket (id={}). {}", conn.status, id, tcp_packet.print_general_info());
                 match &conn.status {
                     TcpStatus::Listen => { self.recv_handler_listen(id, tcp_packet, conns).context("recv_handler_listen failed.")?; }
                     TcpStatus::SynSent => { self.recv_handler_syn_sent(id, tcp_packet, conns).context("recv_handler_syn_sent failed.")?; }
@@ -616,7 +613,7 @@ impl TcpStack {
                 let prev_payload = conn.recv_queue.complete_datagram.payload.len();
                 conn.recv_queue.add(tcp_packet.seq_number as usize, &tcp_packet.payload)?;
                 let current_payload = conn.recv_queue.complete_datagram.payload.len();
-                let rcv_nxt_advance = conn.recv_queue.complete_datagram.payload.len();
+                let rcv_nxt_advance = current_payload - prev_payload;
                 let rcv_nxt_next = conn.recv_queue.get_real_begin_sequence_num().wrapping_add(rcv_nxt_advance as u32);
                 log::debug!("[{}] RCV.NXT advanced. ({}->{}).", conn.print_log_prefix(socket_id), conn.recv_vars.next_sequence_num, rcv_nxt_next);
                 conn.recv_vars.next_sequence_num = rcv_nxt_next;
@@ -999,11 +996,11 @@ impl ReceiveQueue {
             complete_start <= new_start && new_end <= complete_max,
             "An invalid segment was added. SEG.SEQ={} SEG.LEN = {} QUEUE.BEGIN_SEQ={} QUEUE.MAX_SEQ={}", new_start, payload.len(), complete_start, complete_end
         );
-        if new_end <= complete_end {
-            return Ok(());
-        }
         if self.complete_datagram.payload.len() == 0 && complete_start == new_start{
             self.complete_datagram.payload = payload.clone();
+            return Ok(());
+        }
+        if new_end <= complete_end {
             return Ok(());
         }
         let mut pending_new = Vec::new();
@@ -1744,6 +1741,48 @@ mod tcp_tests {
         let initial_complete = ReceiveFragment {
             sequence_num: 10,
             payload: vec![1, 2, 3]
+        };
+        let initial_pending = vec![];
+        let mut queue = ReceiveQueue {
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
+            complete_datagram: initial_complete,
+            fragmented_datagram: initial_pending
+        };
+        let result = queue.add(new_fragment_seq, &new_fragment_payload).expect("Failed to add fragment to queue.");
+
+        assert_eq!(queue.complete_datagram, expected_complete);
+        assert_eq!(queue.fragmented_datagram, expected_pending);
+        assert_eq!(result, ());
+    }
+
+    #[rstest]
+    #[case(
+        10,
+        vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![9, 9]
+        },
+        vec![]
+    )]
+    #[case(
+        10,
+        vec![9; 1],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![9]
+        },
+        vec![]
+    )]
+    fn test_receive_queue_add_to_empty(
+        #[case] new_fragment_seq: usize,
+        #[case] new_fragment_payload: Vec<u8>,
+        #[case] expected_complete: ReceiveFragment,
+        #[case] expected_pending: Vec<ReceiveFragment>,
+     ) {
+        let initial_complete = ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![]
         };
         let initial_pending = vec![];
         let mut queue = ReceiveQueue {

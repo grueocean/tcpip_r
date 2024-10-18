@@ -119,10 +119,7 @@ impl TcpStack {
             ipv4_packet.payload = tcp_packet.create_packet();
             let l3 = get_global_l3stack(self.config.clone())?;
             l3.l3interface.send(ipv4_packet)?;
-            log::trace!(
-                "Send a tcp packet. SEG.SEQ={} SEG.ACK={} LENGTH={} SEG.FLAG={:?}",
-                tcp_packet.seq_number, tcp_packet.ack_number, tcp_packet.payload.len(), tcp_packet.flag
-            );
+            log::trace!("Send a tcp packet. {}", tcp_packet.print_general_info());
             Ok(())
         }
 

@@ -7,7 +7,7 @@ use crate::tcp::{
 };
 use anyhow::{Context, Result};
 use bitflags::bitflags;
-use std::{cmp::{max, min}, collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}};
+use std::{cmp::{max, min}, collections::{HashMap, VecDeque}, net::Ipv4Addr, sync::MutexGuard, time::{Duration, Instant}};
 
 // Tcp header max size is 60 (15*4) bytes because Max Data Offset is 15 (0b1111).
 const TCP_HEADER_LENGTH_BASIC: usize = 20;
@@ -318,6 +318,14 @@ impl TcpPacket {
         let end_offset = start_offset + payload_len;
         datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
         Ok(datagram)
+    }
+
+    pub fn print_general_info(&self) -> String {
+        format!(
+            "SEGINFO: SRC={}:{} DST={}:{} SEQ={} ACK={} LENGTH={} FLAG={:?}",
+            Ipv4Addr::from(self.src_addr), self.local_port, Ipv4Addr::from(self.dst_addr), self.remote_port,
+            self.seq_number, self.ack_number, self.payload.len(), self.flag
+        )
     }
 }
 
