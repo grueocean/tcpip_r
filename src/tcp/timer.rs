@@ -24,6 +24,8 @@ const TCP_REXMT_GAIN_SHIFT: usize = 3;     // α = 1/8 : A <- (1-α)A + α*M
 const TCP_REXMT_MEAN_SHIFT: usize = 2;     // β = 1/4 : D <- D + β*(|M-A|-D)
 pub const TCP_SRTT_SHIFT: usize = 5;       // srtt is scaled by 32 (2^5).
 pub const TCP_RTTVAR_SHIFT: usize = 4;     // rttvar is scaled by 16 (2^4).
+// Delayed Ack Timer
+const TCP_DELAY_ACK: usize = 40;       // BSD: tcp_delacktime
 
 impl TcpStack {
     pub fn timer_thread(&self) -> Result<()> {
@@ -91,39 +93,63 @@ impl TcpStack {
 
     pub fn timer_handler_datagram(&self, socket_id: usize, conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>) -> Result<()> {
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-            if !conn.timer.retransmission.timer_param.active { return Ok(() ); };
-            if conn.timer.retransmission.is_expired()? {
-                conn.flag.ack_now = true;
-                conn.flag.snd_from_una = true;
-                if let Err(e) = self.send_handler(conn) {
-                    conn.timer.retransmission.next_datagram();
-                    log::warn!(
-                        "[{}] Failed to retransmit a datagram packet. next shift={} next delta={} Err: {:?}",
-                        conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta, e
-                    );
-                } else {
-                    conn.timer.retransmission.next_datagram();
-                    log::debug!(
-                        "[{}] Retransmitted a datagram packet. next shift={} next delta={}",
-                        conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta
-                    );
-                }
-                conn.flag.ack_now = false;
-                conn.flag.snd_from_una = false;
-                // Based on Karn Algo, we won't mesure rtt.
-                conn.rtt_start = None;
-                if conn.timer.retransmission.is_finished() {
-                    conn.timer.retransmission.init();
-                    log::debug!(
-                        "[{}] Gave up retransmitting a datagram packet and closing the socket.",
-                        conn.print_log_prefix(socket_id),
-                    );
-                    conn.status = TcpStatus::Closed;
-                    self.publish_event(TcpEvent {socket_id: socket_id, event: TcpEventType::Closed});
-                }
-            }
+            self.timer_handler_datagram_retransmission(socket_id, conn)?;
+            self.timer_handler_datagram_delayed_ack(socket_id, conn)?;
         } else {
             anyhow::bail!("Cannot find socket (id={}).", socket_id);
+        }
+        Ok(())
+    }
+
+    fn timer_handler_datagram_retransmission(&self, socket_id: usize, conn: &mut TcpConnection) -> Result<()> {
+        if !conn.timer.retransmission.timer_param.active { return Ok(()); };
+        if conn.timer.retransmission.is_expired()? {
+            conn.send_flag.ack_now = true;
+            conn.send_flag.snd_from_una = true;
+            if let Err(e) = self.send_handler(conn) {
+                conn.timer.retransmission.next_datagram();
+                log::warn!(
+                    "[{}] Failed to retransmit a datagram packet. next shift={} next delta={} Err: {:?}",
+                    conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta, e
+                );
+            } else {
+                conn.timer.retransmission.next_datagram();
+                log::debug!(
+                    "[{}] Retransmitted a datagram packet. next shift={} next delta={}",
+                    conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta
+                );
+            }
+            // Based on Karn Algo, we won't mesure rtt.
+            conn.rtt_start = None;
+            if conn.timer.retransmission.is_finished() {
+                conn.timer.retransmission.init();
+                log::debug!(
+                    "[{}] Gave up retransmitting a datagram packet and closing the socket.",
+                    conn.print_log_prefix(socket_id),
+                );
+                conn.status = TcpStatus::Closed;
+                self.publish_event(TcpEvent {socket_id: socket_id, event: TcpEventType::Closed});
+            }
+        }
+        Ok(())
+    }
+
+    fn timer_handler_datagram_delayed_ack(&self, socket_id: usize, conn: &mut TcpConnection) -> Result<()> {
+        if !conn.timer.delayed_ack.timer_param.active { return Ok(() ); };
+        if conn.timer.delayed_ack.is_expired()? {
+            conn.send_flag.ack_now = true;
+            if let Err(e) = self.send_handler(conn) {
+                log::warn!(
+                    "[{}] Failed to delayed ack. Err: {:?}",
+                    conn.print_log_prefix(socket_id), e
+                );
+            } else {
+                log::debug!(
+                    "[{}] Delayed Ack Completed.",
+                    conn.print_log_prefix(socket_id)
+                );
+            }
+            conn.timer.delayed_ack.init();
         }
         Ok(())
     }
@@ -152,7 +178,8 @@ pub fn update_retransmission_param(conn: &mut TcpConnection, rtt: usize) -> Resu
 
 #[derive(Debug)]
 pub enum TcpTimerType {
-    Retransmission
+    Retransmission,
+    DelayedAck,
 }
 
 #[derive(Debug, Default)]
@@ -271,15 +298,64 @@ fn adjust_delta(calc_delta: usize) -> usize {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct DelayedAckVariables {
+    pub active: bool,
+}
+
+impl DelayedAckVariables {
+    pub fn new() -> Self {
+        Self {
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DelayedAckTimer {
+    pub timer_type: TcpTimerType,
+    pub timer_param: DelayedAckVariables,
+    pub timer_count: Instant
+}
+
+impl DelayedAckTimer {
+    pub fn new() -> Self {
+        Self {
+            timer_type: TcpTimerType::DelayedAck,
+            timer_param: DelayedAckVariables::new(),
+            timer_count: Instant::now()
+        }
+    }
+
+    pub fn init(&mut self) {
+        self.timer_param.active = false;
+    }
+
+    pub fn fire(&mut self) {
+        self.timer_param.active = true;
+        self.timer_count = Instant::now();
+    }
+
+    pub fn is_expired(&self) -> Result<bool> {
+        if self.timer_count.elapsed() > Duration::from_millis(TCP_DELAY_ACK as u64) {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TcpTimer {
     pub retransmission: RetransmissionTimer,
+    pub delayed_ack: DelayedAckTimer,
 }
 
 impl TcpTimer {
     pub fn new() -> Self {
         Self {
-            retransmission: RetransmissionTimer::new()
+            retransmission: RetransmissionTimer::new(),
+            delayed_ack: DelayedAckTimer::new(),
         }
     }
 }

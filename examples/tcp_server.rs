@@ -55,7 +55,7 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|_| String::from("Data contains non-ASCII characters"));
                 let hex = hex::encode(data);
                 println!("Tcp packet received ({} bytes).", amt);
-                println!("hex: {} ascii: {}", hex, ascii);
+                println!("hex: {}\nascii: {}", hex, ascii);
             }
             Err(e) => {
                 println!("Tcp recv error. Err: {}", e);

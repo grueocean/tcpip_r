@@ -9,20 +9,25 @@ use crate::{
 use anyhow::{Context, Result};
 use std::time::{Instant};
 
+const TCP_SEND_LOOP_MAX: usize = 1000;
+
 impl TcpStack {
         // It behaves as an entry point for sending packets, like tcp_output in BSD.
         pub fn send_handler(
             &self,
             conn: &mut TcpConnection
         ) -> Result<usize> {
-            match &conn.status {
-                TcpStatus::SynSent => { Ok(self.send_handler_syn_sent(conn).context("send_handler_syn_sent failed.")?) }
-                TcpStatus::SynRcvd => { Ok(self.send_handler_syn_rcvd(conn).context("send_handler_syn_rcvd failed.")?) }
-                TcpStatus::Established => { Ok(self.send_handler_established(conn).context("send_handler_established failed.")?) }
+            let result = match &conn.status {
+                TcpStatus::SynSent => { self.send_handler_syn_sent(conn).context("send_handler_syn_sent failed.") }
+                TcpStatus::SynRcvd => { self.send_handler_syn_rcvd(conn).context("send_handler_syn_rcvd failed.") }
+                TcpStatus::Established => { self.send_handler_established(conn).context("send_handler_established failed.") }
                 other => {
+                    conn.send_flag.init();
                     anyhow::bail!("Send handler for {} is not implemented.", other);
                 }
-            }
+            };
+            conn.send_flag.init();
+            result
         }
 
         pub fn send_handler_syn_sent(
@@ -54,16 +59,25 @@ impl TcpStack {
             let send_mss = conn.send_vars.send_mss;
             let new_data = conn.send_queue.payload.len() - send_nxt.wrapping_sub(send_una) as usize;
             let next_send_nxt = send_una.wrapping_add(conn.send_queue.payload.len() as u32);
-            if !conn.flag.no_delay && send_una != send_nxt && ((new_data as u16) < send_mss || send_wnd < send_mss as usize) && !conn.flag.ack_now {
+            if conn.send_flag.ack_delayed && new_data == 0 {
+                log::debug!(
+                    "[status={} {}] Delayed ack situation. RCV.NXT={}",
+                    conn.status, conn.print_address(), conn.recv_vars.next_sequence_num
+                );
+                Ok(0)
+            } else if send_una != send_nxt && ((new_data as u16) < send_mss || send_wnd < send_mss as usize) && !conn.send_flag.ack_now {
                 log::debug!(
                     "[status={} {}] We won't send a datagram here based on Nagle's algo. SND.UNA={} SND.NXT={} SND.WND={} SND.MSS={} PENDING_DATAGRAM_LENGTH={}",
                     conn.status, conn.print_address(), send_una, send_nxt, send_wnd, send_mss, new_data
                 );
                 Ok(0)
-            } else if !conn.flag.snd_from_una {
+            } else if !conn.send_flag.snd_from_una {
+                let mut loop_count: usize = 0;
                 loop {
-                    if next_send_nxt == conn.send_vars.next_sequence_num && conn.last_snd_ack == conn.recv_vars.next_sequence_num && !conn.flag.ack_now {
-                        log::debug!("Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} RCV.NXT={}", conn.flag.snd_from_una, next_send_nxt, conn.last_snd_ack);
+                    anyhow::ensure!(loop_count < TCP_SEND_LOOP_MAX, "Tcp send loop count is {} should be lower than {}.", loop_count, TCP_SEND_LOOP_MAX);
+                    loop_count += 1;
+                    if next_send_nxt == conn.send_vars.next_sequence_num && conn.last_snd_ack == conn.recv_vars.next_sequence_num && !conn.send_flag.ack_now {
+                        log::debug!("Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} RCV.NXT={}", conn.send_flag.snd_from_una, next_send_nxt, conn.last_snd_ack);
                         break;
                     }
                     let datagram = TcpPacket::new_out_packet(conn, None).context("Failed to create a datagram packet.")?;
@@ -85,17 +99,20 @@ impl TcpStack {
                 }
                 Ok(0)
             } else {
+                let mut loop_count: usize = 0;
                 let mut start_seq = conn.send_vars.unacknowledged;
                 loop {
-                    if next_send_nxt == conn.send_vars.next_sequence_num && conn.last_snd_ack == conn.recv_vars.next_sequence_num && !conn.flag.ack_now {
-                        log::debug!("Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} RCV.NXT={}", conn.flag.snd_from_una, next_send_nxt, conn.last_snd_ack);
+                    anyhow::ensure!(loop_count < TCP_SEND_LOOP_MAX, "Tcp send loop count is {} should be lower than {}.", loop_count, TCP_SEND_LOOP_MAX);
+                    loop_count += 1;
+                    if next_send_nxt == conn.send_vars.next_sequence_num && conn.last_snd_ack == conn.recv_vars.next_sequence_num && !conn.send_flag.ack_now {
+                        log::debug!("Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} RCV.NXT={}", conn.send_flag.snd_from_una, next_send_nxt, conn.last_snd_ack);
                         break;
                     }
                     let datagram = TcpPacket::new_out_packet(conn, Some(start_seq)).context("Failed to create a datagram packet.")?;
                     let datagram_size = datagram.payload.len() as u32;
                     let snd_seq = datagram.seq_number;
                     let snd_ack = datagram.ack_number;
-                    // We don't need to update SND.NXT because retransmission will trigger anyway.
+                    // We don't need to update SND.NXT because retransmission will be triggered anyway.
                     self.send_tcp_packet(datagram)?;
                     if conn.rtt_start.is_none() && datagram_size > 0 {
                         conn.rtt_start = Some(Instant::now());

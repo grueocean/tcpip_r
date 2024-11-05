@@ -24,6 +24,7 @@ const TCP_DEFAULT_SEND_QUEUE_LENGTH: usize = 4096;
 const TCP_DEFAULT_RECV_QUEUE_LENGTH: usize = 4096;
 const TCP_RECV_QUEUE_WRAP: usize = 1 << 32;
 const TCP_NO_DELAY: bool = false;
+const TCP_DELAY_ACK: bool = true;
 
 impl TcpStack {
     pub fn receive_thread(&self) -> Result<()> {
@@ -183,7 +184,8 @@ impl TcpStack {
                         rtt_start: None,
                         rtt_seq: None,
                         last_snd_ack: 0,
-                        flag: TcpConnectionFlag::new(),
+                        send_flag: TcpSendControlFlag::new(),
+                        conn_flag: TcpConnectionFlag::new(),
                     };
                     if queue.accepted > 0 {
                         // socket has already accepted and waiting for new established connection.
@@ -479,7 +481,7 @@ impl TcpStack {
             // check if a segment is acceptable
             if !is_segment_acceptable(conn, tcp_packet) {
                 if !tcp_packet.flag.contains(TcpFlag::RST) {
-                    conn.flag.ack_now = true;
+                    conn.send_flag.ack_now = true;
                     if let Err(e) = self.send_handler(conn) {
                         log::warn!(
                             "[{}] Received an unacceptable non-RST packet and just send back ACK, but failed. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={} SEG.FLAG={:?} Err: {:?}",
@@ -491,7 +493,6 @@ impl TcpStack {
                             conn.print_log_prefix(socket_id), tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size, tcp_packet.flag
                         );
                     }
-                    conn.flag.ack_now = false;
                 } else {
                     log::debug!(
                         "[{}] Received an unacceptable RST packet and ignored. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
@@ -622,7 +623,12 @@ impl TcpStack {
                     log::debug!("[{}] Datagram received. (Received datagram length {}->{})", conn.print_log_prefix(socket_id), prev_payload, current_payload);
                     self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived });
                 }
-                conn.flag.ack_now = true;
+                if !conn.timer.delayed_ack.timer_param.active && conn.conn_flag.use_delayed_ack {
+                    conn.send_flag.ack_delayed = true;
+                    conn.timer.delayed_ack.fire();
+                } else {
+                    conn.send_flag.ack_now = true;
+                }
             }
             // Enter the CLOSE-WAIT state. rfc9293
             if tcp_packet.flag.contains(TcpFlag::FIN) {
@@ -635,7 +641,6 @@ impl TcpStack {
                     conn.print_log_prefix(socket_id), tcp_packet.ack_number, conn.send_vars.next_sequence_num, e
                 );
             }
-            conn.flag.ack_now = false;
             if !conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num {
                 conn.timer.retransmission.fire_datagram();
                 log::debug!(
@@ -774,7 +779,8 @@ pub struct TcpConnection {
     pub rtt_start: Option<Instant>,      // BSD: t_rtttime
     pub rtt_seq: Option<u32>,            // BSD: t_rtseq
     pub last_snd_ack: u32,               // BSD: last_ack_sent
-    pub flag: TcpConnectionFlag,
+    pub send_flag: TcpSendControlFlag,
+    pub conn_flag: TcpConnectionFlag,
 }
 
 impl TcpConnection {
@@ -795,7 +801,8 @@ impl TcpConnection {
             rtt_start: None,
             rtt_seq: None,
             last_snd_ack: 0,
-            flag: TcpConnectionFlag::new(),
+            send_flag: TcpSendControlFlag::new(),
+            conn_flag: TcpConnectionFlag::new(),
         }
     }
 
@@ -829,25 +836,41 @@ impl TcpConnection {
     }
 }
 
+// Control flag that used once for each segment send
 #[derive(Debug, Default)]
-pub struct TcpConnectionFlag {
+pub struct TcpSendControlFlag {
     pub ack_now: bool,            // BSD: TF_ACKNOW
-    pub no_delay: bool,           // BSD: TF_NODELAY
-    pub snd_from_una : bool,
+    pub ack_delayed: bool,        // BSD: TF_DELACK
+    pub snd_from_una: bool,
 }
 
-impl TcpConnectionFlag {
+impl TcpSendControlFlag {
     pub fn new() -> Self {
         Self {
-            no_delay: TCP_NO_DELAY,
             ..Default::default()
         }
     }
 
     pub fn init(&mut self) {
         self.ack_now = false;
-        self.no_delay = TCP_NO_DELAY;
+        self.ack_delayed = false;
         self.snd_from_una = false;
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TcpConnectionFlag {
+    pub use_delayed_ack: bool,
+    pub use_no_delay: bool,       // BSD: TF_NODELAY
+}
+
+impl TcpConnectionFlag {
+    pub fn new() -> Self {
+        Self {
+            use_delayed_ack: TCP_DELAY_ACK,
+            use_no_delay: TCP_NO_DELAY,
+            ..Default::default()
+        }
     }
 }
 

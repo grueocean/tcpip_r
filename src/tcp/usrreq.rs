@@ -486,7 +486,8 @@ impl TcpStack {
                 rtt_start: _rtt_start,
                 rtt_seq: _rtt_seq,
                 last_snd_ack: _last_snd_ack,
-                flag: _flag,
+                send_flag: _send_flag,
+                conn_flag: _conn_flag,
             }) = connection_info {
                 if s_addr == dst_addr && d_addr == src_addr && l_port == remote_port && r_port == local_port {
                     ids.push(*id);

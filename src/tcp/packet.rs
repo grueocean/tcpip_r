@@ -229,7 +229,7 @@ impl TcpPacket {
             TcpStatus::SynSent => { Ok(Self::new_syn_sent(conn).context("Failed to create syn_sent packet.")?) }
             TcpStatus::SynRcvd => { Ok(Self::new_syn_rcvd(conn).context("Failed to create syn_rcvd packet.")?) }
             TcpStatus::Established => {
-                if !conn.flag.snd_from_una {
+                if !conn.send_flag.snd_from_una {
                     Ok(Self::new_established_next(conn).context("Failed to create established_1st packet.")?)
                 } else {
                     if let Some (start_seq) = start_seq {
@@ -401,7 +401,7 @@ impl TcpOption {
                     anyhow::ensure!(offset + 2 <= length, "SackOption needs 2 bytes but only {} bytes left.", length - offset);
                     let len = u8::from_be_bytes(option[offset+1..offset+2].try_into()?) as usize;
                     anyhow::ensure!(offset + len <= length, "Length field of SackOption is {} but only {} bytes left.", len, length - offset);
-                    anyhow::ensure!((length - offset - 2) % 8 == 0, "SackOption payload must be 8 bytes alligned but len-2 is {}.", len - 2);
+                    anyhow::ensure!((length - offset - 2) % 8 == 0, "SackOption payload must be 8 bytes aligned but len-2 is {}.", len - 2);
                     for i in (offset+2..offset+len).step_by(8) {
                         if let Some(sack) = self.sack.as_mut() {
                             sack.push((
