@@ -61,7 +61,7 @@ impl TcpStack {
             let next_send_nxt = send_una.wrapping_add(conn.send_queue.payload.len() as u32);
             if conn.send_flag.ack_delayed && new_data == 0 {
                 log::debug!(
-                    "[status={} {}] Delayed ack situation. RCV.NXT={}",
+                    "[status={} {}] Delayed ack situation. (Not sending ack here.) RCV.NXT={}",
                     conn.status, conn.print_address(), conn.recv_vars.next_sequence_num
                 );
                 Ok(0)
@@ -89,6 +89,7 @@ impl TcpStack {
                         conn.send_vars.next_sequence_num = conn.send_vars.next_sequence_num.wrapping_add(datagram_size);
                         anyhow::anyhow!(e)
                     })?;
+                    if conn.timer.delayed_ack.timer_param.active { conn.timer.delayed_ack.init(); }
                     if conn.rtt_start.is_none() && datagram_size > 0 {
                         conn.rtt_start = Some(Instant::now());
                         conn.rtt_seq = Some(snd_seq);
@@ -112,12 +113,13 @@ impl TcpStack {
                     let datagram_size = datagram.payload.len() as u32;
                     let snd_seq = datagram.seq_number;
                     let snd_ack = datagram.ack_number;
-                    // We don't need to update SND.NXT because retransmission will be triggered anyway.
+                    // We don't need to update SND.NXT even if a packet failed to be sent because retransmission will be triggered anyway.
                     self.send_tcp_packet(datagram)?;
                     if conn.rtt_start.is_none() && datagram_size > 0 {
                         conn.rtt_start = Some(Instant::now());
                         conn.rtt_seq = Some(snd_seq);
                     }
+                    if conn.timer.delayed_ack.timer_param.active { conn.timer.delayed_ack.init(); }
                     start_seq = start_seq.wrapping_add(datagram_size);
                     if seq_greater_equal(start_seq, conn.send_vars.next_sequence_num) {
                         conn.send_vars.next_sequence_num = start_seq;
