@@ -51,34 +51,5 @@ fn main() -> Result<()> {
     let tcp = TcpStream::new(config)?;
     tcp.connect_with_bind(SocketAddrV4::new(args.dst, args.port), args.lport)?;
     println!("Socket connected!");
-    let read_stream = tcp.clone();
-    thread::spawn(move || {
-        let mut buf = [0; 512];
-        loop {
-            match read_stream.read(&mut buf) {
-                Ok(amt) => {
-                    let data = &buf[..amt];
-                    let ascii = from_utf8(data)
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|_| String::from("Data contains non-ASCII characters"));
-                    let hex = hex::encode(data);
-                    println!("Tcp packet received ({} bytes).", amt);
-                    println!("hex: {}\nascii: {}", hex, ascii);
-                }
-                Err(e) => {
-                    println!("Tcp recv error. Err: {}", e);
-                }
-            }
-        }
-    });
-    loop {
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        println!("Write to socket.");
-        if let Err(e) = tcp.write(input.as_bytes()) {
-            println!("Failed to write socket. Err: {:?}", e);
-        } else {
-            println!("Write to socket successfully.")
-        }
-    }
+    Ok(())
 }

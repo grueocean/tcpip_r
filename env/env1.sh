@@ -68,6 +68,10 @@ create() {
 delete() {
     set -eux
 
+    ip link delete l2-0
+    ip link delete l2-1
+    ip link delete l2-2
+    ip link delete l2-3
     ip netns delete Dev0
     ip netns delete Dev1
     ip netns delete Tcpip0
