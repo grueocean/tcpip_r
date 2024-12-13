@@ -265,7 +265,11 @@ impl TcpStack {
                     ack_packet.seq_number = next_seq;
                     ack_packet.ack_number = next_ack;
                     ack_packet.flag = TcpFlag::ACK;
-                    ack_packet.window_size = conn.get_recv_window_for_pkt();
+                    if let Some(scale) = tcp_packet.option.window_scale {
+                        ack_packet.window_size = (conn.get_recv_window_size() >> scale) as u16;
+                    } else {
+                        ack_packet.window_size = conn.get_recv_window_for_pkt();
+                    }
                     self.send_tcp_packet(ack_packet).context("Failed to reply ACK.")?;
                     if let Some(mss) = tcp_packet.option.mss {
                         conn.send_vars.send_mss = mss;

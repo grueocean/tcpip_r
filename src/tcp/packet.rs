@@ -230,7 +230,7 @@ impl TcpPacket {
             TcpStatus::SynRcvd => { Ok(Self::new_syn_rcvd(conn).context("Failed to create syn_rcvd packet.")?) }
             TcpStatus::Established => {
                 if !conn.send_flag.snd_from_una {
-                    Ok(Self::new_established_next(conn).context("Failed to create established_1st packet.")?)
+                    Ok(Self::new_established_next(conn).context("Failed to create established_next packet.")?)
                 } else {
                     if let Some (start_seq) = start_seq {
                         Ok(Self::new_established_rexmt(conn, start_seq).context("Failed to create established_rexmt packet.")?)
@@ -272,7 +272,7 @@ impl TcpPacket {
         syn_rcvd.seq_number = conn.send_vars.unacknowledged;
         syn_rcvd.ack_number = conn.recv_vars.next_sequence_num;
         syn_rcvd.flag = TcpFlag::SYN | TcpFlag::ACK;
-        syn_rcvd.window_size = conn.get_recv_window_for_pkt();
+        syn_rcvd.window_size = conn.get_recv_window_size() as u16;
         if conn.send_vars.window_shift != 0 {
             syn_rcvd.option.window_scale = Some(TCP_DEFAULT_WINDOW_SCALE);
         }
