@@ -107,7 +107,8 @@ impl TcpStream {
         Ok(tcp.read(self.socket_id, buf)?)
     }
 
-    pub fn close(&self) {
-
+    pub fn shutdown(&self) -> Result<()> {
+        let tcp = get_global_tcpstack(self.config.clone())?;
+        Ok(tcp.shutdown(self.socket_id)?)
     }
 }

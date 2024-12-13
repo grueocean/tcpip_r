@@ -457,6 +457,20 @@ impl TcpStack {
         }
     }
 
+    pub fn shutdown(&self, socket_id: usize) -> Result<()> {
+        // wip: just flushing queue
+        let mut conns = self.connections.lock().unwrap();
+        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            if conn.recv_queue.complete_datagram.payload.len() != 0 {
+                conn.send_flag.ack_now = true;
+                self.send_handler(conn)?;
+            }
+        } else {
+            anyhow::bail!("Cannot find the socket (id={}).", socket_id);
+        }
+    Ok(())
+    }
+
     pub fn get_socket_id(
         &self,
         src_addr: &Ipv4Addr,
