@@ -10,8 +10,8 @@ const TCP_MAXRXTSHIFT: usize = 12;
 const TCP_MAXRXTSHIFT_DEFAULT: usize = 12;
 const TCP_RTT_INVALIDATE: usize = TCP_MAXRXTSHIFT_DEFAULT / 4;
 // 1 (i=0) is not used for the actual retransmission.
-const TCP_BACKOFF: [usize; TCP_MAXRXTSHIFT_DEFAULT+1] = [
-    1, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 512, 512
+const TCP_BACKOFF: [usize; TCP_MAXRXTSHIFT_DEFAULT+2] = [
+    1, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 512, 512, 0
 ];
 // TCP_REXMT_*** are all msec.
 const TCP_REXMT_INIT: usize = 1_000;   // BSD: tcp_rexmit_initial
