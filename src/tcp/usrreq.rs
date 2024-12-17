@@ -362,19 +362,16 @@ impl TcpStack {
     ) -> Result<usize> {
         let mut current_offset: usize = 0;
         let payload_len = payload.len();
+        log::trace!("WRITE CALL: id={} len={}", socket_id, payload_len);
         loop {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
                 let current_queue_free = conn.send_queue.queue_length - conn.send_queue.payload.len();
-                if current_queue_free == 0 {
-                    // Unix system returns EAGAIN in this situation.
-                    anyhow::bail!("No free space in send queue. length: {}", conn.send_queue.queue_length);
-                }
                 if (payload_len - current_offset) <= current_queue_free {
                     conn.send_queue.payload.extend_from_slice(&payload[current_offset..]);
-                    current_offset += payload_len;
+                    current_offset = payload_len;
                 } else {
-                    conn.send_queue.payload.extend_from_slice(&payload[current_offset..current_offset+current_queue_free]);
+                    conn.send_queue.payload.extend_from_slice(&payload[current_offset..(current_offset+current_queue_free)]);
                     current_offset += current_queue_free
                 }
                 if let Err(e) = self.send_handler(conn) {
@@ -421,6 +418,7 @@ impl TcpStack {
         socket_id: usize,
         payload: &mut [u8]
     ) -> Result<usize> {
+        log::trace!("READ CALL: id={}", socket_id);
         loop {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
@@ -459,16 +457,18 @@ impl TcpStack {
 
     pub fn shutdown(&self, socket_id: usize) -> Result<()> {
         // wip: just flushing queue
-        let mut conns = self.connections.lock().unwrap();
-        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-            if conn.recv_queue.complete_datagram.payload.len() != 0 {
-                conn.send_flag.ack_now = true;
-                self.send_handler(conn)?;
+        log::trace!("SHUTDOWN CALL: id={}", socket_id);
+        loop {
+            let mut conns = self.connections.lock().unwrap();
+            if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+                if conn.send_queue.payload.len() == 0 && conn.recv_vars.next_sequence_num == conn.last_snd_ack {
+                    break;
+                }
+            } else {
+                anyhow::bail!("Cannot find the socket (id={}).", socket_id);
             }
-        } else {
-            anyhow::bail!("Cannot find the socket (id={}).", socket_id);
         }
-    Ok(())
+        Ok(())
     }
 
     pub fn get_socket_id(
