@@ -616,18 +616,21 @@ impl TcpStack {
             // Seventh, process the segment text: rfc9293
             if tcp_packet.payload.len() != 0 {
                 let prev_payload = conn.recv_queue.complete_datagram.payload.len();
-                conn.recv_queue.add(tcp_packet.seq_number as usize, &tcp_packet.payload)?;
-                let current_payload = conn.recv_queue.complete_datagram.payload.len();
-                let rcv_nxt_advance = current_payload - prev_payload;
-                let rcv_nxt_next = conn.recv_queue.get_real_begin_sequence_num().wrapping_add(rcv_nxt_advance as u32);
-                log::debug!("[{}] RCV.NXT advanced. ({}->{}).", conn.print_log_prefix(socket_id), conn.recv_vars.next_sequence_num, rcv_nxt_next);
-                conn.recv_vars.next_sequence_num = rcv_nxt_next;
-                conn.recv_vars.window_size = conn.get_recv_window_size();
-                if prev_payload != current_payload {
-                    log::debug!("[{}] Datagram received. (Received datagram length {}->{})", conn.print_log_prefix(socket_id), prev_payload, current_payload);
-                    self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived });
+                if let Err(e) = conn.recv_queue.add(tcp_packet.seq_number as usize, &tcp_packet.payload) {
+                    log::warn!("Failed to add a segment to the recv queue. Err: {:?}", e);
+                } else {
+                    let current_payload = conn.recv_queue.complete_datagram.payload.len();
+                    let rcv_nxt_advance = current_payload - prev_payload;
+                    let rcv_nxt_next = conn.recv_queue.get_real_begin_sequence_num().wrapping_add(current_payload as u32);
+                    log::debug!("[{}] RCV.NXT advanced. ({}->{}).", conn.print_log_prefix(socket_id), conn.recv_vars.next_sequence_num, rcv_nxt_next);
+                    conn.recv_vars.next_sequence_num = rcv_nxt_next;
+                    conn.recv_vars.window_size = conn.get_recv_window_size();
+                    if prev_payload != current_payload {
+                        log::debug!("[{}] Datagram received. (Received datagram length {}->{})", conn.print_log_prefix(socket_id), prev_payload, current_payload);
+                        self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived });
+                    }
                 }
-                if !conn.timer.delayed_ack.timer_param.active && conn.conn_flag.use_delayed_ack {
+                if !conn.timer.delayed_ack.timer_param.active && conn.conn_flag.use_delayed_ack && !conn.has_unsent_data() {
                     conn.send_flag.ack_delayed = true;
                     conn.timer.delayed_ack.fire();
                 } else {
@@ -837,6 +840,11 @@ impl TcpConnection {
         self.send_queue.payload.drain(..new_snd_una.wrapping_sub(self.send_vars.unacknowledged) as usize);
         self.send_vars.unacknowledged = new_snd_una;
         Ok(different)
+    }
+
+    pub fn has_unsent_data(&self) -> bool {
+        let send_queue_tail = self.send_vars.unacknowledged.wrapping_add(self.send_queue.payload.len() as u32);
+        send_queue_tail != self.send_vars.next_sequence_num
     }
 }
 
