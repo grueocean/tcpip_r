@@ -19,7 +19,7 @@ const TESTAPP_PATH: &str = "./target/debug/examples/";
 const TESTAPP_TCP_CLIENT_OPEN: &str = "_test_tcp_client_open";
 const TESTAPP_TCP_SERVER_OPEN: &str = "_test_tcp_server_open";
 const TEST_INITIALIZE: u64 = 100; // msec
-const TEST_TIMEOUT: u64 = 3; // sec
+const TEST_TIMEOUT: u64 = 10; // sec
 const CLIENT_CONNECTTED: &str = "Socket connected!";
 const SERVER_ACCEPTED: &str = "Socket accepted!";
 

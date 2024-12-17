@@ -107,3 +107,13 @@ pub fn check_stdout_pattern(child: &mut Child, patterns: &[&str]) -> Result<bool
     println!("output: {}", output);
     Ok(patterns.iter().all(|pattern| output.contains(pattern)))
 }
+
+pub fn dump_stderr(child: &mut Child) -> Result<()> {
+    println!("=== Dump stderr start id={} ===", child.id());
+    let stderr = child.stderr.take().context("Cannot take stderr from child.")?;
+    for line in BufReader::new(stderr).lines() {
+        println!("{}", line.context("Failed to read line")?);
+    }
+    println!("=== Dump stderr end id={} ===", child.id());
+    Ok(())
+}
