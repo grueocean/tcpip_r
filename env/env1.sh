@@ -87,6 +87,24 @@ pktcap() {
     ip netns exec Tcpip1 tcpdump -i p1 -w "pkt/Tcpip1-$(date +%Y-%m-%dT%H-%M-%S).pcap" >/dev/null 2>&1 &
 }
 
+drop() {
+    set -eux
+
+    tc qdisc add dev l2-0 root netem loss $1%
+    tc qdisc add dev l2-1 root netem loss $1%
+    tc qdisc add dev l2-2 root netem loss $1%
+    tc qdisc add dev l2-3 root netem loss $1%
+}
+
+clear() {
+    set -eux
+
+    tc qdisc del dev l2-1 root
+    tc qdisc del dev l2-2 root
+    tc qdisc del dev l2-0 root
+    tc qdisc del dev l2-3 root
+}
+
 case "$1" in
     create)
         create
@@ -96,6 +114,16 @@ case "$1" in
         ;;
     pktcap)
         pktcap
+        ;;
+    drop)
+        if [ $# -ne 2 ]; then
+            echo "Option drop requires 2nd arg (drop rate)."
+            exit 1
+        fi
+        drop $2
+        ;;
+    clear)
+        clear
         ;;
     *)
         echo "Usage: $0 {create|delete|pktcap}"
