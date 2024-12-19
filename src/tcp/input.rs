@@ -201,11 +201,17 @@ impl TcpStack {
                             id, src_addr, tcp_packet.remote_port, dst_addr, tcp_packet.local_port, socket_id
                         );
                         queue.pending_acked.push_back(id);
-                        self.send_tcp_packet(syn_ack).context("Failed to send SYN/ACK.")?;
-                        log::debug!(
-                            "An accepted socket (id={}) replies SYN/ACK to {}:{} in listen_handler. SEQ={} ACK={}",
-                            id, dst_addr, tcp_packet.local_port, seq, ack
-                        );
+                        if let Some(Some(conn)) = conns.get_mut(&id) {
+                            conn.timer.retransmission.init();
+                            self.send_tcp_packet(syn_ack).context("Failed to send SYN/ACK.")?;
+                            log::debug!(
+                                "An accepted socket (id={}) replies SYN/ACK to {}:{} in listen_handler. SEQ={} ACK={}",
+                                id, dst_addr, tcp_packet.local_port, seq, ack
+                            );
+                            conn.timer.retransmission.fire_syn();
+                        } else {
+                            anyhow::bail!("No socket (id={}).", socket_id);
+                        }
                         self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::SynReceived });
                     } else {
                         conns.insert(id, Some(new_conn));
