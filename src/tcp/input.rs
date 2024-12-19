@@ -203,11 +203,17 @@ impl TcpStack {
                         queue.pending_acked.push_back(id);
                         if let Some(Some(conn)) = conns.get_mut(&id) {
                             conn.timer.retransmission.init();
-                            self.send_tcp_packet(syn_ack).context("Failed to send SYN/ACK.")?;
-                            log::debug!(
-                                "An accepted socket (id={}) replies SYN/ACK to {}:{} in listen_handler. SEQ={} ACK={}",
-                                id, dst_addr, tcp_packet.local_port, seq, ack
-                            );
+                            if let Err(e) = self.send_tcp_packet(syn_ack).context("Failed to send SYN/ACK.") {
+                                log::debug!(
+                                    "An accepted socket (id={}) failed to send SYN/ACK to {}:{} in listen_handler. SEQ={} ACK={} Err: {:?}",
+                                    id, dst_addr, tcp_packet.local_port, seq, ack, e
+                                );
+                            } else {
+                                log::debug!(
+                                    "An accepted socket (id={}) replies SYN/ACK to {}:{} in listen_handler. SEQ={} ACK={}",
+                                    id, dst_addr, tcp_packet.local_port, seq, ack
+                                );
+                            }
                             conn.timer.retransmission.fire_syn();
                         } else {
                             anyhow::bail!("No socket (id={}).", socket_id);
