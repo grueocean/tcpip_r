@@ -341,7 +341,9 @@ impl TcpStack {
                     conn.recv_queue.complete_datagram.sequence_num = next_ack as usize;
                     conn.status = TcpStatus::SynRcvd;
                     conn.timer.retransmission.init();
-                    self.send_handler(conn)?;
+                    if let Err (e) = self.send_handler(conn) {
+                        log::debug!("[{}] Failed to send SYN/ACK. Err: {:?}", conn.print_log_prefix(socket_id), e);
+                    }
                     log::debug!(
                         "[{}] Status changed from SYN-SENT to SYN-RECEIVED. This is a Simultaneous Connection situation.",
                         conn.print_log_prefix(socket_id)
@@ -720,14 +722,17 @@ pub fn seq_greater_equal(seq1: u32, seq2: u32) -> bool {
 }
 
 // There are four cases for the acceptability test for an incoming segment: rfc9293
+// Modify rfc9293 implementation based on https://datatracker.ietf.org/doc/html/draft-gont-tcpm-tcp-seq-validation-04
 pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bool {
     if tcp_packet.payload.len() == 0 && tcp_packet.window_size << conn.send_vars.window_shift == 0 {
-        if tcp_packet.seq_number == conn.recv_vars.next_sequence_num {
+        // RCV.NXT-1 =< SEG.SEQ <= RCV.NXT
+        if tcp_packet.seq_number == conn.recv_vars.next_sequence_num || tcp_packet.seq_number.wrapping_add(1) == conn.recv_vars.next_sequence_num {
             return true;
         }
     } else if tcp_packet.payload.len() == 0 && tcp_packet.window_size << conn.send_vars.window_shift > 0 {
+        // RCV.NXT-1 =< SEG.SEQ < RCV.NXT+RCV.WND
         if seq_in_range(
-            conn.recv_vars.next_sequence_num,
+            conn.recv_vars.next_sequence_num.wrapping_sub(1),
             conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
             tcp_packet.seq_number
         ) {
@@ -736,14 +741,14 @@ pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bo
     } else if tcp_packet.payload.len() > 0 && tcp_packet.window_size << conn.send_vars.window_shift == 0 {
         return false;
     } else if tcp_packet.payload.len() > 0 && tcp_packet.window_size << conn.send_vars.window_shift > 0 {
-        // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+        // RCV.NXT - 1 =< SEG.SEQ < RCV.NXT+RCV.WND
         if seq_in_range(
-            conn.recv_vars.next_sequence_num,
+            conn.recv_vars.next_sequence_num.wrapping_sub(1),
             conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
             tcp_packet.seq_number
-        // RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
+        // RCV.NXT -1 =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
         ) || seq_in_range(
-            conn.recv_vars.next_sequence_num,
+            conn.recv_vars.next_sequence_num.wrapping_sub(1),
             conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
             tcp_packet.seq_number.wrapping_add(tcp_packet.payload.len() as u32 - 1)
         ) {
