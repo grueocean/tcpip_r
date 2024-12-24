@@ -126,7 +126,7 @@ case "$1" in
         clear
         ;;
     *)
-        echo "Usage: $0 {create|delete|pktcap}"
+        echo "Usage: $0 {create|delete|pktcap|drop|clear}"
         exit 1
         ;;
 esac
