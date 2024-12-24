@@ -629,26 +629,40 @@ impl TcpStack {
             }
             // Seventh, process the segment text: rfc9293
             if tcp_packet.payload.len() != 0 {
+                eprintln!("recv paylod: {} SEG.SEQ={}", tcp_packet.payload.len(), tcp_packet.seq_number);
                 let prev_payload = conn.recv_queue.complete_datagram.payload.len();
+                eprintln!("BEFORE ADD: {:?}", conn.recv_queue);
                 if let Err(e) = conn.recv_queue.add(tcp_packet.seq_number as usize, &tcp_packet.payload) {
                     log::warn!("Failed to add a segment to the recv queue. Err: {:?}", e);
                 } else {
+                    eprintln!("AFTER ADD: {:?}", conn.recv_queue);
                     let current_payload = conn.recv_queue.complete_datagram.payload.len();
+                    eprintln!("debug line: 1");
                     let rcv_nxt_advance = current_payload - prev_payload;
+                    eprintln!("debug line: 2");
                     let rcv_nxt_next = conn.recv_queue.get_real_begin_sequence_num().wrapping_add(current_payload as u32);
+                    eprintln!("debug line: 3");
                     log::debug!("[{}] RCV.NXT advanced. ({}->{}).", conn.print_log_prefix(socket_id), conn.recv_vars.next_sequence_num, rcv_nxt_next);
+                    eprintln!("debug line: 4");
                     conn.recv_vars.next_sequence_num = rcv_nxt_next;
+                    eprintln!("debug line: 5");
                     conn.recv_vars.window_size = conn.get_recv_window_size();
+                    eprintln!("debug line: 6");
                     if prev_payload != current_payload {
-                        log::debug!("[{}] Datagram received. (Received datagram length {}->{})", conn.print_log_prefix(socket_id), prev_payload, current_payload);
+                        log::debug!("[{}] Datagram received {} bytes. (Received datagram length {}->{})", conn.print_log_prefix(socket_id), rcv_nxt_advance, prev_payload, current_payload);
                         self.publish_event(TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived });
                     }
+                    eprintln!("debug line: 7");
                 }
                 if !conn.timer.delayed_ack.timer_param.active && conn.conn_flag.use_delayed_ack && !conn.has_unsent_data() {
+                    eprintln!("debug line: 8");
                     conn.send_flag.ack_delayed = true;
+                    eprintln!("debug line: 9");
                     conn.timer.delayed_ack.fire();
+                    eprintln!("debug line: 10");
                 } else {
                     conn.send_flag.ack_now = true;
+                    eprintln!("debug line: 11");
                 }
             }
             // Enter the CLOSE-WAIT state. rfc9293
@@ -656,12 +670,14 @@ impl TcpStack {
                 conn.status = TcpStatus::CloseWait;
                 log::debug!("[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}", conn.print_log_prefix(socket_id), tcp_packet.flag);
             }
+            eprintln!("Send here.");
             if let Err(e) = self.send_handler(conn) {
                 log::warn!(
                     "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {}",
                     conn.print_log_prefix(socket_id), tcp_packet.ack_number, conn.send_vars.next_sequence_num, e
                 );
             }
+            eprintln!("Send done.");
             if !conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num {
                 conn.timer.retransmission.fire_datagram();
                 log::debug!(
@@ -743,14 +759,14 @@ pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bo
     } else if tcp_packet.payload.len() > 0 && tcp_packet.window_size << conn.send_vars.window_shift > 0 {
         // RCV.NXT - 1 =< SEG.SEQ < RCV.NXT+RCV.WND
         if seq_in_range(
-            conn.recv_vars.next_sequence_num.wrapping_sub(1),
-            conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
-            tcp_packet.seq_number
+            conn.recv_vars.next_sequence_num,
+            conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32),
+            tcp_packet.seq_number.wrapping_add(1)
         // RCV.NXT -1 =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
         ) || seq_in_range(
-            conn.recv_vars.next_sequence_num.wrapping_sub(1),
-            conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32 - 1),
-            tcp_packet.seq_number.wrapping_add(tcp_packet.payload.len() as u32 - 1)
+            conn.recv_vars.next_sequence_num,
+            conn.recv_vars.next_sequence_num.wrapping_add(conn.recv_vars.window_size as u32),
+            tcp_packet.seq_number.wrapping_add(tcp_packet.payload.len() as u32)
         ) {
             return true;
         }
@@ -1226,7 +1242,10 @@ impl ReceiveQueue {
         Ok(())
     }
 
+    // After read from recv queue, we need to update RCV.WND.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let old_begin = self.complete_datagram.sequence_num;
+        let old_len = self.complete_datagram.payload.len();
         let copy_len = min(buf.len(), self.complete_datagram.payload.len());
         buf[..copy_len].copy_from_slice(&self.complete_datagram.payload[..copy_len]);
         self.complete_datagram.payload.drain(..copy_len);
@@ -1240,6 +1259,10 @@ impl ReceiveQueue {
         } else {
             self.complete_datagram.sequence_num = new_begin;
         }
+        log::trace!(
+            "Read {} bytes from recv queue. (head: {} -> {} len: {} -> {})",
+            copy_len, old_begin, new_begin, old_len, self.complete_datagram.payload.len()
+        );
         Ok(copy_len)
     }
 }

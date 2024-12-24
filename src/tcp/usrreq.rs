@@ -367,13 +367,22 @@ impl TcpStack {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
                 let current_queue_free = conn.send_queue.queue_length - conn.send_queue.payload.len();
-                if (payload_len - current_offset) <= current_queue_free {
+                let remain = payload_len - current_offset;
+                if remain <= current_queue_free {
                     conn.send_queue.payload.extend_from_slice(&payload[current_offset..]);
                     current_offset = payload_len;
+                    log::trace!(
+                        "[{}] Wrote {} bytes to send queue. SND.UNA={} CURRENT_QUEUE_LENGTH={}",
+                        conn.print_log_prefix(socket_id), remain, conn.send_vars.unacknowledged, conn.send_queue.payload.len()
+                    );
                 } else {
                     conn.send_queue.payload.extend_from_slice(&payload[current_offset..(current_offset+current_queue_free)]);
-                    current_offset += current_queue_free
-                }
+                    current_offset += current_queue_free;
+                    log::trace!(
+                        "[{}] Wrote {} bytes to send queue. SND.UNA={} CURRENT_QUEUE_LENGTH={}",
+                        conn.print_log_prefix(socket_id), current_queue_free, conn.send_vars.unacknowledged, conn.send_queue.payload.len()
+                    );
+                 }
                 if let Err(e) = self.send_handler(conn) {
                     log::warn!("Failed to send a datagram. Err: {e:?}");
                 }
@@ -423,7 +432,11 @@ impl TcpStack {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
                 if conn.recv_queue.complete_datagram.payload.len() != 0 {
-                    return Ok(conn.recv_queue.read(payload)?);
+                    let read_size = conn.recv_queue.read(payload)?;
+                    if read_size != 0 {
+                        conn.recv_vars.window_size = conn.recv_queue.queue_length - conn.recv_queue.complete_datagram.payload.len();
+                        return Ok(read_size);
+                    }
                 }
             } else {
                 anyhow::bail!("Cannot find the socket (id={}).", socket_id);
@@ -467,7 +480,9 @@ impl TcpStack {
             } else {
                 anyhow::bail!("Cannot find the socket (id={}).", socket_id);
             }
+            // thread::sleep(Duration::from_millis(10));
         }
+        log::trace!("Shutting down. id={}", socket_id);
         Ok(())
     }
 
