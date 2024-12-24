@@ -62,12 +62,12 @@ fn main() -> Result<()> {
     let mut total_bytes: usize = 0;
     loop {
         let bytes_read = reader.read(&mut buffer).context("Failed to read from test file.")?;
-        println!("Write: {}~{}", total_bytes, total_bytes + bytes_read);
+        eprintln!("Write: {}~{}", total_bytes, total_bytes + bytes_read);
         total_bytes += bytes_read;
         if bytes_read == 0 { break; }
         loop {
             if let Err(e) = stream.write(&buffer[..bytes_read]) {
-                println!("Failed to write to stream. Err: {:?}", e);
+                eprintln!("Failed to write to stream. Err: {:?}", e);
                 thread::sleep(Duration::from_millis(10));
             } else {
                 break;

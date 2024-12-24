@@ -1,11 +1,12 @@
 mod common;
-use common::{setup_env, cleanup_env, child_wait_with_timeout, check_stdout_pattern};
+use common::{setup_env, cleanup_env, child_wait_with_timeout, check_stdout_pattern, dump_stdout, dump_stderr};
 use std::ops::Add;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use anyhow::{Result, Context};
 use serial_test::serial;
+use rstest::*;
 
 const TCP_CLIENT_PORT: usize = 1200;
 const TCP_SERVER_PORT: usize = 2000;
@@ -30,6 +31,7 @@ fn test_normal_3way_handshake_client() -> Result<()> {
     let expected_client_stdout = [CLIENT_CONNECTTED];
     let env_num: usize = 1;
     setup_env(env_num)?;
+    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut server = Command::new("sudo")
         .arg("ip")
         .arg("netns")
@@ -66,6 +68,8 @@ fn test_normal_3way_handshake_client() -> Result<()> {
     server.wait()?;
     client.kill()?;
     client.wait()?;
+    dump_stderr(&mut server)?;
+    dump_stderr(&mut client)?;
     cleanup_env(env_num)?;
     assert!(suc, "Connection is not established correctly.");
     Ok(())
@@ -78,6 +82,7 @@ fn test_normal_3way_handshake_server() -> Result<()> {
     let expected_server_stdout = [SERVER_ACCEPTED];
     let env_num: usize = 1;
     setup_env(env_num)?;
+    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut server = Command::new("sudo")
         .arg("ip")
         .arg("netns")
@@ -92,7 +97,6 @@ fn test_normal_3way_handshake_server() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .context(format!("Failed to execute {}.", TESTAPP_TCP_SERVER_OPEN))?;
-    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut client = Command::new("sudo")
         .arg("ip")
         .arg("netns")
@@ -104,7 +108,7 @@ fn test_normal_3way_handshake_server() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to execut server (nc).")?;
+        .context("Failed to execute server (nc).")?;
     if let Some(status) = child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))? {
         println!("status: {:?}", status);
         if status.success() && check_stdout_pattern(&mut server, &expected_server_stdout)? {
@@ -115,6 +119,8 @@ fn test_normal_3way_handshake_server() -> Result<()> {
     server.wait()?;
     client.kill()?;
     client.wait()?;
+    dump_stderr(&mut server)?;
+    dump_stderr(&mut client)?;
     cleanup_env(env_num)?;
     assert!(suc, "Connection is not established correctly.");
     Ok(())
@@ -128,6 +134,7 @@ fn test_normal_3way_handshake_both() -> Result<()> {
     let expected_client_stdout = [CLIENT_CONNECTTED];
     let env_num: usize = 1;
     setup_env(env_num)?;
+    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut server = Command::new("sudo")
         .arg("ip")
         .arg("netns")
@@ -142,7 +149,6 @@ fn test_normal_3way_handshake_both() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .context(format!("Failed to execute {}.", TESTAPP_TCP_SERVER_OPEN))?;
-    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut client = Command::new("sudo")
         .arg("ip")
         .arg("netns")
@@ -172,6 +178,8 @@ fn test_normal_3way_handshake_both() -> Result<()> {
     server.wait()?;
     client.kill()?;
     client.wait()?;
+    dump_stderr(&mut server)?;
+    dump_stderr(&mut client)?;
     cleanup_env(env_num)?;
     assert!(suc, "Connection is not established correctly.");
     Ok(())
@@ -184,6 +192,7 @@ fn test_simultaneous_open() -> Result<()> {
     let expected_stdout = [CLIENT_CONNECTTED];
     let env_num: usize = 1;
     setup_env(env_num)?;
+    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut client1 = Command::new("sudo")
         .arg("ip")
         .arg("netns")
@@ -200,7 +209,6 @@ fn test_simultaneous_open() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_OPEN))?;
-    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut client2 = Command::new("sudo")
         .arg("ip")
         .arg("netns")
@@ -231,6 +239,8 @@ fn test_simultaneous_open() -> Result<()> {
     client1.wait()?;
     client2.kill()?;
     client2.wait()?;
+    dump_stderr(&mut client1)?;
+    dump_stderr(&mut client2)?;
     cleanup_env(env_num)?;
     assert!(suc, "Connection is not established correctly.");
     Ok(())

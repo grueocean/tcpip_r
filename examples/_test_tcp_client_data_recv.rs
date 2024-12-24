@@ -49,6 +49,7 @@ struct Args {
 
 fn main() -> Result<()> {
     env_logger::builder()
+        .filter_level(log::LevelFilter::Trace)
         .format_timestamp_millis()
         .init();
     let args = Args::parse();
