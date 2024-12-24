@@ -16,6 +16,7 @@ const ARP_LENGTH: usize = 28; // bytes
 const ARP_CACHE_TIME: Duration = Duration::from_secs(100); // seconds
 const ARP_CACHE_REFREASH: Duration = Duration::from_millis(100);
 const ARP_RETRY: usize = 3;
+const LOG_PKT_DUMP: bool = false;
 
 #[derive(Debug, PartialEq)]
 enum L2StackEvent {
@@ -187,7 +188,7 @@ impl L2Stack {
         let mut iface_recv = EthernetRecveiver::new(&self.interface_name)?;
         loop {
             let packet = iface_recv.recv_packet()?;
-            log::trace!("Packet Received in L2Stack: {:x?}", packet);
+            if LOG_PKT_DUMP { log::trace!("Packet Received in L2Stack: {:x?}", packet); }
             let mut ethernet_packet = EthernetPacket::new();
             match ethernet_packet.read(&packet) {
                 Err(e) => {
@@ -198,7 +199,7 @@ impl L2Stack {
             }
             let dst_mac = MacAddress::from_bytes(&ethernet_packet.dst)?;
             if dst_mac != self.interface_mac && dst_mac != MacAddress::broadcast() {
-                log::trace!("Discarding packet. Interface mac is {}, but packet dst is to {}.", self.interface_mac, dst_mac);
+                if LOG_PKT_DUMP { log::trace!("Discarding packet. Interface mac is {}, but packet dst is to {}.", self.interface_mac, dst_mac); }
                 continue;
             }
             if EtherType::from(ethernet_packet.ethertype) == EtherType::ARP {
