@@ -322,9 +322,9 @@ impl TcpPacket {
 
     pub fn print_general_info(&self) -> String {
         format!(
-            "SEGINFO: SRC={}:{} DST={}:{} SEQ={} ACK={} LENGTH={} FLAG={:?}",
+            "SEGINFO: SRC={}:{} DST={}:{} SEQ={} ACK={} LENGTH={} WND(RAW)={} FLAG={:?}",
             Ipv4Addr::from(self.src_addr), self.local_port, Ipv4Addr::from(self.dst_addr), self.remote_port,
-            self.seq_number, self.ack_number, self.payload.len(), self.flag
+            self.seq_number, self.ack_number, self.payload.len(), self.window_size, self.flag
         )
     }
 }

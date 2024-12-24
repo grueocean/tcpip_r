@@ -334,6 +334,7 @@ impl DelayedAckTimer {
     pub fn fire(&mut self) {
         self.timer_param.active = true;
         self.timer_count = Instant::now();
+        log::debug!("Delayed ack timer is fired. interval={}", TCP_DELAY_ACK);
     }
 
     pub fn is_expired(&self) -> Result<bool> {
