@@ -6,7 +6,7 @@ use std::net::{SocketAddrV4};
 pub enum TcpOptionKind {
     // 8 bit
     EndOption = 0x00,       // mandatory
-    NoOperation = 0x01,     // mandatory, used for word boundary allign
+    NoOperation = 0x01,     // mandatory, used for word boundary align
     MaxSegmentSize = 0x02,  // mandatory
     WindowScale = 0x3,      // https://datatracker.ietf.org/doc/html/rfc7323#section-2
     SackPermission = 0x04,  // rfc2018, rfc2883
