@@ -9,6 +9,8 @@ const SCRIPT_PATH: &str = "./env/";
 const SCRIPT_BASE: &str = "env";
 const CREATE_COMMAND: &str = "create";
 const DELETE_COMMAND: &str = "delete";
+const DROP_COMMAND: &str = "drop";
+const CLEAR_COMMAND: &str = "clear";
 
 fn is_netns_clean() -> Result<()> {
     let out = Command::new("ip")
@@ -85,6 +87,43 @@ pub fn cleanup_env(script_num: usize) -> Result<()> {
     Ok(())
 }
 
+pub fn insert_drop(script_num: usize, drop_rate: usize) -> Result<()> {
+    let script = format!("{}{}{}.sh", SCRIPT_PATH, SCRIPT_BASE, script_num);
+    if !Path::new(&script).exists() {
+        anyhow::bail!("No {} found.", script);
+    }
+    let out = Command::new("sudo")
+        .arg("sh")
+        .arg(script)
+        .arg(DROP_COMMAND)
+        .arg(drop_rate.to_string())
+        .output()
+        .context("Failed to insert drop.")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("Insert drop failed. out={:?}", out)
+    }
+}
+
+pub fn clear_drop(script_num: usize) -> Result<()> {
+    let script = format!("{}{}{}.sh", SCRIPT_PATH, SCRIPT_BASE, script_num);
+    if !Path::new(&script).exists() {
+        anyhow::bail!("No {} found.", script);
+    }
+    let out = Command::new("sudo")
+        .arg("sh")
+        .arg(script)
+        .arg(CLEAR_COMMAND)
+        .output()
+        .context("Failed to clear drop.")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("Clear drop failed. out={:?}", out)
+    }
+}
+
 pub fn child_wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -98,6 +137,7 @@ pub fn child_wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<O
             }
         }
     }
+    println!("Child wait timeout. {:?}", timeout);
     Ok(None)
 }
 
@@ -106,6 +146,16 @@ pub fn check_stdout_pattern(child: &mut Child, patterns: &[&str]) -> Result<bool
     let output: String = BufReader::new(stdout).lines().collect::<Result<Vec<_>, _>>()?.join("\n");
     println!("output: {}", output);
     Ok(patterns.iter().all(|pattern| output.contains(pattern)))
+}
+
+pub fn dump_stdout(child: &mut Child) -> Result<()> {
+    println!("=== Dump stdout start id={} ===", child.id());
+    let stdout = child.stdout.take().context("Cannot take stdout from child.")?;
+    for line in BufReader::new(stdout).lines() {
+        println!("{}", line.context("Failed to read line")?);
+    }
+    println!("=== Dump stdout end id={} ===", child.id());
+    Ok(())
 }
 
 pub fn dump_stderr(child: &mut Child) -> Result<()> {
