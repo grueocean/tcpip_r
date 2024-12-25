@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{Result, Context};
 use clap::Parser;
 use eui48::MacAddress;
 use hex;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::str::from_utf8;
 use std::thread;
 use std::time::Duration;
 use tcpip_r::{
@@ -14,7 +15,7 @@ use tcpip_r::{
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-#[command(after_help = "EXAMPLES: ./tcp_server -i d0 -n 172.20.10.100/24 -g 172.20.10.1 -p 300")]
+#[command(after_help = "EXAMPLES: ./tcp_client -i d0 -n 172.20.10.100/24 -g 172.20.10.1 -p 300")]
 struct Args {
     #[arg(long, short = 'i', help = "Interface name, e.g., eth0")]
     iface: String,
@@ -31,10 +32,16 @@ struct Args {
     #[arg(long, short = 'g', help = "Gateway Ipv4 Address, e.g., 172.20.10.1")]
     gateway: Ipv4Addr,
 
-    #[arg(long, short = 'p', help = "Port for this tcp server (0 if assign ephemeral port), e.g., 300", default_value_t  = 0)]
+    #[arg(long, short = 'd', help = "Destination Ipv4 Address, e.g., 172.20.10.1")]
+    dst: Ipv4Addr,
+
+    #[arg(long, short = 'p', help = "Destination port, e.g., 300")]
     port: u16,
 
-    #[arg(long, help = "File to be rcvd")]
+    #[arg(long, help = "Local port, e.g., 300", default_value_t  = 0)]
+    lport: u16,
+
+    #[arg(long, help = "File to send")]
     file: String,
 
     #[arg(long, help = "Buffer size")]
@@ -53,10 +60,9 @@ fn main() -> Result<()> {
     let config = generate_network_config(
         args.iface, args.mac, args.mtu, args.network, args.gateway
     )?;
-    let tcp = TcpListener::new(config)?;
-    tcp.bind(SocketAddrV4::new(args.network.address, args.port))?;
-    let (stream, _addr) = tcp.accept()?;
-    println!("Socket accepted!");
+    let stream = TcpStream::new(config)?;
+    stream.connect_with_bind(SocketAddrV4::new(args.dst, args.port), args.lport)?;
+    println!("Socket connected!");
     let file = File::open(args.file).context("Failed to open test file.")?;
     let mut reader = BufReader::new(file);
     let mut buffer = vec![0u8; args.buf];

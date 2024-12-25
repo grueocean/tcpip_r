@@ -1253,7 +1253,7 @@ impl ReceiveQueue {
 
     pub fn get_current(&self) -> String {
         let complete_str = if self.complete_datagram.payload.is_empty() {
-            "None".to_string()
+            self.complete_datagram.sequence_num.to_string()
         } else {
             format!(
                 "{} (LEN:{})",
@@ -1270,8 +1270,7 @@ impl ReceiveQueue {
             .join(" ");
         format!(
             "QUEUE.LEN={} COMPLETE: {} FRAGMENT: {}",
-            self.queue_length,
-            complete_str,
+            self.queue_length, complete_str,
             if fragments_str.is_empty() { "None".to_string() } else { fragments_str }
         )
     }

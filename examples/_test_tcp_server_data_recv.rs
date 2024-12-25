@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use eui48::MacAddress;
 use hex;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::thread;
@@ -37,9 +37,6 @@ struct Args {
     #[arg(long, help = "File to be rcvd")]
     file: String,
 
-    #[arg(long, help = "Buffer size")]
-    buf: usize,
-
     #[arg(long, help = "Transfer size")]
     size: usize,
 }
@@ -57,24 +54,23 @@ fn main() -> Result<()> {
     tcp.bind(SocketAddrV4::new(args.network.address, args.port))?;
     let (stream, _addr) = tcp.accept()?;
     println!("Socket accepted!");
-    let file = File::open(args.file).context("Failed to open test file.")?;
-    let mut reader = BufReader::new(file);
-    let mut buffer = vec![0u8; args.buf];
     let mut total_bytes: usize = 0;
+    let mut buffer = [0u8; 1024];
+    let mut rcvd_data = Vec::new();
     loop {
-        let bytes_read = reader.read(&mut buffer).context("Failed to read from test file.")?;
-        eprintln!("Write: {}~{}", total_bytes, total_bytes + bytes_read);
+        let bytes_read = stream.read(&mut buffer)?;
         total_bytes += bytes_read;
-        if bytes_read == 0 { break; }
-        loop {
-            if let Err(e) = stream.write(&buffer[..bytes_read]) {
-                eprintln!("Failed to write to stream. Err: {:?}", e);
-                thread::sleep(Duration::from_millis(10));
-            } else {
-                break;
-            }
+        rcvd_data.extend_from_slice(&buffer[..bytes_read]);
+        if bytes_read == 0 || total_bytes == args.size {
+            break;
         }
     }
     stream.shutdown()?;
-    Ok(())
+    let file_data = fs::read(args.file)?;
+    if rcvd_data == file_data {
+        Ok(())
+    } else {
+        eprintln!("Received data is incorrect.");
+        anyhow::bail!("Received data is incorrect.")
+    }
 }

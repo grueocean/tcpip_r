@@ -6,7 +6,6 @@ use std::thread;
 use std::time::Duration;
 use anyhow::{Result, Context};
 use serial_test::serial;
-use rstest::*;
 
 const TCP_CLIENT_PORT: usize = 1200;
 const TCP_SERVER_PORT: usize = 2000;
@@ -19,7 +18,7 @@ const SUBNETMASK: usize = 24;
 const TESTAPP_PATH: &str = "./target/debug/examples/";
 const TESTAPP_TCP_CLIENT_OPEN: &str = "_test_tcp_client_open";
 const TESTAPP_TCP_SERVER_OPEN: &str = "_test_tcp_server_open";
-const TEST_INITIALIZE: u64 = 100; // msec
+const TEST_INITIALIZE: u64 = 50; // msec
 const TEST_TIMEOUT: u64 = 10; // sec
 const CLIENT_CONNECTTED: &str = "Socket connected!";
 const SERVER_ACCEPTED: &str = "Socket accepted!";
@@ -82,7 +81,6 @@ fn test_normal_3way_handshake_server() -> Result<()> {
     let expected_server_stdout = [SERVER_ACCEPTED];
     let env_num: usize = 1;
     setup_env(env_num)?;
-    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut server = Command::new("sudo")
         .arg("ip")
         .arg("netns")
@@ -97,6 +95,7 @@ fn test_normal_3way_handshake_server() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .context(format!("Failed to execute {}.", TESTAPP_TCP_SERVER_OPEN))?;
+    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut client = Command::new("sudo")
         .arg("ip")
         .arg("netns")

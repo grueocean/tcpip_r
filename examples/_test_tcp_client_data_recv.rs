@@ -40,7 +40,7 @@ struct Args {
     #[arg(long, help = "Local port, e.g., 300", default_value_t  = 0)]
     lport: u16,
 
-    #[arg(long, help = "File to send")]
+    #[arg(long, help = "File to be rcvd")]
     file: String,
 
     #[arg(long, help = "Transfer size")]
@@ -75,6 +75,7 @@ fn main() -> Result<()> {
     if rcvd_data == file_data {
         Ok(())
     } else {
+        eprintln!("Received data is incorrect.");
         anyhow::bail!("Received data is incorrect.")
     }
 }
