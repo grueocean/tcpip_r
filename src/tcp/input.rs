@@ -428,7 +428,7 @@ impl TcpStack {
             // If the connection was initiated with a passive OPEN, then return this connection to the LISTEN state and return. rfc9293
             if tcp_packet.flag.contains(TcpFlag::SYN) {
                 if  let Some(parent) = conn.parent_id {
-                    log::debug!("[{}] A Passive open connection (parent={}) is removed because of RST.", conn.print_log_prefix(socket_id), parent);
+                    log::debug!("[{}] A Passive open connection (parent={}) is removed because of SYN.", conn.print_log_prefix(socket_id), parent);
                     conns.remove(&socket_id);
                     let mut listen_queue = self.listen_queue.lock().unwrap();
                     if let Some(queue) = listen_queue.get_mut(&parent) {
@@ -1022,7 +1022,7 @@ impl ReceiveQueue {
         } else if begin <= seq + TCP_RECV_QUEUE_WRAP && seq + TCP_RECV_QUEUE_WRAP <= begin + self.queue_length {
             Ok(seq + TCP_RECV_QUEUE_WRAP)
         } else {
-            anyhow::bail!("Unacceptable sequence number. SEQ: {} QUEUE.BEGIN: {} QUEUE.LENGTH: {}", seq, begin, self.queue_length);
+            anyhow::bail!("Unacceptable sequence number. SEG.SEQ: {} QUEUE.BEGIN: {} QUEUE.CURRENT_LEN: {} QUEUE.LENGTH: {}", seq, begin, self.complete_datagram.payload.len(), self.queue_length);
         }
     }
 
@@ -1036,6 +1036,7 @@ impl ReceiveQueue {
     }
 
     pub fn add(&mut self, seq: usize, payload: &Vec<u8>) -> Result<()> {
+        log::trace!("Adding SEQ={} (LEN: {}) to recv queue {}.", seq, payload.len(), self.get_current());
         anyhow::ensure!(payload.len() > 0, "Cannot add an empty segment.");
         let virtual_seq = self.convert_virtual_sequence_num(seq).context("Failed to add segment, possibly it is out of the receive queue.")?;
         let new_start = virtual_seq;
@@ -1046,7 +1047,7 @@ impl ReceiveQueue {
         let pending_start = max(complete_end + 1, new_start);
         anyhow::ensure!(
             complete_start <= new_start && new_end <= complete_max,
-            "An invalid segment was added. SEG.SEQ={} SEG.LEN = {} QUEUE.BEGIN_SEQ={} QUEUE.MAX_SEQ={}", new_start, payload.len(), complete_start, complete_end
+            "An invalid segment was added. SEG.SEQ={} SEG.LEN={} QUEUE.BEGIN_SEQ={} QUEUE.MAX_SEQ={}", new_start, payload.len(), complete_start, complete_end
         );
         if self.complete_datagram.payload.len() == 0 && complete_start == new_start{
             self.complete_datagram.payload = payload.clone();
@@ -1209,7 +1210,7 @@ impl ReceiveQueue {
             }
         }
         if self.fragmented_datagram.len() == 0 {
-            pending_new.push(ReceiveFragment { sequence_num: new_start, payload: payload.clone() });
+            pending_new.push(ReceiveFragment { sequence_num: pending_start, payload: payload[pending_start-new_start..].to_vec() });
         }
         if let Some(tmp) = tmp_fragment {
             if !complete_marge {
@@ -1248,6 +1249,31 @@ impl ReceiveQueue {
             copy_len, old_begin, new_begin, old_len, self.complete_datagram.payload.len()
         );
         Ok(copy_len)
+    }
+
+    pub fn get_current(&self) -> String {
+        let complete_str = if self.complete_datagram.payload.is_empty() {
+            "None".to_string()
+        } else {
+            format!(
+                "{} (LEN:{})",
+                self.complete_datagram.sequence_num,
+                self.complete_datagram.payload.len()
+            )
+        };
+
+        let fragments_str = self
+            .fragmented_datagram
+            .iter()
+            .map(|frag| format!("{} (LEN:{})", frag.sequence_num, frag.payload.len()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "QUEUE.LEN={} COMPLETE: {} FRAGMENT: {}",
+            self.queue_length,
+            complete_str,
+            if fragments_str.is_empty() { "None".to_string() } else { fragments_str }
+        )
     }
 }
 
@@ -1785,6 +1811,15 @@ mod tcp_tests {
     #[case(
         13,
         vec![9; 2],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![1, 2, 3, 9, 9]
+        },
+        vec![]
+    )]
+    #[case(
+        11,
+        vec![9; 4],
         ReceiveFragment {
             sequence_num: 10,
             payload: vec![1, 2, 3, 9, 9]
