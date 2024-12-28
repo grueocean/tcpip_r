@@ -1,11 +1,13 @@
 mod common;
-use common::{setup_env, cleanup_env, child_wait_with_timeout, check_stdout_pattern, dump_stdout, dump_stderr};
+use anyhow::{Context, Result};
+use common::{
+    check_stdout_pattern, child_wait_with_timeout, cleanup_env, dump_stderr, dump_stdout, setup_env,
+};
+use serial_test::serial;
 use std::ops::Add;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
-use anyhow::{Result, Context};
-use serial_test::serial;
 
 const TCP_CLIENT_PORT: usize = 1200;
 const TCP_SERVER_PORT: usize = 2000;
@@ -37,7 +39,8 @@ fn test_normal_3way_handshake_client() -> Result<()> {
         .arg("exec")
         .arg("Tcpip0")
         .arg("nc")
-        .arg("-l").arg(TCP_SERVER_PORT.to_string())
+        .arg("-l")
+        .arg(TCP_SERVER_PORT.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -48,11 +51,16 @@ fn test_normal_3way_handshake_client() -> Result<()> {
         .arg("exec")
         .arg("Dev0")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_OPEN))
-        .arg("--iface").arg("d0")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--dst").arg(NETWORK_TCPIP0.to_string())
-        .arg("--port").arg(TCP_SERVER_PORT.to_string())
+        .arg("--iface")
+        .arg("d0")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--dst")
+        .arg(NETWORK_TCPIP0.to_string())
+        .arg("--port")
+        .arg(TCP_SERVER_PORT.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -87,10 +95,14 @@ fn test_normal_3way_handshake_server() -> Result<()> {
         .arg("exec")
         .arg("Dev0")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_SERVER_OPEN))
-        .arg("--iface").arg("d0")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--port").arg(TCP_SERVER_PORT.to_string())
+        .arg("--iface")
+        .arg("d0")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--port")
+        .arg(TCP_SERVER_PORT.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -140,10 +152,14 @@ fn test_normal_3way_handshake_both() -> Result<()> {
         .arg("exec")
         .arg("Dev0")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_SERVER_OPEN))
-        .arg("--iface").arg("d0")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--port").arg(TCP_SERVER_PORT.to_string())
+        .arg("--iface")
+        .arg("d0")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--port")
+        .arg(TCP_SERVER_PORT.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -154,21 +170,33 @@ fn test_normal_3way_handshake_both() -> Result<()> {
         .arg("exec")
         .arg("Dev1")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_OPEN))
-        .arg("--iface").arg("d1")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV1, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--dst").arg(NETWORK_DEV0.to_string())
-        .arg("--port").arg(TCP_SERVER_PORT.to_string())
+        .arg("--iface")
+        .arg("d1")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV1, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--dst")
+        .arg(NETWORK_DEV0.to_string())
+        .arg("--port")
+        .arg(TCP_SERVER_PORT.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_OPEN))?;
-    if let Some(server_status) = child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))? {
+    if let Some(server_status) =
+        child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))?
+    {
         println!("server status: {:?}", server_status);
-        if let Some(client_status) = child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT))? {
+        if let Some(client_status) =
+            child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT))?
+        {
             println!("client status: {:?}", client_status);
-            if server_status.success() && check_stdout_pattern(&mut server, &expected_server_stdout)? &&
-                client_status.success() && check_stdout_pattern(&mut client, &expected_client_stdout)? {
+            if server_status.success()
+                && check_stdout_pattern(&mut server, &expected_server_stdout)?
+                && client_status.success()
+                && check_stdout_pattern(&mut client, &expected_client_stdout)?
+            {
                 suc = true;
             }
         }
@@ -198,12 +226,18 @@ fn test_simultaneous_open() -> Result<()> {
         .arg("exec")
         .arg("Dev0")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_OPEN))
-        .arg("--iface").arg("d0")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--dst").arg(NETWORK_DEV1.to_string())
-        .arg("--port").arg(TCP_CLIENT_PORT.add(1).to_string())
-        .arg("--lport").arg(TCP_CLIENT_PORT.to_string())
+        .arg("--iface")
+        .arg("d0")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--dst")
+        .arg(NETWORK_DEV1.to_string())
+        .arg("--port")
+        .arg(TCP_CLIENT_PORT.add(1).to_string())
+        .arg("--lport")
+        .arg(TCP_CLIENT_PORT.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -214,22 +248,34 @@ fn test_simultaneous_open() -> Result<()> {
         .arg("exec")
         .arg("Dev1")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_OPEN))
-        .arg("--iface").arg("d1")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV1, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--dst").arg(NETWORK_DEV0.to_string())
-        .arg("--port").arg(TCP_CLIENT_PORT.to_string())
-        .arg("--lport").arg(TCP_CLIENT_PORT.add(1).to_string())
+        .arg("--iface")
+        .arg("d1")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV1, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--dst")
+        .arg(NETWORK_DEV0.to_string())
+        .arg("--port")
+        .arg(TCP_CLIENT_PORT.to_string())
+        .arg("--lport")
+        .arg(TCP_CLIENT_PORT.add(1).to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_OPEN))?;
-    if let Some(status1) = child_wait_with_timeout(&mut client1, Duration::from_secs(TEST_TIMEOUT))? {
+    if let Some(status1) = child_wait_with_timeout(&mut client1, Duration::from_secs(TEST_TIMEOUT))?
+    {
         println!("client1 status: {:?}", status1);
-        if let Some(status2) = child_wait_with_timeout(&mut client2, Duration::from_secs(TEST_TIMEOUT))? {
+        if let Some(status2) =
+            child_wait_with_timeout(&mut client2, Duration::from_secs(TEST_TIMEOUT))?
+        {
             println!("client2 status: {:?}", status1);
-            if status1.success() && check_stdout_pattern(&mut client1, &expected_stdout)? &&
-                status2.success() && check_stdout_pattern(&mut client2, &expected_stdout)? {
+            if status1.success()
+                && check_stdout_pattern(&mut client1, &expected_stdout)?
+                && status2.success()
+                && check_stdout_pattern(&mut client2, &expected_stdout)?
+            {
                 suc = true;
             }
         }

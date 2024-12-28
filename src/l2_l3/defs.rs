@@ -1,5 +1,5 @@
-use thiserror::Error;
 use std::net::Ipv4Addr;
+use thiserror::Error;
 
 // https://www.iana.org/assignments/ieee-802-numbers/ieee-802-numbers.xhtml
 #[derive(Debug, PartialEq)]
@@ -8,7 +8,7 @@ pub enum EtherType {
     IPv4 = 0x0800,
     ARP = 0x0806,
     Reserved = 0xffff,
-    Unknown
+    Unknown,
 }
 
 impl From<u16> for EtherType {
@@ -17,7 +17,7 @@ impl From<u16> for EtherType {
             v if v == EtherType::IPv4 as u16 => EtherType::IPv4,
             v if v == EtherType::ARP as u16 => EtherType::ARP,
             v if v == EtherType::Reserved as u16 => EtherType::Reserved,
-            _ => EtherType::Unknown
+            _ => EtherType::Unknown,
         }
     }
 }
@@ -36,7 +36,7 @@ pub enum Ipv4Type {
     TCP = 0x6,
     UDP = 0x11,
     Reserved = 0xff,
-    Unknown
+    Unknown,
 }
 
 impl From<u8> for Ipv4Type {
@@ -46,7 +46,7 @@ impl From<u8> for Ipv4Type {
             v if v == Ipv4Type::TCP as u8 => Ipv4Type::TCP,
             v if v == Ipv4Type::UDP as u8 => Ipv4Type::UDP,
             v if v == Ipv4Type::Reserved as u8 => Ipv4Type::Reserved,
-            _ => Ipv4Type::Unknown
+            _ => Ipv4Type::Unknown,
         }
     }
 }
@@ -60,15 +60,12 @@ impl From<Ipv4Type> for u8 {
 #[derive(Error, Debug)]
 pub enum L2Error {
     #[error("Failed to resolve IP {target_ip} after {retries} attempts.")]
-    ResolveError {
-        target_ip: Ipv4Addr,
-        retries: usize,
-    },
+    ResolveError { target_ip: Ipv4Addr, retries: usize },
     #[error("No gateway address specified. Packet dst is {target_ip} out of l2 network range which is {l2_ip}/{l2_netmask}.")]
     NoGatewayError {
         target_ip: Ipv4Addr,
         l2_ip: Ipv4Addr,
-        l2_netmask: usize
+        l2_netmask: usize,
     },
 }
 
@@ -78,14 +75,10 @@ pub enum L3Error {
     AddressError {
         target_ip: Ipv4Addr,
         l2_ip: Ipv4Addr,
-        l2_netmask: usize
+        l2_netmask: usize,
     },
     #[error("Destination {target_ip} within local network is unreachable.")]
-    LocalUnreachableError {
-        target_ip: Ipv4Addr
-    },
+    LocalUnreachableError { target_ip: Ipv4Addr },
     #[error("Gateway {target_ip} is unreachable.")]
-    GatewayUnreachableError {
-        target_ip: Ipv4Addr
-    },
+    GatewayUnreachableError { target_ip: Ipv4Addr },
 }

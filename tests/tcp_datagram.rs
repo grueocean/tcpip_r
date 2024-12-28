@@ -1,12 +1,15 @@
 mod common;
-use common::{check_stdout_pattern, child_wait_with_timeout, cleanup_env, clear_drop, dump_stderr, insert_drop, setup_env};
+use anyhow::{Context, Result};
+use common::{
+    check_stdout_pattern, child_wait_with_timeout, cleanup_env, clear_drop, dump_stderr,
+    insert_drop, setup_env,
+};
+use rstest::*;
+use serial_test::serial;
 use std::ops::Add;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
-use anyhow::{Result, Context};
-use serial_test::serial;
-use rstest::*;
 
 const TCP_CLIENT_PORT: usize = 1200;
 const TCP_SERVER_PORT: usize = 2000;
@@ -40,13 +43,20 @@ fn test_normal_datagram_server_to_client(
     #[case] buffer_size: usize,
     #[case] transfer_size: usize,
 ) -> Result<()> {
-    println!("FILENAME: {} BUF_SIZE: {} SIZE: {}", file_name, buffer_size, transfer_size);
+    println!(
+        "FILENAME: {} BUF_SIZE: {} SIZE: {}",
+        file_name, buffer_size, transfer_size
+    );
     pub struct TestResult {
         connect: bool,
         server: bool,
         client: bool,
     }
-    let mut result = TestResult { connect: false, server: false, client: false };
+    let mut result = TestResult {
+        connect: false,
+        server: false,
+        client: false,
+    };
     let expected_server_stdout = [SERVER_ACCEPTED];
     let expected_client_stdout = [CLIENT_CONNECTTED];
     let env_num: usize = 1;
@@ -58,37 +68,61 @@ fn test_normal_datagram_server_to_client(
         .arg("exec")
         .arg("Dev0")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_SERVER_DATA_SEND))
-        .arg("--iface").arg("d0")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--port").arg(TCP_SERVER_PORT.to_string())
-        .arg("--file").arg(format!("{}{}", TEST_DATA_DIR, file_name))
-        .arg("--buf").arg(buffer_size.to_string())
-        .arg("--size").arg(transfer_size.to_string())
+        .arg("--iface")
+        .arg("d0")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--port")
+        .arg(TCP_SERVER_PORT.to_string())
+        .arg("--file")
+        .arg(format!("{}{}", TEST_DATA_DIR, file_name))
+        .arg("--buf")
+        .arg(buffer_size.to_string())
+        .arg("--size")
+        .arg(transfer_size.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_SERVER_DATA_SEND))?;
+        .context(format!(
+            "Failed to execute {}.",
+            TESTAPP_TCP_SERVER_DATA_SEND
+        ))?;
     let mut client = Command::new("sudo")
         .arg("ip")
         .arg("netns")
         .arg("exec")
         .arg("Dev1")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_DATA_RECV))
-        .arg("--iface").arg("d1")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV1, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--dst").arg(NETWORK_DEV0.to_string())
-        .arg("--port").arg(TCP_SERVER_PORT.to_string())
-        .arg("--file").arg(format!("{}{}", TEST_DATA_DIR, file_name))
-        .arg("--size").arg(transfer_size.to_string())
+        .arg("--iface")
+        .arg("d1")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV1, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--dst")
+        .arg(NETWORK_DEV0.to_string())
+        .arg("--port")
+        .arg(TCP_SERVER_PORT.to_string())
+        .arg("--file")
+        .arg(format!("{}{}", TEST_DATA_DIR, file_name))
+        .arg("--size")
+        .arg(transfer_size.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_DATA_RECV))?;
-    if let Some(server_status) = child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))? {
+        .context(format!(
+            "Failed to execute {}.",
+            TESTAPP_TCP_CLIENT_DATA_RECV
+        ))?;
+    if let Some(server_status) =
+        child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))?
+    {
         println!("server status: {:?}", server_status);
-        if let Some(client_status) = child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT))? {
+        if let Some(client_status) =
+            child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT))?
+        {
             println!("client status: {:?}", client_status);
             result.server = server_status.success();
             result.client = client_status.success();
@@ -98,10 +132,12 @@ fn test_normal_datagram_server_to_client(
     server.wait()?;
     client.kill()?;
     client.wait()?;
-    if check_stdout_pattern(&mut server, &expected_server_stdout)? && check_stdout_pattern(&mut client, &expected_client_stdout)? {
+    if check_stdout_pattern(&mut server, &expected_server_stdout)?
+        && check_stdout_pattern(&mut client, &expected_client_stdout)?
+    {
         result.connect = true;
     }
-dump_stderr(&mut server)?;
+    dump_stderr(&mut server)?;
     dump_stderr(&mut client)?;
     cleanup_env(env_num)?;
     assert!(result.connect, "Failed to establish connection.");
@@ -123,13 +159,20 @@ fn test_normal_datagram_client_to_server(
     #[case] buffer_size: usize,
     #[case] transfer_size: usize,
 ) -> Result<()> {
-    println!("FILENAME: {} BUF_SIZE: {} SIZE: {}", file_name, buffer_size, transfer_size);
+    println!(
+        "FILENAME: {} BUF_SIZE: {} SIZE: {}",
+        file_name, buffer_size, transfer_size
+    );
     pub struct TestResult {
         connect: bool,
         server: bool,
         client: bool,
     }
-    let mut result = TestResult { connect: false, server: false, client: false };
+    let mut result = TestResult {
+        connect: false,
+        server: false,
+        client: false,
+    };
     let expected_server_stdout = [SERVER_ACCEPTED];
     let expected_client_stdout = [CLIENT_CONNECTTED];
     let env_num: usize = 1;
@@ -141,37 +184,61 @@ fn test_normal_datagram_client_to_server(
         .arg("exec")
         .arg("Dev0")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_SERVER_DATA_RECV))
-        .arg("--iface").arg("d0")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--port").arg(TCP_SERVER_PORT.to_string())
-        .arg("--file").arg(format!("{}{}", TEST_DATA_DIR, file_name))
-        .arg("--size").arg(transfer_size.to_string())
+        .arg("--iface")
+        .arg("d0")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--port")
+        .arg(TCP_SERVER_PORT.to_string())
+        .arg("--file")
+        .arg(format!("{}{}", TEST_DATA_DIR, file_name))
+        .arg("--size")
+        .arg(transfer_size.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_SERVER_DATA_SEND))?;
+        .context(format!(
+            "Failed to execute {}.",
+            TESTAPP_TCP_SERVER_DATA_SEND
+        ))?;
     let mut client = Command::new("sudo")
         .arg("ip")
         .arg("netns")
         .arg("exec")
         .arg("Dev1")
         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_DATA_SEND))
-        .arg("--iface").arg("d1")
-        .arg("--network").arg(format!("{}/{}", NETWORK_DEV1, SUBNETMASK))
-        .arg("--gateway").arg(GATEWAY.to_string())
-        .arg("--dst").arg(NETWORK_DEV0.to_string())
-        .arg("--port").arg(TCP_SERVER_PORT.to_string())
-        .arg("--file").arg(format!("{}{}", TEST_DATA_DIR, file_name))
-        .arg("--buf").arg(buffer_size.to_string())
-        .arg("--size").arg(transfer_size.to_string())
+        .arg("--iface")
+        .arg("d1")
+        .arg("--network")
+        .arg(format!("{}/{}", NETWORK_DEV1, SUBNETMASK))
+        .arg("--gateway")
+        .arg(GATEWAY.to_string())
+        .arg("--dst")
+        .arg(NETWORK_DEV0.to_string())
+        .arg("--port")
+        .arg(TCP_SERVER_PORT.to_string())
+        .arg("--file")
+        .arg(format!("{}{}", TEST_DATA_DIR, file_name))
+        .arg("--buf")
+        .arg(buffer_size.to_string())
+        .arg("--size")
+        .arg(transfer_size.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_DATA_RECV))?;
-    if let Some(server_status) = child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))? {
+        .context(format!(
+            "Failed to execute {}.",
+            TESTAPP_TCP_CLIENT_DATA_RECV
+        ))?;
+    if let Some(server_status) =
+        child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))?
+    {
         println!("server status: {:?}", server_status);
-        if let Some(client_status) = child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT))? {
+        if let Some(client_status) =
+            child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT))?
+        {
             println!("client status: {:?}", client_status);
             result.server = server_status.success();
             result.client = client_status.success();
@@ -181,7 +248,9 @@ fn test_normal_datagram_client_to_server(
     server.wait()?;
     client.kill()?;
     client.wait()?;
-    if check_stdout_pattern(&mut server, &expected_server_stdout)? && check_stdout_pattern(&mut client, &expected_client_stdout)? {
+    if check_stdout_pattern(&mut server, &expected_server_stdout)?
+        && check_stdout_pattern(&mut client, &expected_client_stdout)?
+    {
         result.connect = true;
     }
     dump_stderr(&mut server)?;

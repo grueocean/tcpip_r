@@ -1,20 +1,30 @@
 use crate::{
-    l2_l3::{defs::Ipv4Type, ip::{get_global_l3stack, Ipv4Packet, L3Stack, NetworkConfiguration}},
+    l2_l3::{
+        defs::Ipv4Type,
+        ip::{get_global_l3stack, Ipv4Packet, L3Stack, NetworkConfiguration},
+    },
     tcp::{
-        self, defs::{TcpError, TcpStatus},  packet::{TcpFlag,TcpPacket, TCP_DEFAULT_WINDOW_SCALE},
-        input::{TcpConnection, ListenQueue, TcpEvent, TcpEventType},
-        output, timer::{TcpTimer, update_retransmission_param, TCP_SRTT_SHIFT, TCP_RTTVAR_SHIFT}
-    }
+        self,
+        defs::{TcpError, TcpStatus},
+        input::{ListenQueue, TcpConnection, TcpEvent, TcpEventType},
+        output,
+        packet::{TcpFlag, TcpPacket, TCP_DEFAULT_WINDOW_SCALE},
+        timer::{update_retransmission_param, TcpTimer, TCP_RTTVAR_SHIFT, TCP_SRTT_SHIFT},
+    },
 };
 use anyhow::{Context, Result};
 use log;
-use std::{cmp::{max, min}, collections::{HashMap, VecDeque}, sync::MutexGuard, time::Duration};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::ops::Range;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc::channel};
+use std::sync::{mpsc::channel, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Instant};
-
+use std::time::Instant;
+use std::{
+    cmp::{max, min},
+    collections::{HashMap, VecDeque},
+    sync::MutexGuard,
+    time::Duration,
+};
 
 pub const TCP_MAX_SOCKET: usize = 100;
 // "the Dynamic Ports, also known as the Private or Ephemeral Ports, from 49152-65535 (never assigned)" rfc6335
@@ -31,7 +41,7 @@ pub struct TcpStack {
     pub connections: Mutex<HashMap<usize, Option<TcpConnection>>>,
     pub listen_queue: Mutex<HashMap<usize, ListenQueue>>,
     pub threads: Mutex<Vec<JoinHandle<()>>>,
-    event_condvar: (Mutex<TcpEvent>, Condvar)
+    event_condvar: (Mutex<TcpEvent>, Condvar),
 }
 
 impl TcpStack {
@@ -41,7 +51,13 @@ impl TcpStack {
             connections: Mutex::new(HashMap::new()),
             listen_queue: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
-            event_condvar: (Mutex::new(TcpEvent {socket_id: 0, event: TcpEventType::InitialState}), Condvar::new())
+            event_condvar: (
+                Mutex::new(TcpEvent {
+                    socket_id: 0,
+                    event: TcpEventType::InitialState,
+                }),
+                Condvar::new(),
+            ),
         });
 
         let tcp_recv = tcp.clone();
@@ -70,7 +86,10 @@ impl TcpStack {
                 return Ok(id);
             }
         }
-        anyhow::bail!("Failed to generate a new tcp socket because no available id. TCP_MAX_SOCKET={}", TCP_MAX_SOCKET)
+        anyhow::bail!(
+            "Failed to generate a new tcp socket because no available id. TCP_MAX_SOCKET={}",
+            TCP_MAX_SOCKET
+        )
     }
 
     pub fn release_socket(&self, socket_id: usize) -> Result<()> {
@@ -89,35 +108,52 @@ impl TcpStack {
 
     pub fn bind(&self, socket_id: usize, addr: SocketAddrV4) -> Result<()> {
         let mut conns = self.connections.lock().unwrap();
-        let used_ports: Vec<u16> = conns.values()
+        let used_ports: Vec<u16> = conns
+            .values()
             .filter_map(|conn| conn.as_ref().map(|c| c.local_port))
             .collect();
         if let Some(conn_wrap) = conns.get_mut(&socket_id) {
             if let Some(conn) = conn_wrap {
-                anyhow::bail!("Tcp socket (id={}) has already bound to {}:{}.", socket_id, conn.src_addr, conn.local_port);
+                anyhow::bail!(
+                    "Tcp socket (id={}) has already bound to {}:{}.",
+                    socket_id,
+                    conn.src_addr,
+                    conn.local_port
+                );
             } else {
                 // assign ephemeral port
                 if addr.port() == 0 {
                     for port in TCP_EPHEMERAL_PORT_RANGE {
                         if !used_ports.contains(&port) {
-                            let new_conn = TcpConnection::new(
-                                *addr.ip(), port, Ipv4Addr::UNSPECIFIED, 0
-                            );
+                            let new_conn =
+                                TcpConnection::new(*addr.ip(), port, Ipv4Addr::UNSPECIFIED, 0);
                             conns.insert(socket_id, Some(new_conn));
-                            log::info!("Tcp socket (id={}) bind to the ephemeral port {}:{}.", socket_id, *addr.ip(), port);
+                            log::info!(
+                                "Tcp socket (id={}) bind to the ephemeral port {}:{}.",
+                                socket_id,
+                                *addr.ip(),
+                                port
+                            );
                             return Ok(());
                         }
                     }
                     anyhow::bail!("Failed to bind tcp socket. No available ephemeral port.");
                 } else {
                     if !used_ports.contains(&addr.port()) {
-                        let new_conn = TcpConnection::new(
-                            *addr.ip(), addr.port(), Ipv4Addr::UNSPECIFIED, 0
-                        );
+                        let new_conn =
+                            TcpConnection::new(*addr.ip(), addr.port(), Ipv4Addr::UNSPECIFIED, 0);
                         conns.insert(socket_id, Some(new_conn));
-                        log::info!("Tcp socket (id={}) bind to the specified port {}:{}.", socket_id, *addr.ip(), addr.port());
+                        log::info!(
+                            "Tcp socket (id={}) bind to the specified port {}:{}.",
+                            socket_id,
+                            *addr.ip(),
+                            addr.port()
+                        );
                     } else {
-                        anyhow::bail!("Failed to bind tcp socket. Port {} is already used.", addr.port());
+                        anyhow::bail!(
+                            "Failed to bind tcp socket. Port {} is already used.",
+                            addr.port()
+                        );
                     }
                 }
                 Ok(())
@@ -136,17 +172,25 @@ impl TcpStack {
                 listen_queue.insert(
                     socket_id,
                     ListenQueue {
-                        pending: VecDeque::new(), pending_acked: VecDeque::new(),
-                        established_unconsumed: VecDeque::new(), established_consumed: VecDeque::new(),
-                        accepted: 0
-                    }
+                        pending: VecDeque::new(),
+                        pending_acked: VecDeque::new(),
+                        established_unconsumed: VecDeque::new(),
+                        established_consumed: VecDeque::new(),
+                        accepted: 0,
+                    },
                 );
                 Ok(())
             } else {
-                anyhow::bail!("Only a Closed socket can transit to Listen. Current: {}", conn.status);
+                anyhow::bail!(
+                    "Only a Closed socket can transit to Listen. Current: {}",
+                    conn.status
+                );
             }
         } else {
-            anyhow::bail!("Cannot listen Socket (id={}) which is not bound.", socket_id);
+            anyhow::bail!(
+                "Cannot listen Socket (id={}) which is not bound.",
+                socket_id
+            );
         }
     }
 
@@ -159,7 +203,10 @@ impl TcpStack {
                     queue.accepted += 1;
                     if let Some(id) = queue.established_unconsumed.pop_front() {
                         if let Some(Some(conn_est)) = conns.get(&id) {
-                            return Ok((id, SocketAddrV4::new(conn_est.dst_addr, conn_est.remote_port)));
+                            return Ok((
+                                id,
+                                SocketAddrV4::new(conn_est.dst_addr, conn_est.remote_port),
+                            ));
                         } else {
                             log::error!("An Established connection (id={}) dose not exist in TcpConnections", id);
                         }
@@ -177,8 +224,15 @@ impl TcpStack {
                             if let Some(Some(conn)) = conns.get(&established_id) {
                                 queue.established_consumed.push_back(established_id);
                                 queue.accepted -= 1;
-                                log::info!("An Established socket (id={} {}) is conusmed by accept call.", established_id, conn.print_address());
-                                return Ok((established_id, SocketAddrV4::new(conn.dst_addr, conn.remote_port)));
+                                log::info!(
+                                    "An Established socket (id={} {}) is conusmed by accept call.",
+                                    established_id,
+                                    conn.print_address()
+                                );
+                                return Ok((
+                                    established_id,
+                                    SocketAddrV4::new(conn.dst_addr, conn.remote_port),
+                                ));
                             } else {
                                 log::error!("An Established connection (id={}) dose not exist in TcpConnections", established_id);
                                 continue;
@@ -188,7 +242,9 @@ impl TcpStack {
                         if let Some(syn_recv_id) = queue.pending.pop_front() {
                             // reply syn-ack
                             if let Some(Some(conn)) = conns.get_mut(&syn_recv_id) {
-                                if conn.status != TcpStatus::SynRcvd { continue; }
+                                if conn.status != TcpStatus::SynRcvd {
+                                    continue;
+                                }
                                 let mut syn_ack = TcpPacket::new_syn_rcvd(conn)?;
                                 syn_ack.option.mss = Some((self.config.mtu - 40) as u16);
                                 if let Err(e) = self.send_tcp_packet(syn_ack) {
@@ -210,26 +266,44 @@ impl TcpStack {
                                 // Current TcpStatus is SynRcvd
                                 if let (_valid, Some(event)) = self.wait_events_with_timeout(
                                     vec![
-                                        TcpEvent { socket_id: syn_recv_id, event: TcpEventType::Established },
-                                        TcpEvent { socket_id: syn_recv_id, event: TcpEventType::Refused },
-                                        TcpEvent { socket_id: syn_recv_id, event: TcpEventType::Closed }
+                                        TcpEvent {
+                                            socket_id: syn_recv_id,
+                                            event: TcpEventType::Established,
+                                        },
+                                        TcpEvent {
+                                            socket_id: syn_recv_id,
+                                            event: TcpEventType::Refused,
+                                        },
+                                        TcpEvent {
+                                            socket_id: syn_recv_id,
+                                            event: TcpEventType::Closed,
+                                        },
                                     ],
-                                    Duration::from_millis(100)
+                                    Duration::from_millis(100),
                                 ) {
                                     match event.event {
                                         TcpEventType::Established => {
                                             // event received, expected that syn_recv_id's state is established.
                                             let mut conns = self.connections.lock().unwrap();
-                                            let mut listen_queue = self.listen_queue.lock().unwrap();
+                                            let mut listen_queue =
+                                                self.listen_queue.lock().unwrap();
                                             if let (Some(Some(conn)), Some(queue)) = (
                                                 conns.get_mut(&syn_recv_id),
-                                                listen_queue.get_mut(&socket_id)
+                                                listen_queue.get_mut(&socket_id),
                                             ) {
                                                 if conn.status == TcpStatus::Established {
-                                                    queue.established_consumed.push_back(syn_recv_id);
+                                                    queue
+                                                        .established_consumed
+                                                        .push_back(syn_recv_id);
                                                     queue.accepted -= 1;
                                                     log::info!("Accepted socket (id={}) connection established. {}", syn_recv_id, conn.print_address());
-                                                    return Ok((syn_recv_id, SocketAddrV4::new(conn.dst_addr, conn.remote_port)));
+                                                    return Ok((
+                                                        syn_recv_id,
+                                                        SocketAddrV4::new(
+                                                            conn.dst_addr,
+                                                            conn.remote_port,
+                                                        ),
+                                                    ));
                                                 } else {
                                                     break;
                                                 }
@@ -253,7 +327,9 @@ impl TcpStack {
                                     // timeout occured
                                     let mut conns = self.connections.lock().unwrap();
                                     if let Some(Some(conn)) = conns.get_mut(&syn_recv_id) {
-                                        if conn.status == TcpStatus::SynRcvd { continue; }
+                                        if conn.status == TcpStatus::SynRcvd {
+                                            continue;
+                                        }
                                     }
                                     // SYN-RECIEVED socket may be removed in a situation like "Recovery from Old Duplicate SYN".
                                     // In that case, we come to here and start from outer loop again
@@ -266,8 +342,11 @@ impl TcpStack {
                             drop(listen_queue);
                             loop {
                                 if self.wait_event_with_timeout(
-                                    TcpEvent { socket_id: socket_id, event: TcpEventType::SynReceived },
-                                    Duration::from_millis(100)
+                                    TcpEvent {
+                                        socket_id: socket_id,
+                                        event: TcpEventType::SynReceived,
+                                    },
+                                    Duration::from_millis(100),
                                 ) {
                                     log::debug!("Wake up that accepted LISTEN socket (id={}) spawn SYN-RECEIVED client socket.", socket_id);
                                     break;
@@ -287,10 +366,16 @@ impl TcpStack {
                     }
                 }
             } else {
-                anyhow::bail!("Cannot accept a socket which status is not Listen. Current: {}", conn.status);
+                anyhow::bail!(
+                    "Cannot accept a socket which status is not Listen. Current: {}",
+                    conn.status
+                );
             }
         } else {
-            anyhow::bail!("Cannot accept the socket (id={}) which is not bound.", socket_id);
+            anyhow::bail!(
+                "Cannot accept the socket (id={}) which is not bound.",
+                socket_id
+            );
         }
     }
 
@@ -311,7 +396,11 @@ impl TcpStack {
                 log::warn!("Failed to send SYN. (1st time) Err: {:?}", e);
             }
             conn.timer.retransmission.fire_syn();
-            log::debug!("[{}] Status changed from CLOSED to SYN-SENT. ISS={}.", conn.print_log_prefix(socket_id), seq);
+            log::debug!(
+                "[{}] Status changed from CLOSED to SYN-SENT. ISS={}.",
+                conn.print_log_prefix(socket_id),
+                seq
+            );
         } else {
             anyhow::bail!("Socket (id={}) is not bound.", socket_id);
         }
@@ -319,11 +408,20 @@ impl TcpStack {
         loop {
             if let (_valid, Some(event)) = self.wait_events_with_timeout(
                 vec![
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::Established },
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::Refused },
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::Closed }
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::Established,
+                    },
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::Refused,
+                    },
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::Closed,
+                    },
                 ],
-                Duration::from_millis(100)
+                Duration::from_millis(100),
             ) {
                 match event.event {
                     TcpEventType::Established => {
@@ -339,13 +437,22 @@ impl TcpStack {
                         }
                     }
                     TcpEventType::Refused => {
-                        anyhow::bail!(TcpError::RefusedError { id: socket_id, addr: addr })
+                        anyhow::bail!(TcpError::RefusedError {
+                            id: socket_id,
+                            addr: addr
+                        })
                     }
                     TcpEventType::Closed => {
-                        anyhow::bail!(TcpError::ClosedError { id: socket_id, addr: addr })
+                        anyhow::bail!(TcpError::ClosedError {
+                            id: socket_id,
+                            addr: addr
+                        })
                     }
                     other => {
-                        anyhow::bail!("Wake up from unexpected event ({:?}). Expected Established/Refused.", other);
+                        anyhow::bail!(
+                            "Wake up from unexpected event ({:?}). Expected Established/Refused.",
+                            other
+                        );
                     }
                 }
             // timeout occured, so wait again
@@ -355,39 +462,48 @@ impl TcpStack {
         }
     }
 
-    pub fn write(
-        &self,
-        socket_id: usize,
-        payload: &[u8]
-    ) -> Result<usize> {
+    pub fn write(&self, socket_id: usize, payload: &[u8]) -> Result<usize> {
         let mut current_offset: usize = 0;
         let payload_len = payload.len();
         log::trace!("WRITE CALL: id={} len={}", socket_id, payload_len);
         loop {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-                let current_queue_free = conn.send_queue.queue_length - conn.send_queue.payload.len();
+                let current_queue_free =
+                    conn.send_queue.queue_length - conn.send_queue.payload.len();
                 let remain = payload_len - current_offset;
                 if remain <= current_queue_free {
-                    conn.send_queue.payload.extend_from_slice(&payload[current_offset..]);
+                    conn.send_queue
+                        .payload
+                        .extend_from_slice(&payload[current_offset..]);
                     current_offset = payload_len;
                     log::trace!(
                         "[{}] Wrote {} bytes to send queue. SND.UNA={} CURRENT_QUEUE_LENGTH={}",
-                        conn.print_log_prefix(socket_id), remain, conn.send_vars.unacknowledged, conn.send_queue.payload.len()
+                        conn.print_log_prefix(socket_id),
+                        remain,
+                        conn.send_vars.unacknowledged,
+                        conn.send_queue.payload.len()
                     );
                 } else {
-                    conn.send_queue.payload.extend_from_slice(&payload[current_offset..(current_offset+current_queue_free)]);
+                    conn.send_queue.payload.extend_from_slice(
+                        &payload[current_offset..(current_offset + current_queue_free)],
+                    );
                     current_offset += current_queue_free;
                     log::trace!(
                         "[{}] Wrote {} bytes to send queue. SND.UNA={} CURRENT_QUEUE_LENGTH={}",
-                        conn.print_log_prefix(socket_id), current_queue_free, conn.send_vars.unacknowledged, conn.send_queue.payload.len()
+                        conn.print_log_prefix(socket_id),
+                        current_queue_free,
+                        conn.send_vars.unacknowledged,
+                        conn.send_queue.payload.len()
                     );
-                 }
+                }
                 if let Err(e) = self.send_handler(conn) {
                     log::warn!("Failed to send a datagram. Err: {e:?}");
                 }
                 if current_offset == payload_len {
-                    if !conn.timer.retransmission.timer_param.active && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num {
+                    if !conn.timer.retransmission.timer_param.active
+                        && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num
+                    {
                         conn.timer.retransmission.fire_datagram();
                     }
                     return Ok(current_offset);
@@ -398,11 +514,20 @@ impl TcpStack {
             drop(conns);
             if let (_valid, Some(event)) = self.wait_events_with_timeout(
                 vec![
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::SendMore },
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::Refused },
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::Closed }
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::SendMore,
+                    },
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::Refused,
+                    },
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::Closed,
+                    },
                 ],
-                Duration::from_millis(100)
+                Duration::from_millis(100),
             ) {
                 match event.event {
                     TcpEventType::SendMore => {
@@ -422,11 +547,7 @@ impl TcpStack {
         }
     }
 
-    pub fn read(
-        &self,
-        socket_id: usize,
-        payload: &mut [u8]
-    ) -> Result<usize> {
+    pub fn read(&self, socket_id: usize, payload: &mut [u8]) -> Result<usize> {
         log::trace!("READ CALL: id={}", socket_id);
         loop {
             let mut conns = self.connections.lock().unwrap();
@@ -434,7 +555,8 @@ impl TcpStack {
                 if conn.recv_queue.complete_datagram.payload.len() != 0 {
                     let read_size = conn.recv_queue.read(payload)?;
                     if read_size != 0 {
-                        conn.recv_vars.window_size = conn.recv_queue.queue_length - conn.recv_queue.complete_datagram.payload.len();
+                        conn.recv_vars.window_size = conn.recv_queue.queue_length
+                            - conn.recv_queue.complete_datagram.payload.len();
                         return Ok(read_size);
                     }
                 }
@@ -444,11 +566,20 @@ impl TcpStack {
             drop(conns);
             if let (_valid, Some(event)) = self.wait_events_with_timeout(
                 vec![
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::DatagramReceived },
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::Refused },
-                    TcpEvent { socket_id: socket_id, event: TcpEventType::Closed }
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::DatagramReceived,
+                    },
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::Refused,
+                    },
+                    TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::Closed,
+                    },
                 ],
-                Duration::from_millis(100)
+                Duration::from_millis(100),
             ) {
                 match event.event {
                     TcpEventType::DatagramReceived => {
@@ -474,7 +605,9 @@ impl TcpStack {
         loop {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-                if conn.send_queue.payload.len() == 0 && conn.recv_vars.next_sequence_num == conn.last_snd_ack {
+                if conn.send_queue.payload.len() == 0
+                    && conn.recv_vars.next_sequence_num == conn.last_snd_ack
+                {
                     break;
                 }
             } else {
@@ -492,7 +625,10 @@ impl TcpStack {
         dst_addr: &Ipv4Addr,
         local_port: &u16,
         remote_port: &u16,
-    ) -> Result<(Option<usize>, MutexGuard<HashMap<usize, Option<TcpConnection>>>)> {
+    ) -> Result<(
+        Option<usize>,
+        MutexGuard<HashMap<usize, Option<TcpConnection>>>,
+    )> {
         let conns = self.connections.lock().unwrap();
         let mut listen_ids = Vec::new();
         let mut ids = Vec::new();
@@ -517,10 +653,19 @@ impl TcpStack {
                 last_snd_ack: _last_snd_ack,
                 send_flag: _send_flag,
                 conn_flag: _conn_flag,
-            }) = connection_info {
-                if s_addr == dst_addr && d_addr == src_addr && l_port == remote_port && r_port == local_port {
+            }) = connection_info
+            {
+                if s_addr == dst_addr
+                    && d_addr == src_addr
+                    && l_port == remote_port
+                    && r_port == local_port
+                {
                     ids.push(*id);
-                } else if s_addr == dst_addr && *d_addr == Ipv4Addr::UNSPECIFIED && l_port == remote_port && *r_port == 0 {
+                } else if s_addr == dst_addr
+                    && *d_addr == Ipv4Addr::UNSPECIFIED
+                    && l_port == remote_port
+                    && *r_port == 0
+                {
                     listen_ids.push(*id);
                 } else {
                     continue;
@@ -528,7 +673,13 @@ impl TcpStack {
             }
         }
         if listen_ids.len() == 0 && ids.len() == 0 {
-            log::debug!("There is no tcp socket for the packet (src={}:{} dst={}:{}).", src_addr, local_port, dst_addr, remote_port);
+            log::debug!(
+                "There is no tcp socket for the packet (src={}:{} dst={}:{}).",
+                src_addr,
+                local_port,
+                dst_addr,
+                remote_port
+            );
             Ok((None, conns))
         } else if (listen_ids.len() == 1 || listen_ids.len() == 0) && ids.len() == 1 {
             Ok((ids.pop(), conns))
@@ -537,7 +688,10 @@ impl TcpStack {
         } else {
             log::error!(
                 "Panic because duplicate socket detected. src={}:{} dst={}:{}",
-                dst_addr, remote_port, src_addr, local_port
+                dst_addr,
+                remote_port,
+                src_addr,
+                local_port
             );
             panic!();
         }
@@ -549,7 +703,10 @@ impl TcpStack {
         let mut event = lock.lock().unwrap();
         loop {
             if *event == wait_event {
-                *event = TcpEvent { socket_id: 0, event: TcpEventType::InitialState };
+                *event = TcpEvent {
+                    socket_id: 0,
+                    event: TcpEventType::InitialState,
+                };
                 return true;
             }
             let elapsed = start_time.elapsed();
@@ -565,14 +722,21 @@ impl TcpStack {
         }
     }
 
-    fn wait_events_with_timeout(&self, wait_events: Vec<TcpEvent>, timeout: Duration) -> (bool, Option<TcpEvent>) {
+    fn wait_events_with_timeout(
+        &self,
+        wait_events: Vec<TcpEvent>,
+        timeout: Duration,
+    ) -> (bool, Option<TcpEvent>) {
         let (lock, condvar) = &self.event_condvar;
         let start_time = Instant::now();
         let mut event = lock.lock().unwrap();
         loop {
             if wait_events.contains(&event) {
                 let ret_event = Some(event.clone());
-                *event = TcpEvent { socket_id: 0, event: TcpEventType::InitialState };
+                *event = TcpEvent {
+                    socket_id: 0,
+                    event: TcpEventType::InitialState,
+                };
                 return (true, ret_event);
             }
             let elapsed = start_time.elapsed();

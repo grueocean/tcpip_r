@@ -1,13 +1,13 @@
-use crate::l2_l3::ip::{Ipv4Packet, NetworkConfiguration, L3Stack, get_global_l3stack};
-use crate::l2_l3::defs::{Ipv4Type};
+use crate::l2_l3::defs::Ipv4Type;
+use crate::l2_l3::ip::{get_global_l3stack, Ipv4Packet, L3Stack, NetworkConfiguration};
 use anyhow::{Context, Result};
 use log;
-use std::collections::{HashMap, VecDeque};
 use std::cmp::min;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::ops::Range;
+use std::sync::mpsc::channel;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::sync::mpsc::{channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -53,16 +53,16 @@ pub fn get_global_udpstack(config: NetworkConfiguration) -> Result<&'static Arc<
 
 #[derive(Clone, Debug)]
 pub struct UdpPacket {
-    pub src_addr: [u8; 4],  // pesudo header
-    pub dst_addr: [u8; 4],  // pesudo header
-    pub protocol: u8,       // pesudo header
-    pub udp_length: u16,    // pesudo header
+    pub src_addr: [u8; 4], // pesudo header
+    pub dst_addr: [u8; 4], // pesudo header
+    pub protocol: u8,      // pesudo header
+    pub udp_length: u16,   // pesudo header
     pub local_port: u16,
     pub remote_port: u16,
-    pub length: u16,        // same as udp_length (udp header (8) + payload)
+    pub length: u16, // same as udp_length (udp header (8) + payload)
     pub checksum: u16,
     pub payload: Vec<u8>,
-    pub valid: bool
+    pub valid: bool,
 }
 
 impl UdpPacket {
@@ -77,16 +77,23 @@ impl UdpPacket {
             length: 0,
             checksum: 0,
             payload: Vec::new(),
-            valid: false
+            valid: false,
         }
     }
 
     pub fn read(&mut self, ipv4_packet: &Ipv4Packet) -> Result<bool> {
         let payload_len = ipv4_packet.payload.len();
         if payload_len > 0xffff {
-            return Err(anyhow::anyhow!("UDP packet payload length is {}, must be smaller than 65536+1.", payload_len));
+            return Err(anyhow::anyhow!(
+                "UDP packet payload length is {}, must be smaller than 65536+1.",
+                payload_len
+            ));
         } else if payload_len < UDP_HEADER_LENGTH {
-            return Err(anyhow::anyhow!("UDP packet payload length is {}, must be larger than header length ({}).", payload_len, UDP_HEADER_LENGTH));
+            return Err(anyhow::anyhow!(
+                "UDP packet payload length is {}, must be larger than header length ({}).",
+                payload_len,
+                UDP_HEADER_LENGTH
+            ));
         } else {
             self.udp_length = payload_len as u16;
         }
@@ -113,7 +120,7 @@ impl UdpPacket {
         let mut checksum_tmp: u32 = 0;
         for i in (0..packet.len()).step_by(2) {
             if i + 1 < packet.len() {
-                let word = u16::from_be_bytes([packet[i], packet[i+1]]);
+                let word = u16::from_be_bytes([packet[i], packet[i + 1]]);
                 checksum_tmp += u32::from(word);
             }
         }
@@ -140,12 +147,24 @@ impl UdpPacket {
         let length = (UDP_HEADER_LENGTH + self.payload.len()) as u16;
         if self.udp_length != length {
             // This may be unneccessary becuase it should be also checked in Ipv4Packet.validate.
-            return Err(anyhow::anyhow!("Bad length UDP packet. Header expected {} bytes but actually {} bytes.", self.udp_length, length));
+            return Err(anyhow::anyhow!(
+                "Bad length UDP packet. Header expected {} bytes but actually {} bytes.",
+                self.udp_length,
+                length
+            ));
         }
         let expected_checksum = self.calc_header_checksum();
         if self.checksum != expected_checksum && self.checksum != 0x0 {
-            log::debug!("Unexpected udp header. Header checksum is 0x{:x} but is expected 0x{:x}.", self.checksum, expected_checksum);
-            return Err(anyhow::anyhow!("UDP Header has bad checksum 0x{:x}, expected 0x{:x}.", self.checksum, expected_checksum));
+            log::debug!(
+                "Unexpected udp header. Header checksum is 0x{:x} but is expected 0x{:x}.",
+                self.checksum,
+                expected_checksum
+            );
+            return Err(anyhow::anyhow!(
+                "UDP Header has bad checksum 0x{:x}, expected 0x{:x}.",
+                self.checksum,
+                expected_checksum
+            ));
         }
 
         Ok(self.valid)
@@ -182,13 +201,13 @@ impl UdpPacket {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UdpEventType {
-    UdpReceived
+    UdpReceived,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct UdpEvent {
     socket_id: usize,
-    event: UdpEventType
+    event: UdpEventType,
 }
 
 pub struct UdpStack {
@@ -196,7 +215,7 @@ pub struct UdpStack {
     pub sockets: Mutex<HashMap<usize, Option<UdpNetworkInfo>>>,
     pub receive_queue: Mutex<HashMap<usize, VecDeque<UdpPacket>>>,
     pub threads: Mutex<Vec<JoinHandle<()>>>,
-    event_condvar: (Mutex<Option<UdpEvent>>, Condvar)
+    event_condvar: (Mutex<Option<UdpEvent>>, Condvar),
 }
 
 impl UdpStack {
@@ -206,7 +225,7 @@ impl UdpStack {
             sockets: Mutex::new(HashMap::new()),
             receive_queue: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
-            event_condvar: (Mutex::new(None), Condvar::new())
+            event_condvar: (Mutex::new(None), Condvar::new()),
         });
 
         let udp_recv = udp.clone();
@@ -218,14 +237,20 @@ impl UdpStack {
         Ok(udp)
     }
 
-    pub fn send(&self, socket_id: usize, network_info: Option<UdpNetworkInfo>, payload: Vec<u8>) -> Result<()> {
+    pub fn send(
+        &self,
+        socket_id: usize,
+        network_info: Option<UdpNetworkInfo>,
+        payload: Vec<u8>,
+    ) -> Result<()> {
         let mut ipv4_packet = Ipv4Packet::new();
         let mut udp_packet = UdpPacket::new();
         // using send_to (specify dst)
         if let Some(UdpNetworkInfo {
             local,
-            remote: Some(remote)
-        }) = network_info {
+            remote: Some(remote),
+        }) = network_info
+        {
             udp_packet.src_addr = local.ip().octets();
             udp_packet.local_port = local.port();
             udp_packet.dst_addr = remote.ip().octets();
@@ -236,15 +261,18 @@ impl UdpStack {
             let sockets = self.sockets.lock().unwrap();
             if let Some(Some(UdpNetworkInfo {
                 local,
-                remote: Some(remote)
-            })) = sockets.get(&socket_id) {
+                remote: Some(remote),
+            })) = sockets.get(&socket_id)
+            {
                 udp_packet.src_addr = local.ip().octets();
                 udp_packet.local_port = local.port();
                 udp_packet.dst_addr = remote.ip().octets();
                 udp_packet.remote_port = remote.port();
                 ipv4_packet.dst_addr = remote.ip().octets();
             } else {
-                return Err(anyhow::anyhow!("Failed to send UDP packet. Specify correct dst info or connect socket."));
+                return Err(anyhow::anyhow!(
+                    "Failed to send UDP packet. Specify correct dst info or connect socket."
+                ));
             }
         }
         udp_packet.protocol = u8::from(Ipv4Type::UDP);
@@ -273,7 +301,7 @@ impl UdpStack {
             }
             let event = UdpEvent {
                 socket_id: socket_id,
-                event: UdpEventType::UdpReceived
+                event: UdpEventType::UdpReceived,
             };
             // drop lock and wait_event is not atomic... this may cause lost wakeup... :P
             drop(sockets);
@@ -283,9 +311,14 @@ impl UdpStack {
         }
     }
 
-    pub fn bind(&self, socket_id: usize, mut network_info: UdpNetworkInfo) -> Result<UdpNetworkInfo> {
+    pub fn bind(
+        &self,
+        socket_id: usize,
+        mut network_info: UdpNetworkInfo,
+    ) -> Result<UdpNetworkInfo> {
         let mut sockets = self.sockets.lock().unwrap();
-        let used_ports: Vec<u16> = sockets.values()
+        let used_ports: Vec<u16> = sockets
+            .values()
             .filter_map(|info| info.as_ref().map(|i| i.local.port()))
             .collect();
         if network_info.local.port() == 0 {
@@ -302,7 +335,10 @@ impl UdpStack {
         } else {
             // verify if specified port is already used
             if used_ports.contains(&network_info.local.port()) {
-                anyhow::bail!("Failed to bind udp socket. Port {} is already used.", network_info.local.port())
+                anyhow::bail!(
+                    "Failed to bind udp socket. Port {} is already used.",
+                    network_info.local.port()
+                )
             } else {
                 sockets.insert(socket_id, Some(network_info));
                 self.update_queue(socket_id, network_info)?;
@@ -311,9 +347,13 @@ impl UdpStack {
         }
     }
 
-    pub fn connect(&self, socket_id: usize, netwrok_info: UdpNetworkInfo) -> Result<UdpNetworkInfo> {
+    pub fn connect(
+        &self,
+        socket_id: usize,
+        netwrok_info: UdpNetworkInfo,
+    ) -> Result<UdpNetworkInfo> {
         let mut sockets = self.sockets.lock().unwrap();
-        if let Some(Some(info)) = sockets.get_mut(&socket_id)  {
+        if let Some(Some(info)) = sockets.get_mut(&socket_id) {
             *info = netwrok_info;
             Ok(netwrok_info)
         } else {
@@ -325,25 +365,35 @@ impl UdpStack {
     fn update_queue(&self, socket_id: usize, network_info: UdpNetworkInfo) -> Result<()> {
         let mut receive_queue = self.receive_queue.lock().unwrap();
         if let Some(queue) = receive_queue.get_mut(&socket_id) {
-            if let UdpNetworkInfo { local, remote: None} =  network_info {
-                let filtered: VecDeque<UdpPacket> = queue.iter()
-                    .filter(|udp_packet|
-                        udp_packet.dst_addr == local.ip().octets() &&
-                        udp_packet.remote_port == local.port()
-                    )
+            if let UdpNetworkInfo {
+                local,
+                remote: None,
+            } = network_info
+            {
+                let filtered: VecDeque<UdpPacket> = queue
+                    .iter()
+                    .filter(|udp_packet| {
+                        udp_packet.dst_addr == local.ip().octets()
+                            && udp_packet.remote_port == local.port()
+                    })
                     .cloned()
                     .collect();
                 *queue = filtered;
                 return Ok(());
             }
-            if let UdpNetworkInfo { local, remote: Some(remote)} =  network_info {
-                let filtered: VecDeque<UdpPacket> = queue.iter()
-                    .filter(|udp_packet|
-                        udp_packet.dst_addr == local.ip().octets() &&
-                        udp_packet.remote_port == local.port() &&
-                        udp_packet.src_addr == remote.ip().octets() &&
-                        udp_packet.remote_port == remote.port()
-                    )
+            if let UdpNetworkInfo {
+                local,
+                remote: Some(remote),
+            } = network_info
+            {
+                let filtered: VecDeque<UdpPacket> = queue
+                    .iter()
+                    .filter(|udp_packet| {
+                        udp_packet.dst_addr == local.ip().octets()
+                            && udp_packet.remote_port == local.port()
+                            && udp_packet.src_addr == remote.ip().octets()
+                            && udp_packet.remote_port == remote.port()
+                    })
                     .cloned()
                     .collect();
                 *queue = filtered;
@@ -368,7 +418,10 @@ impl UdpStack {
             }
         }
 
-        anyhow::bail!("Failed to generate new udp socket because no available id. UDP_MAX_SOCKET={}", UDP_MAX_SOCKET)
+        anyhow::bail!(
+            "Failed to generate new udp socket because no available id. UDP_MAX_SOCKET={}",
+            UDP_MAX_SOCKET
+        )
     }
 
     pub fn release_socket(&self, socket_id: usize) -> Result<()> {
@@ -409,20 +462,27 @@ impl UdpStack {
             if let Some(network) = udp_info {
                 if let UdpNetworkInfo {
                     local,
-                    remote: Some(remote)
-                } = network {
-                    if local.ip().octets() != udp_packet.dst_addr ||
-                       local.port() != udp_packet.remote_port ||
-                       remote.ip().octets() != udp_packet.src_addr ||
-                       remote.port() != udp_packet.local_port {
+                    remote: Some(remote),
+                } = network
+                {
+                    if local.ip().octets() != udp_packet.dst_addr
+                        || local.port() != udp_packet.remote_port
+                        || remote.ip().octets() != udp_packet.src_addr
+                        || remote.port() != udp_packet.local_port
+                    {
                         continue;
                     }
                 };
                 if let UdpNetworkInfo {
                     local,
-                    remote: None
-                } = network {
-                    if local.ip().octets() != udp_packet.dst_addr || local.port() != udp_packet.remote_port { continue; }
+                    remote: None,
+                } = network
+                {
+                    if local.ip().octets() != udp_packet.dst_addr
+                        || local.port() != udp_packet.remote_port
+                    {
+                        continue;
+                    }
                 };
                 let mut queue = self.receive_queue.lock().unwrap();
                 if let Some(q) = queue.get_mut(id) {
@@ -430,7 +490,7 @@ impl UdpStack {
                         q.push_back(udp_packet);
                         let event = UdpEvent {
                             socket_id: *id,
-                            event: UdpEventType::UdpReceived
+                            event: UdpEventType::UdpReceived,
                         };
                         self.publish_event(event);
                         return Ok(true);
@@ -439,14 +499,19 @@ impl UdpStack {
                     }
                 }
             } else {
-                log::debug!("Udp socket (id={}) info is empty. Maybe it's not bind to port.", id);
+                log::debug!(
+                    "Udp socket (id={}) info is empty. Maybe it's not bind to port.",
+                    id
+                );
             }
         }
 
         log::debug!(
             "Discarding udp packet. Port is unbound for this packet. src={}:{} dst={}:{}",
-            Ipv4Addr::from(udp_packet.src_addr), udp_packet.local_port,
-            Ipv4Addr::from(udp_packet.dst_addr), udp_packet.remote_port
+            Ipv4Addr::from(udp_packet.src_addr),
+            udp_packet.local_port,
+            Ipv4Addr::from(udp_packet.dst_addr),
+            udp_packet.remote_port
         );
         Ok(false)
     }
@@ -486,13 +551,13 @@ impl UdpStack {
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub struct UdpNetworkInfo {
     pub local: SocketAddrV4,
-    pub remote: Option<SocketAddrV4>
+    pub remote: Option<SocketAddrV4>,
 }
 
 pub struct UdpSocket {
     config: NetworkConfiguration,
     socket_id: usize,
-    pub info: Option<UdpNetworkInfo>
+    pub info: Option<UdpNetworkInfo>,
 }
 
 // follow stdlib interface https://doc.rust-lang.org/std/net/struct.UdpSocket.html
@@ -501,19 +566,27 @@ impl UdpSocket {
         let udp = get_global_udpstack(config.clone())?;
         let socket = udp.generate_socket()?;
 
-        Ok(Self { config: config, socket_id: socket, info: None })
+        Ok(Self {
+            config: config,
+            socket_id: socket,
+            info: None,
+        })
     }
 
     pub fn bind<A: ToSocketAddrs>(&mut self, addr: A) -> Result<()> {
         if let Some(info) = self.info {
-            anyhow::bail!("It is already bound to {}/{}.", info.local.ip(), info.local.port());
+            anyhow::bail!(
+                "It is already bound to {}/{}.",
+                info.local.ip(),
+                info.local.port()
+            );
         } else {
             match addr.to_socket_addrs()?.next() {
                 Some(addr) => {
                     // We only assign port and ignore ip address because l3stack currently have an exact 1 interface and ip address.
                     let info = UdpNetworkInfo {
                         local: SocketAddrV4::new(self.config.ip.address, addr.port()),
-                        remote: None
+                        remote: None,
                     };
                     self.info = Some(info);
                     let udp = get_global_udpstack(self.config.clone())?;
@@ -532,23 +605,25 @@ impl UdpSocket {
     pub fn connect<A: ToSocketAddrs>(&mut self, addr: A) -> Result<()> {
         if let Some(mut info) = self.info {
             if let Some(remote) = info.remote {
-                anyhow::bail!("It is already connected to {}:{}.", remote.ip(), remote.port())
+                anyhow::bail!(
+                    "It is already connected to {}:{}.",
+                    remote.ip(),
+                    remote.port()
+                )
             } else {
                 match addr.to_socket_addrs()?.next() {
-                    Some(addr) => {
-                        match addr.ip() {
-                            IpAddr::V4(v4_addr) => {
-                                info.remote = Some(SocketAddrV4::new(v4_addr, addr.port()));
-                                let udp = get_global_udpstack(self.config.clone())?;
-                                let new_info = udp.connect(self.socket_id, info)?;
-                                self.info = Some(new_info);
-                                return Ok(());
-                            }
-                            IpAddr::V6(_) => {
-                                anyhow::bail!("Ipv6 is not supported.")
-                            }
+                    Some(addr) => match addr.ip() {
+                        IpAddr::V4(v4_addr) => {
+                            info.remote = Some(SocketAddrV4::new(v4_addr, addr.port()));
+                            let udp = get_global_udpstack(self.config.clone())?;
+                            let new_info = udp.connect(self.socket_id, info)?;
+                            self.info = Some(new_info);
+                            return Ok(());
                         }
-                    }
+                        IpAddr::V6(_) => {
+                            anyhow::bail!("Ipv6 is not supported.")
+                        }
+                    },
                     None => {
                         anyhow::bail!("Address may be invalid.")
                     }
@@ -561,28 +636,25 @@ impl UdpSocket {
 
     pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> Result<()> {
         if let Some(info) = self.info {
-            anyhow::ensure!(info.remote == None, "send_to is only available for non-connected socket.");
+            anyhow::ensure!(
+                info.remote == None,
+                "send_to is only available for non-connected socket."
+            );
             match addr.to_socket_addrs()?.next() {
-                Some(addr) => {
-                    match addr.ip() {
-                        IpAddr::V4(v4_addr) => {
-                            let udp = get_global_udpstack(self.config.clone())?;
-                            let network_info = UdpNetworkInfo {
-                                local: info.local,
-                                remote: Some(SocketAddrV4::new(v4_addr, addr.port()))
-                            };
-                            udp.send(
-                                self.socket_id,
-                                Some(network_info),
-                                buf.to_vec()
-                            )?;
-                            return Ok(());
-                        }
-                        IpAddr::V6(_) => {
-                            anyhow::bail!("Ipv6 is not supported.")
-                        }
+                Some(addr) => match addr.ip() {
+                    IpAddr::V4(v4_addr) => {
+                        let udp = get_global_udpstack(self.config.clone())?;
+                        let network_info = UdpNetworkInfo {
+                            local: info.local,
+                            remote: Some(SocketAddrV4::new(v4_addr, addr.port())),
+                        };
+                        udp.send(self.socket_id, Some(network_info), buf.to_vec())?;
+                        return Ok(());
                     }
-                }
+                    IpAddr::V6(_) => {
+                        anyhow::bail!("Ipv6 is not supported.")
+                    }
+                },
                 None => {
                     anyhow::bail!("Address may be invalid.");
                 }
@@ -594,7 +666,10 @@ impl UdpSocket {
 
     pub fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddrV4)> {
         if let Some(info) = self.info {
-            anyhow::ensure!(info.remote == None, "recv_from is only available for non-connected socket.");
+            anyhow::ensure!(
+                info.remote == None,
+                "recv_from is only available for non-connected socket."
+            );
             let udp = get_global_udpstack(self.config.clone())?;
             let (src, payload) = udp.recv(self.socket_id)?;
             let length = min(buf.len(), payload.len());
@@ -608,7 +683,10 @@ impl UdpSocket {
 
     pub fn send(&self, buf: &[u8]) -> Result<()> {
         if let Some(info) = self.info {
-            anyhow::ensure!(info.remote != None, "send is only available for connected socket.");
+            anyhow::ensure!(
+                info.remote != None,
+                "send is only available for connected socket."
+            );
             let udp = get_global_udpstack(self.config.clone())?;
             udp.send(self.socket_id, None, buf.to_vec())?;
 
@@ -620,7 +698,10 @@ impl UdpSocket {
 
     pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
         if let Some(info) = self.info {
-            anyhow::ensure!(info.remote != None, "recv is only available for connected socket.");
+            anyhow::ensure!(
+                info.remote != None,
+                "recv is only available for connected socket."
+            );
             let udp = get_global_udpstack(self.config.clone())?;
             let (_src, payload) = udp.recv(self.socket_id)?;
             let length = min(buf.len(), payload.len());
@@ -636,8 +717,8 @@ impl UdpSocket {
 #[cfg(test)]
 mod udp_tests {
     use super::*;
-    use rstest::rstest;
     use hex::decode;
+    use rstest::rstest;
 
     #[rstest]
     #[case(
@@ -677,16 +758,22 @@ mod udp_tests {
         #[case] expected_length: u16,
         #[case] expected_checksum: u16,
         #[case] udp_payload_hex: &str,
-        #[case] expected_valid: bool
+        #[case] expected_valid: bool,
     ) {
         let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
         let mut ipv4_packet = Ipv4Packet::new();
-        assert!(ipv4_packet.read(&packet_data).is_ok(), "Failed to read IPv4 packet");
+        assert!(
+            ipv4_packet.read(&packet_data).is_ok(),
+            "Failed to read IPv4 packet"
+        );
 
         let mut udp_packet = UdpPacket::new();
         assert_eq!(ipv4_packet.protocol, expected_protocol);
         let read_result = udp_packet.read(&ipv4_packet);
-        assert!(read_result.is_ok(), "UDP packet read failed when it should not have");
+        assert!(
+            read_result.is_ok(),
+            "UDP packet read failed when it should not have"
+        );
 
         if read_result.is_ok() {
             assert_eq!(udp_packet.src_addr, expected_src_addr);
@@ -699,8 +786,12 @@ mod udp_tests {
             assert_eq!(udp_packet.checksum, expected_checksum);
             assert_eq!(udp_packet.valid, expected_valid);
 
-            let payload_data = decode(udp_payload_hex).expect("Failed to decode payload hex string");
-            assert_eq!(udp_packet.payload, payload_data, "UDP payload does not match");
+            let payload_data =
+                decode(udp_payload_hex).expect("Failed to decode payload hex string");
+            assert_eq!(
+                udp_packet.payload, payload_data,
+                "UDP payload does not match"
+            );
             let recreated_packet = udp_packet.create_packet();
             assert_eq!(ipv4_packet.payload, recreated_packet);
         }
@@ -710,9 +801,7 @@ mod udp_tests {
     #[case("4500003cfe5e4000401153eeac136f760ad9c20194e7003500286c")]
     // bad udp checksum, last byte is 02 but should be 01
     #[case("4500003cfe5e4000401153eeac136f760ad9c20194e7003500286c038650012000010000000000000378787806676f6f676c6503636f6d0000010002")]
-    fn test_udp_packet_read_error(
-        #[case] encoded_packet: &str,
-    ) {
+    fn test_udp_packet_read_error(#[case] encoded_packet: &str) {
         let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
         let mut ipv4_packet = Ipv4Packet::new();
         let _ = ipv4_packet.read(&packet_data);
@@ -721,5 +810,4 @@ mod udp_tests {
 
         assert!(result.is_err(), "Expected an error for incorrect header");
     }
-
 }

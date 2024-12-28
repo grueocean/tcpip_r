@@ -1,21 +1,23 @@
-use crate::l2_l3::ethernet::get_interface_mac;
-use crate::l2_l3::arp::{L2Stack, is_netmask_range, generate_network_addr, generate_broadcast_addr};
+use crate::l2_l3::arp::{
+    generate_broadcast_addr, generate_network_addr, is_netmask_range, L2Stack,
+};
 use crate::l2_l3::defs::{Ipv4Type, L2Error, L3Error};
+use crate::l2_l3::ethernet::get_interface_mac;
 use anyhow::{Context, Result};
 use eui48::MacAddress;
-use std::collections::{HashMap, VecDeque};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const IPV4_HEADER_LENGTH_BASIC: usize = 20;
 const IPV4_MAX_SIZE: usize = 65535;
-const IPV4_MIN_MTU: usize = 68;    // rfc791
+const IPV4_MIN_MTU: usize = 68; // rfc791
 const IPV4_MIN_MTU_2: usize = 576; // rfc1122, rfc8900
 const IPV4_FRAGMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -61,13 +63,13 @@ pub fn get_global_l3stack(config: NetworkConfiguration) -> Result<&'static Arc<L
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #[derive(Clone, Debug)]
 pub struct Ipv4Packet {
-    pub version: u8,           // 4 bit
-    pub ihl: u8,               // 4 bit
+    pub version: u8, // 4 bit
+    pub ihl: u8,     // 4 bit
     pub type_of_service: u8,
     pub length: u16,
     pub identification: u16,
-    pub flags: u8,             // 3 bit
-    pub frag_offset: u16,      // 13 bit
+    pub flags: u8,        // 3 bit
+    pub frag_offset: u16, // 13 bit
     pub ttl: u8,
     pub protocol: u8,
     pub header_checksum: u16,
@@ -75,7 +77,7 @@ pub struct Ipv4Packet {
     pub dst_addr: [u8; 4],
     pub options: Option<u32>,
     pub payload: Vec<u8>,
-    pub valid: bool
+    pub valid: bool,
 }
 
 impl Ipv4Packet {
@@ -95,34 +97,42 @@ impl Ipv4Packet {
             dst_addr: [0; 4],
             options: None,
             payload: Vec::new(),
-            valid: false
+            valid: false,
         }
     }
 
     pub fn read(&mut self, packet: &Vec<u8>) -> Result<bool> {
         if packet.len() < IPV4_HEADER_LENGTH_BASIC {
-            return Err(anyhow::anyhow!("Insufficient packet length for IPv4 Header. packet.len()={}", packet.len()));
+            return Err(anyhow::anyhow!(
+                "Insufficient packet length for IPv4 Header. packet.len()={}",
+                packet.len()
+            ));
         }
-        self.version = u8::from_be_bytes(packet[0..1].try_into()?) >> 4;  // top 4 bit
-        self.ihl = u8::from_be_bytes(packet[0..1].try_into()?) & 0xf;     // bottom 4 bit
+        self.version = u8::from_be_bytes(packet[0..1].try_into()?) >> 4; // top 4 bit
+        self.ihl = u8::from_be_bytes(packet[0..1].try_into()?) & 0xf; // bottom 4 bit
         self.type_of_service = u8::from_be_bytes(packet[1..2].try_into()?);
         self.length = u16::from_be_bytes(packet[2..4].try_into()?);
         self.identification = u16::from_be_bytes(packet[4..6].try_into()?);
-        self.flags = (u16::from_be_bytes(packet[6..8].try_into()?) >> 13) as u8;  // top 3 bit
+        self.flags = (u16::from_be_bytes(packet[6..8].try_into()?) >> 13) as u8; // top 3 bit
         self.frag_offset = u16::from_be_bytes(packet[6..8].try_into()?) & 0x1fff; // bottom 13 bit
         self.ttl = u8::from_be_bytes(packet[8..9].try_into()?);
         self.protocol = u8::from_be_bytes(packet[9..10].try_into()?);
         self.header_checksum = u16::from_be_bytes(packet[10..12].try_into()?);
         self.src_addr = packet[12..16].try_into()?;
         self.dst_addr = packet[16..20].try_into()?;
-        if self.ihl == 5 {  // 20 bytes header w/o option
+        if self.ihl == 5 {
+            // 20 bytes header w/o option
             self.options = None;
             self.payload = packet[20..].to_vec();
-        } else if self.ihl == 6 {  // 24 bytes header w/ option
+        } else if self.ihl == 6 {
+            // 24 bytes header w/ option
             self.options = Some(u32::from_be_bytes(packet[20..24].try_into()?));
             self.payload = packet[24..].to_vec();
         } else {
-            return Err(anyhow::anyhow!("Unsupported Ipv4 Header length. length={}", self.ihl));
+            return Err(anyhow::anyhow!(
+                "Unsupported Ipv4 Header length. length={}",
+                self.ihl
+            ));
         }
         self.validate()?;
 
@@ -134,7 +144,7 @@ impl Ipv4Packet {
         let mut checksum_tmp: u32 = 0;
         for i in (0..header.len()).step_by(2) {
             if i + 1 < header.len() {
-                let word = u16::from_be_bytes([header[i], header[i+1]]);
+                let word = u16::from_be_bytes([header[i], header[i + 1]]);
                 checksum_tmp += u32::from(word);
             }
         }
@@ -155,11 +165,17 @@ impl Ipv4Packet {
     pub fn validate(&mut self) -> Result<bool> {
         self.valid = true;
         if self.version != 4 {
-            log::debug!("Unexpected ip header. version is {}, but is expected 4.", self.version);
+            log::debug!(
+                "Unexpected ip header. version is {}, but is expected 4.",
+                self.version
+            );
             self.valid = false;
         }
         if self.ihl != 5 && self.ihl != 6 {
-            log::debug!("Unexpected ip header. ihl is {}, but is expected 5 or 6.", self.ihl);
+            log::debug!(
+                "Unexpected ip header. ihl is {}, but is expected 5 or 6.",
+                self.ihl
+            );
             self.valid = false;
         }
         if Ipv4Type::from(self.protocol) == Ipv4Type::Unknown {
@@ -168,9 +184,17 @@ impl Ipv4Packet {
         }
         let expected_checksum = self.calc_header_checksum();
         if self.header_checksum != expected_checksum && self.header_checksum != 0x0 {
-            log::debug!("Unexpected ip header. Header checksum is 0x{:x} but is expected 0x{:x}.", self.header_checksum, expected_checksum);
+            log::debug!(
+                "Unexpected ip header. Header checksum is 0x{:x} but is expected 0x{:x}.",
+                self.header_checksum,
+                expected_checksum
+            );
             self.valid = false;
-            return Err(anyhow::anyhow!("IP Header has bad checksum 0x{:x}, expected 0x{:x}.", self.header_checksum, expected_checksum));
+            return Err(anyhow::anyhow!(
+                "IP Header has bad checksum 0x{:x}, expected 0x{:x}.",
+                self.header_checksum,
+                expected_checksum
+            ));
         }
 
         Ok(self.valid)
@@ -182,7 +206,9 @@ impl Ipv4Packet {
         header.extend_from_slice(&self.type_of_service.to_be_bytes());
         header.extend_from_slice(&self.length.to_be_bytes());
         header.extend_from_slice(&self.identification.to_be_bytes());
-        header.extend_from_slice(&(((self.flags as u16) << 13 | self.frag_offset) as u16).to_be_bytes());
+        header.extend_from_slice(
+            &(((self.flags as u16) << 13 | self.frag_offset) as u16).to_be_bytes(),
+        );
         header.extend_from_slice(&self.ttl.to_be_bytes());
         header.extend_from_slice(&self.protocol.to_be_bytes());
         header.extend_from_slice(&self.header_checksum.to_be_bytes());
@@ -205,17 +231,16 @@ impl Ipv4Packet {
     }
 
     pub fn create_fragment_packets(&self, mtu: usize) -> Result<VecDeque<Self>> {
-        anyhow::ensure!((self.flags & IPV4_FLAG_DF) == 0, "Cannot split packet with DF (Don't Fragment) enabled.");
+        anyhow::ensure!(
+            (self.flags & IPV4_FLAG_DF) == 0,
+            "Cannot split packet with DF (Don't Fragment) enabled."
+        );
         let mut packets = VecDeque::new();
         let base_packet = self.clone();
         let header_length = (self.ihl * 4) as usize;
         // fragment must be 8-bytes aligned
-        let max_payload = (
-            std::cmp::min(
-                mtu - header_length,
-                IPV4_MAX_SIZE - header_length
-            )
-        ) &!0b111;
+        let max_payload =
+            (std::cmp::min(mtu - header_length, IPV4_MAX_SIZE - header_length)) & !0b111;
         let num_fragments = (self.payload.len() - 1) / max_payload + 1;
         if num_fragments == 1 {
             let mut packet_fragment = base_packet.clone();
@@ -229,12 +254,13 @@ impl Ipv4Packet {
                 packet_fragment.frag_offset = (i * max_payload / 8) as u16;
                 // not a last fragment
                 if i + 1 != num_fragments {
-                    packet_fragment.flags = IPV4_FLAG_MF;   // DF=0 MF=1
-                    packet_fragment.payload = packet_fragment.payload[i*max_payload..(i+1)*max_payload].to_vec();
+                    packet_fragment.flags = IPV4_FLAG_MF; // DF=0 MF=1
+                    packet_fragment.payload =
+                        packet_fragment.payload[i * max_payload..(i + 1) * max_payload].to_vec();
                 // last fragment
                 } else {
                     packet_fragment.flags = IPV4_FLAG_ZERO; // DF=0 MF=0
-                    packet_fragment.payload = packet_fragment.payload[i*max_payload..].to_vec();
+                    packet_fragment.payload = packet_fragment.payload[i * max_payload..].to_vec();
                 }
                 packet_fragment.length = (packet_fragment.payload.len() + header_length) as u16;
                 packet_fragment.calc_header_checksum_and_set();
@@ -252,51 +278,54 @@ trait MatchFragmentHeader {
 
 impl MatchFragmentHeader for Ipv4Packet {
     fn match_fragment_header(&self, other: &Self) -> bool {
-        self.version == other.version &&
-        self.ihl == other.ihl &&
-        self.type_of_service == other.type_of_service &&
-        self.identification == other.identification &&
-        self.ttl == other.ttl &&
-        self.protocol == other.protocol &&
-        self.src_addr == other.src_addr &&
-        self.dst_addr == other.dst_addr &&
-        self.options == other.options
+        self.version == other.version
+            && self.ihl == other.ihl
+            && self.type_of_service == other.type_of_service
+            && self.identification == other.identification
+            && self.ttl == other.ttl
+            && self.protocol == other.protocol
+            && self.src_addr == other.src_addr
+            && self.dst_addr == other.dst_addr
+            && self.options == other.options
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Ipv4FragmentHole {
     pub start: usize,
-    pub end: usize
+    pub end: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct Ipv4FragmentPiece {
     pub is_hole: bool,
     pub hole: Option<Ipv4FragmentHole>,
-    pub packet: Option<Ipv4Packet>
+    pub packet: Option<Ipv4Packet>,
 }
 
 #[derive(Debug)]
 pub struct Ipv4FragmentQueue {
     timestamp: Instant,
     has_hole: bool,
-    queue: VecDeque<Ipv4FragmentPiece>
+    queue: VecDeque<Ipv4FragmentPiece>,
 }
 
 impl Ipv4FragmentQueue {
     pub fn new() -> Self {
         let init_hole = Ipv4FragmentPiece {
             is_hole: true,
-            hole: Some(Ipv4FragmentHole { start: 0, end: IPV4_MAX_SIZE }),
-            packet: None
+            hole: Some(Ipv4FragmentHole {
+                start: 0,
+                end: IPV4_MAX_SIZE,
+            }),
+            packet: None,
         };
         let mut init_queue = VecDeque::new();
         init_queue.push_back(init_hole);
         Self {
             timestamp: Instant::now(),
             has_hole: true,
-            queue: init_queue
+            queue: init_queue,
         }
     }
 
@@ -335,15 +364,18 @@ impl Ipv4FragmentQueue {
                         if hole.start < frag_start {
                             let hole1 = Ipv4FragmentPiece {
                                 is_hole: true,
-                                hole: Some(Ipv4FragmentHole { start: hole.start, end: frag_start - 1}),
-                                packet: None
+                                hole: Some(Ipv4FragmentHole {
+                                    start: hole.start,
+                                    end: frag_start - 1,
+                                }),
+                                packet: None,
                             };
                             new_queue.push_back(hole1);
                         }
                         let new_packet = Ipv4FragmentPiece {
                             is_hole: false,
                             hole: None,
-                            packet: Some(packet.clone())
+                            packet: Some(packet.clone()),
                         };
                         new_queue.push_back(new_packet);
                         break;
@@ -357,20 +389,26 @@ impl Ipv4FragmentQueue {
                             // When adding head packet, hole1 is not generated.
                             let hole1 = Ipv4FragmentPiece {
                                 is_hole: true,
-                                hole: Some(Ipv4FragmentHole { start: hole.start, end: frag_start - 1}),
-                                packet: None
+                                hole: Some(Ipv4FragmentHole {
+                                    start: hole.start,
+                                    end: frag_start - 1,
+                                }),
+                                packet: None,
                             };
                             new_queue.push_back(hole1);
                         }
                         let new_packet = Ipv4FragmentPiece {
                             is_hole: false,
                             hole: None,
-                            packet: Some(packet.clone())
+                            packet: Some(packet.clone()),
                         };
                         let hole2 = Ipv4FragmentPiece {
                             is_hole: true,
-                            hole: Some(Ipv4FragmentHole { start: frag_end + 1, end: hole.end}),
-                            packet: None
+                            hole: Some(Ipv4FragmentHole {
+                                start: frag_end + 1,
+                                end: hole.end,
+                            }),
+                            packet: None,
                         };
                         new_queue.push_back(new_packet);
                         new_queue.push_back(hole2);
@@ -401,11 +439,15 @@ impl Ipv4FragmentQueue {
     }
 
     pub fn create_complete_packet(&self) -> Result<Ipv4Packet> {
-        anyhow::ensure!(!self.has_hole, "Cannot generate complete packet from fragment queue with hole.");
-        let mut packets: VecDeque<Ipv4Packet> =
-            self.queue.iter()
-                .filter_map(|piece| piece.packet.as_ref().cloned())
-                .collect();
+        anyhow::ensure!(
+            !self.has_hole,
+            "Cannot generate complete packet from fragment queue with hole."
+        );
+        let mut packets: VecDeque<Ipv4Packet> = self
+            .queue
+            .iter()
+            .filter_map(|piece| piece.packet.as_ref().cloned())
+            .collect();
         let mut payload: Vec<u8> = Vec::new();
         if let Some(mut first_packet) = packets.pop_front() {
             payload.extend_from_slice(&first_packet.payload);
@@ -434,7 +476,7 @@ pub struct Ipv4Config {
     pub address: Ipv4Addr,
     pub netmask: usize,
     pub broadcast_address: Ipv4Addr,
-    pub network_address: Ipv4Addr
+    pub network_address: Ipv4Addr,
 }
 
 impl FromStr for Ipv4Config {
@@ -446,8 +488,12 @@ impl FromStr for Ipv4Config {
             return Err("Input must be in the format <IPv4Address>/<Netmask>".into());
         }
 
-        let address = parts[0].parse::<Ipv4Addr>().map_err(|_| "Invalid IP address format".to_string())?;
-        let netmask = parts[1].parse::<usize>().map_err(|_| "Invalid netmask format".to_string())?;
+        let address = parts[0]
+            .parse::<Ipv4Addr>()
+            .map_err(|_| "Invalid IP address format".to_string())?;
+        let netmask = parts[1]
+            .parse::<usize>()
+            .map_err(|_| "Invalid netmask format".to_string())?;
 
         if netmask > 32 {
             return Err("Netmask must be between 0 and 32".into());
@@ -490,7 +536,7 @@ pub struct NetworkConfiguration {
     pub mac: MacAddress,
     pub mtu: usize,
     pub ip: Ipv4Config,
-    pub gateway: HashMap<Ipv4Network, Route>
+    pub gateway: HashMap<Ipv4Network, Route>,
 }
 
 impl NetworkConfiguration {
@@ -499,14 +545,14 @@ impl NetworkConfiguration {
         mac: MacAddress,
         mtu: usize,
         ip: Ipv4Config,
-        gateway: HashMap<Ipv4Network, Route>
+        gateway: HashMap<Ipv4Network, Route>,
     ) -> Self {
         Self {
             interface_name,
             mac,
             mtu,
             ip,
-            gateway
+            gateway,
         }
     }
 }
@@ -516,14 +562,24 @@ pub fn generate_network_config(
     mac: MacAddress,
     mtu: usize,
     ip: Ipv4Config,
-    default_gateway: Ipv4Addr
+    default_gateway: Ipv4Addr,
 ) -> Result<NetworkConfiguration> {
-    let route = vec![
-        (Ipv4Network { address: ip.address, netmask: ip.netmask },
-        Route { gateway_addr: default_gateway, rank: 1 })
-    ];
+    let route = vec![(
+        Ipv4Network {
+            address: ip.address,
+            netmask: ip.netmask,
+        },
+        Route {
+            gateway_addr: default_gateway,
+            rank: 1,
+        },
+    )];
     let mut config = NetworkConfiguration {
-        interface_name: interface_name.clone(), mac, mtu, ip, gateway: route.into_iter().collect()
+        interface_name: interface_name.clone(),
+        mac,
+        mtu,
+        ip,
+        gateway: route.into_iter().collect(),
     };
     if mac == MacAddress::new([0, 0, 0, 0, 0, 0]) {
         if let Some(interface_mac) = get_interface_mac(interface_name)? {
@@ -536,11 +592,12 @@ pub fn generate_network_config(
 #[derive(Clone, Debug)]
 pub struct Route {
     pub gateway_addr: Ipv4Addr,
-    pub rank: usize
+    pub rank: usize,
 }
 
 fn search_route(routes: &HashMap<Ipv4Network, Route>, target_ip: &Ipv4Addr) -> Option<Route> {
-    routes.iter()
+    routes
+        .iter()
         .filter(|(network, _)| is_netmask_range(&network.address, network.netmask, target_ip))
         .max_by_key(|(_, route)| route.rank)
         .map(|(_, route)| route.clone())
@@ -549,7 +606,7 @@ fn search_route(routes: &HashMap<Ipv4Network, Route>, target_ip: &Ipv4Addr) -> O
 pub struct L3Interface {
     l2stack: Arc<L2Stack>,
     gateway: HashMap<Ipv4Network, Route>,
-    ipv4_identification: Mutex<u16>
+    ipv4_identification: Mutex<u16>,
 }
 
 impl L3Interface {
@@ -558,10 +615,15 @@ impl L3Interface {
         mac: MacAddress,
         mtu: usize,
         ip: Ipv4Config,
-        gateway: HashMap<Ipv4Network, Route>
+        gateway: HashMap<Ipv4Network, Route>,
     ) -> Result<Arc<Self>> {
         if !cfg!(debug_assertions) {
-            anyhow::ensure!(mtu >= IPV4_MIN_MTU_2, "Mtu ({}) is less than minimum {}.", mtu, IPV4_MIN_MTU_2);
+            anyhow::ensure!(
+                mtu >= IPV4_MIN_MTU_2,
+                "Mtu ({}) is less than minimum {}.",
+                mtu,
+                IPV4_MIN_MTU_2
+            );
         }
         let l3 = Arc::new(Self {
             l2stack: L2Stack::new(interface_name, mac, mtu, ip)?,
@@ -582,13 +644,11 @@ impl L3Interface {
     fn resolve_ip(&self, ip: &Ipv4Addr) -> Result<Option<MacAddress>> {
         // reject packet to network addr
         if ip == &self.l2stack.interface_ipv4.network_address {
-            return Err(anyhow::anyhow!(
-                L3Error::AddressError {
-                    target_ip: *ip,
-                    l2_ip: self.l2stack.interface_ipv4.address,
-                    l2_netmask: self.l2stack.interface_ipv4.netmask
-                }
-            ));
+            return Err(anyhow::anyhow!(L3Error::AddressError {
+                target_ip: *ip,
+                l2_ip: self.l2stack.interface_ipv4.address,
+                l2_netmask: self.l2stack.interface_ipv4.netmask
+            }));
         // set broadcast mac addr if dst is broadcast ip addr
         } else if ip == &self.l2stack.interface_ipv4.broadcast_address {
             return Ok(Some(MacAddress::broadcast()));
@@ -596,40 +656,61 @@ impl L3Interface {
         } else if !is_netmask_range(
             &self.l2stack.interface_ipv4.address,
             self.l2stack.interface_ipv4.netmask,
-            ip
+            ip,
         ) {
             if let Some(gateway) = search_route(&self.gateway, ip) {
                 match self.l2stack.lookup_arp(&gateway.gateway_addr) {
-                    Ok(mac) => { return Ok(Some(mac)); }
+                    Ok(mac) => {
+                        return Ok(Some(mac));
+                    }
                     Err(e) => {
-                        if let Some(L2Error::ResolveError {target_ip: _, retries: _}) = e.downcast_ref::<L2Error>() {
+                        if let Some(L2Error::ResolveError {
+                            target_ip: _,
+                            retries: _,
+                        }) = e.downcast_ref::<L2Error>()
+                        {
                             log::warn!("Cannot resolve gateway addr {}.", gateway.gateway_addr);
-                            return Err(L3Error::GatewayUnreachableError { target_ip: gateway.gateway_addr }.into());
+                            return Err(L3Error::GatewayUnreachableError {
+                                target_ip: gateway.gateway_addr,
+                            }
+                            .into());
                         } else {
-                            return Err(anyhow::anyhow!("Lookup gateway addr {} failed unexpectedly. Err: {}", gateway.gateway_addr, e));
+                            return Err(anyhow::anyhow!(
+                                "Lookup gateway addr {} failed unexpectedly. Err: {}",
+                                gateway.gateway_addr,
+                                e
+                            ));
                         }
                     }
                 }
             } else {
-                return Err(
-                    anyhow::anyhow!(
-                        "No available gateway. dst ip is {} and l2Stack is {}/{}.",
-                        *ip,
-                        self.l2stack.interface_ipv4.address,
-                        self.l2stack.interface_ipv4.netmask
-                    )
-                );
+                return Err(anyhow::anyhow!(
+                    "No available gateway. dst ip is {} and l2Stack is {}/{}.",
+                    *ip,
+                    self.l2stack.interface_ipv4.address,
+                    self.l2stack.interface_ipv4.netmask
+                ));
             }
         // lookup dst mac addr directly that it is whitin local network
         } else {
             match self.l2stack.lookup_arp(ip) {
-                Ok(mac) => { return Ok(Some(mac)); }
+                Ok(mac) => {
+                    return Ok(Some(mac));
+                }
                 Err(e) => {
-                    if let Some(L2Error::ResolveError {target_ip: _, retries: _}) = e.downcast_ref::<L2Error>() {
+                    if let Some(L2Error::ResolveError {
+                        target_ip: _,
+                        retries: _,
+                    }) = e.downcast_ref::<L2Error>()
+                    {
                         log::warn!("Cannot resolve local addr {}.", ip);
                         return Err(L3Error::LocalUnreachableError { target_ip: *ip }.into());
                     } else {
-                        return Err(anyhow::anyhow!("Lookup local addr {} failed unexpectedly. Err: {}", *ip, e));
+                        return Err(anyhow::anyhow!(
+                            "Lookup local addr {} failed unexpectedly. Err: {}",
+                            *ip,
+                            e
+                        ));
                     }
                 }
             }
@@ -648,7 +729,11 @@ impl L3Interface {
         ipv4_packet.src_addr = self.l2stack.interface_ipv4.address.octets();
         let dst_ip = Ipv4Addr::from(ipv4_packet.dst_addr);
         let dst_mac = self.resolve_ip(&dst_ip)?;
-        anyhow::ensure!(ipv4_packet.payload.len() <= IPV4_MAX_SIZE + header_length, "Ipv4 payload is too long ({}).", ipv4_packet.payload.len());
+        anyhow::ensure!(
+            ipv4_packet.payload.len() <= IPV4_MAX_SIZE + header_length,
+            "Ipv4 payload is too long ({}).",
+            ipv4_packet.payload.len()
+        );
         let packets = ipv4_packet.create_fragment_packets(self.l2stack.interface_mtu)?;
         for fragment in packets {
             self.l2stack.send(fragment, dst_mac)?;
@@ -675,8 +760,9 @@ impl L3Interface {
                 Ok(_) => {}
             }
             let dst_addr = Ipv4Addr::from(ipv4_packet.dst_addr);
-            if dst_addr != self.l2stack.interface_ipv4.address &&
-               dst_addr != self.l2stack.interface_ipv4.broadcast_address {
+            if dst_addr != self.l2stack.interface_ipv4.address
+                && dst_addr != self.l2stack.interface_ipv4.broadcast_address
+            {
                 log::warn!(
                     "Discarding packet. Interface ip is {}/{}, but packet dst is to {}.",
                     self.l2stack.interface_ipv4.address,
@@ -695,25 +781,23 @@ pub struct L3Stack {
     pub l3interface: Arc<L3Interface>,
     fragmented_packet_queue: Mutex<HashMap<u16, Ipv4FragmentQueue>>,
     l4_receive_channels: Mutex<HashMap<Ipv4Type, Sender<Ipv4Packet>>>,
-    threads: Mutex<Vec<JoinHandle<()>>>
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl L3Stack {
     pub fn new(config: NetworkConfiguration) -> Result<Arc<Self>> {
-        let l3stack = Arc::new(
-            Self {
-                l3interface: L3Interface::new(
-                    config.interface_name,
-                    config.mac,
-                    config.mtu,
-                    config.ip,
-                    config.gateway
-                )?,
-                fragmented_packet_queue: Mutex::new(HashMap::new()),
-                l4_receive_channels: Mutex::new(HashMap::new()),
-                threads: Mutex::new(Vec::new())
-            }
-        );
+        let l3stack = Arc::new(Self {
+            l3interface: L3Interface::new(
+                config.interface_name,
+                config.mac,
+                config.mtu,
+                config.ip,
+                config.gateway,
+            )?,
+            fragmented_packet_queue: Mutex::new(HashMap::new()),
+            l4_receive_channels: Mutex::new(HashMap::new()),
+            threads: Mutex::new(Vec::new()),
+        });
 
         let l3stack_recv = l3stack.clone();
         let handle_recv = thread::spawn(move || {
@@ -728,7 +812,11 @@ impl L3Stack {
         let mut recv_channels = self.l4_receive_channels.lock().unwrap();
         let proto_type = Ipv4Type::from(proto);
         match recv_channels.entry(proto_type) {
-            Occupied(_) => { Err(anyhow::anyhow!("Cannot register proto {:?} ({}) to L3Stack because it's already registered.", proto_type, proto)) }
+            Occupied(_) => Err(anyhow::anyhow!(
+                "Cannot register proto {:?} ({}) to L3Stack because it's already registered.",
+                proto_type,
+                proto
+            )),
             Vacant(e) => {
                 e.insert(l4_recv_channel);
                 Ok(())
@@ -757,14 +845,21 @@ impl L3Stack {
                 Occupied(e) => {
                     match e.get().send(ipv4_packet) {
                         Err(e) => {
-                            anyhow::bail!("Failed to transfer packet to {:?} stack. Err: {}", proto, e);
+                            anyhow::bail!(
+                                "Failed to transfer packet to {:?} stack. Err: {}",
+                                proto,
+                                e
+                            );
                         }
                         Ok(_) => {}
                     }
                     return Ok(());
                 }
                 Vacant(_) => {
-                    log::trace!("There is no registered L4 stack for the ipv4 packet (proto={:?}).", proto);
+                    log::trace!(
+                        "There is no registered L4 stack for the ipv4 packet (proto={:?}).",
+                        proto
+                    );
                     return Ok(());
                 }
             }
@@ -797,7 +892,11 @@ impl L3Stack {
                 let id = ipv4_packet.identification;
                 if let Some(queue) = frag_queue.get_mut(&id) {
                     if queue.check_is_expired(IPV4_FRAGMENT_TIMEOUT) {
-                        log::warn!("Ipv4 fragment queue (id={}) is cleared due to timeout ({:?}).", id, IPV4_FRAGMENT_TIMEOUT);
+                        log::warn!(
+                            "Ipv4 fragment queue (id={}) is cleared due to timeout ({:?}).",
+                            id,
+                            IPV4_FRAGMENT_TIMEOUT
+                        );
                         frag_queue.remove_entry(&id);
                         continue;
                     }
@@ -809,7 +908,10 @@ impl L3Stack {
                                 }
                             }
                             Err(e) => {
-                                log::warn!("Creating packet from fragment queue failed. Err: {}", e);
+                                log::warn!(
+                                    "Creating packet from fragment queue failed. Err: {}",
+                                    e
+                                );
                             }
                         }
                         frag_queue.remove_entry(&id);
@@ -820,7 +922,6 @@ impl L3Stack {
                     frag_queue.insert(id, new_queue);
                 }
             }
-
         }
     }
 }
@@ -828,8 +929,8 @@ impl L3Stack {
 #[cfg(test)]
 mod ipv4_tests {
     use super::*;
-    use rstest::rstest;
     use hex::decode;
+    use rstest::rstest;
 
     #[rstest]
     // normal icmp packet
@@ -939,13 +1040,17 @@ mod ipv4_tests {
         #[case] expected_dst_addr: [u8; 4],
         #[case] expected_options: Option<u32>,
         #[case] encoded_payload: &str,
-        #[case] expected_valid: bool
+        #[case] expected_valid: bool,
     ) {
         let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
         let payload = decode(encoded_payload).expect("Failed to decode payload hex string");
         let mut ipv4_packet = Ipv4Packet::new();
-        let result = ipv4_packet.read(&packet_data).expect("Failed to read IPv4 packet");
-        let recreated_packet = ipv4_packet.create_packet().expect("Failed to recreate packet");
+        let result = ipv4_packet
+            .read(&packet_data)
+            .expect("Failed to read IPv4 packet");
+        let recreated_packet = ipv4_packet
+            .create_packet()
+            .expect("Failed to recreate packet");
 
         assert_eq!(ipv4_packet.version, expected_version);
         assert_eq!(ipv4_packet.ihl, expected_ihl);
@@ -962,7 +1067,10 @@ mod ipv4_tests {
         assert_eq!(ipv4_packet.options, expected_options);
         assert_eq!(ipv4_packet.payload, payload);
         assert_eq!(result, expected_valid);
-        assert_eq!(recreated_packet, packet_data, "Recreated packet does not match the original data");
+        assert_eq!(
+            recreated_packet, packet_data,
+            "Recreated packet does not match the original data"
+        );
     }
 
     #[rstest]
@@ -972,9 +1080,7 @@ mod ipv4_tests {
     #[case("4700005439034000400168d9c0a8c815080808080800dada2062000152f2a862000000003d9a050000000000101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637")]
     // bad checksum (0x68d9)
     #[case("4500005439034000400168d9c0a8c815080808080800dada2062000152f2a862000000003d9a050000000000101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637")]
-    fn test_ipv4_packet_read_error(
-        #[case] encoded_packet: &str,
-    ) {
+    fn test_ipv4_packet_read_error(#[case] encoded_packet: &str) {
         let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
         let mut packet = Ipv4Packet::new();
         let result = packet.read(&packet_data);
@@ -1026,7 +1132,7 @@ mod ipv4_tests {
     fn test_search_route(
         #[case] target_ip: Ipv4Addr,
         #[case] routes_data: Vec<(Ipv4Network, Route)>,
-        #[case] expected_gateway: Ipv4Addr
+        #[case] expected_gateway: Ipv4Addr,
     ) {
         let routes: HashMap<Ipv4Network, Route> = routes_data.into_iter().collect();
         let result = search_route(&routes, &target_ip);

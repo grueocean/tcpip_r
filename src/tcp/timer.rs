@@ -1,31 +1,38 @@
 use crate::tcp::{
-    defs::TcpStatus, usrreq::{TcpStack}, packet::TcpPacket,
-    input::{TcpConnection, TcpEvent, TcpEventType}
+    defs::TcpStatus,
+    input::{TcpConnection, TcpEvent, TcpEventType},
+    packet::TcpPacket,
+    usrreq::TcpStack,
 };
 use anyhow::{Context, Result};
-use std::{cmp::max, collections::{HashMap, VecDeque}, sync::MutexGuard, time::{Duration, Instant}, thread};
+use std::{
+    cmp::max,
+    collections::{HashMap, VecDeque},
+    sync::MutexGuard,
+    thread,
+    time::{Duration, Instant},
+};
 
 // From FreeBSD 14.1.0 implementation.
 const TCP_MAXRXTSHIFT: usize = 12;
 const TCP_MAXRXTSHIFT_DEFAULT: usize = 12;
 const TCP_RTT_INVALIDATE: usize = TCP_MAXRXTSHIFT_DEFAULT / 4;
 // 1 (i=0) is not used for the actual retransmission.
-const TCP_BACKOFF: [usize; TCP_MAXRXTSHIFT_DEFAULT+2] = [
-    1, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 512, 512, 0
-];
+const TCP_BACKOFF: [usize; TCP_MAXRXTSHIFT_DEFAULT + 2] =
+    [1, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 512, 512, 0];
 // TCP_REXMT_*** are all msec.
-const TCP_REXMT_INIT: usize = 1_000;   // BSD: tcp_rexmit_initial
-const TCP_REXMT_SLOP: usize = 20;      // BSD: tcp_rexmit_slop
-const TCP_REXMT_MIN: usize = 30;       // BSD: tcp_rexmit_min
-const TCP_REXMT_MAX: usize = 64_000;   // BSD: TCPTV_REXMTMAX
+const TCP_REXMT_INIT: usize = 1_000; // BSD: tcp_rexmit_initial
+const TCP_REXMT_SLOP: usize = 20; // BSD: tcp_rexmit_slop
+const TCP_REXMT_MIN: usize = 30; // BSD: tcp_rexmit_min
+const TCP_REXMT_MAX: usize = 64_000; // BSD: TCPTV_REXMTMAX
 const TCP_REXMT_RTTVAR_INIT: usize = 400;
 // A: srtt  M: rtt  D: rttvar
-const TCP_REXMT_GAIN_SHIFT: usize = 3;     // α = 1/8 : A <- (1-α)A + α*M
-const TCP_REXMT_MEAN_SHIFT: usize = 2;     // β = 1/4 : D <- D + β*(|M-A|-D)
-pub const TCP_SRTT_SHIFT: usize = 5;       // srtt is scaled by 32 (2^5).
-pub const TCP_RTTVAR_SHIFT: usize = 4;     // rttvar is scaled by 16 (2^4).
-// Delayed Ack Timer
-const TCP_DELAY_ACK: usize = 40;       // BSD: tcp_delacktime
+const TCP_REXMT_GAIN_SHIFT: usize = 3; // α = 1/8 : A <- (1-α)A + α*M
+const TCP_REXMT_MEAN_SHIFT: usize = 2; // β = 1/4 : D <- D + β*(|M-A|-D)
+pub const TCP_SRTT_SHIFT: usize = 5; // srtt is scaled by 32 (2^5).
+pub const TCP_RTTVAR_SHIFT: usize = 4; // rttvar is scaled by 16 (2^4).
+                                       // Delayed Ack Timer
+const TCP_DELAY_ACK: usize = 40; // BSD: tcp_delacktime
 
 impl TcpStack {
     pub fn timer_thread(&self) -> Result<()> {
@@ -50,18 +57,33 @@ impl TcpStack {
             .collect();
         for (socket_id, status) in statusmap {
             match status {
-                TcpStatus::SynSent => { self.timer_handler_syn(socket_id, &mut conns).context("timer_handler_syn failed. (state=SYN-SENT)")?; }
-                TcpStatus::SynRcvd => { self.timer_handler_syn(socket_id, &mut conns).context("timer_handler_syn failed. (state=SYN-RCVD)")?; }
-                TcpStatus::Established => { self.timer_handler_datagram(socket_id, &mut conns).context("timer_handler_datagram failed. (state=ESTABLISHED)")?; }
+                TcpStatus::SynSent => {
+                    self.timer_handler_syn(socket_id, &mut conns)
+                        .context("timer_handler_syn failed. (state=SYN-SENT)")?;
+                }
+                TcpStatus::SynRcvd => {
+                    self.timer_handler_syn(socket_id, &mut conns)
+                        .context("timer_handler_syn failed. (state=SYN-RCVD)")?;
+                }
+                TcpStatus::Established => {
+                    self.timer_handler_datagram(socket_id, &mut conns)
+                        .context("timer_handler_datagram failed. (state=ESTABLISHED)")?;
+                }
                 _ => {}
             }
         }
         Ok(())
     }
 
-    pub fn timer_handler_syn(&self, socket_id: usize, conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>) -> Result<()> {
+    pub fn timer_handler_syn(
+        &self,
+        socket_id: usize,
+        conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>,
+    ) -> Result<()> {
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-            if !conn.timer.retransmission.timer_param.active { return Ok(() ); };
+            if !conn.timer.retransmission.timer_param.active {
+                return Ok(());
+            };
             if conn.timer.retransmission.is_expired()? {
                 if let Err(e) = self.send_handler(conn) {
                     conn.timer.retransmission.next_syn();
@@ -73,7 +95,9 @@ impl TcpStack {
                     conn.timer.retransmission.next_syn();
                     log::debug!(
                         "[{}] Retransmitted a SYN packet. next shift={} next delta={}",
-                        conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta
+                        conn.print_log_prefix(socket_id),
+                        conn.timer.retransmission.timer_param.rexmt_shift,
+                        conn.timer.retransmission.timer_param.delta
                     );
                 }
                 if conn.timer.retransmission.is_finished() {
@@ -82,7 +106,10 @@ impl TcpStack {
                         conn.print_log_prefix(socket_id),
                     );
                     conn.timer.retransmission.timer_param.active = false;
-                    self.publish_event(TcpEvent {socket_id: socket_id, event: TcpEventType::Closed});
+                    self.publish_event(TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::Closed,
+                    });
                 }
             }
         } else {
@@ -91,7 +118,11 @@ impl TcpStack {
         Ok(())
     }
 
-    pub fn timer_handler_datagram(&self, socket_id: usize, conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>) -> Result<()> {
+    pub fn timer_handler_datagram(
+        &self,
+        socket_id: usize,
+        conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>,
+    ) -> Result<()> {
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
             self.timer_handler_datagram_retransmission(socket_id, conn)?;
             self.timer_handler_datagram_delayed_ack(socket_id, conn)?;
@@ -101,8 +132,14 @@ impl TcpStack {
         Ok(())
     }
 
-    fn timer_handler_datagram_retransmission(&self, socket_id: usize, conn: &mut TcpConnection) -> Result<()> {
-        if !conn.timer.retransmission.timer_param.active { return Ok(()); };
+    fn timer_handler_datagram_retransmission(
+        &self,
+        socket_id: usize,
+        conn: &mut TcpConnection,
+    ) -> Result<()> {
+        if !conn.timer.retransmission.timer_param.active {
+            return Ok(());
+        };
         if conn.timer.retransmission.is_expired()? {
             conn.send_flag.ack_now = true;
             conn.send_flag.snd_from_una = true;
@@ -116,7 +153,9 @@ impl TcpStack {
                 conn.timer.retransmission.next_datagram();
                 log::debug!(
                     "[{}] Retransmitted a datagram packet. next shift={} next delta={}",
-                    conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.timer.retransmission.timer_param.delta
+                    conn.print_log_prefix(socket_id),
+                    conn.timer.retransmission.timer_param.rexmt_shift,
+                    conn.timer.retransmission.timer_param.delta
                 );
             }
             // Based on Karn Algo, we won't mesure rtt.
@@ -128,20 +167,30 @@ impl TcpStack {
                     conn.print_log_prefix(socket_id),
                 );
                 conn.status = TcpStatus::Closed;
-                self.publish_event(TcpEvent {socket_id: socket_id, event: TcpEventType::Closed});
+                self.publish_event(TcpEvent {
+                    socket_id: socket_id,
+                    event: TcpEventType::Closed,
+                });
             }
         }
         Ok(())
     }
 
-    fn timer_handler_datagram_delayed_ack(&self, socket_id: usize, conn: &mut TcpConnection) -> Result<()> {
-        if !conn.timer.delayed_ack.timer_param.active { return Ok(() ); };
+    fn timer_handler_datagram_delayed_ack(
+        &self,
+        socket_id: usize,
+        conn: &mut TcpConnection,
+    ) -> Result<()> {
+        if !conn.timer.delayed_ack.timer_param.active {
+            return Ok(());
+        };
         if conn.timer.delayed_ack.is_expired()? {
             conn.send_flag.ack_now = true;
             if let Err(e) = self.send_handler(conn) {
                 log::warn!(
                     "[{}] Failed to delayed ack. Err: {:?}",
-                    conn.print_log_prefix(socket_id), e
+                    conn.print_log_prefix(socket_id),
+                    e
                 );
             } else {
                 log::debug!(
@@ -160,10 +209,14 @@ pub fn update_retransmission_param(conn: &mut TcpConnection, rtt: usize) -> Resu
     // (2.3) When a subsequent RTT measurement R' is made, a host MUST set rfc6298
     if timer_param.rtt_smoothed != 0 && timer_param.rexmt_shift <= TCP_RTT_INVALIDATE {
         // RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'| rfc6298
-        timer_param.rtt_variance = timer_param.rtt_variance - (timer_param.rtt_variance >> TCP_REXMT_MEAN_SHIFT) +
-                                   ((rtt << TCP_SRTT_SHIFT).abs_diff(timer_param.rtt_smoothed) >> (TCP_SRTT_SHIFT - TCP_RTTVAR_SHIFT + TCP_REXMT_MEAN_SHIFT));
+        timer_param.rtt_variance = timer_param.rtt_variance
+            - (timer_param.rtt_variance >> TCP_REXMT_MEAN_SHIFT)
+            + ((rtt << TCP_SRTT_SHIFT).abs_diff(timer_param.rtt_smoothed)
+                >> (TCP_SRTT_SHIFT - TCP_RTTVAR_SHIFT + TCP_REXMT_MEAN_SHIFT));
         // SRTT <- (1 - alpha) * SRTT + alpha * R' rfc6298
-        timer_param.rtt_smoothed = (rtt << (TCP_SRTT_SHIFT - TCP_REXMT_GAIN_SHIFT)) + timer_param.rtt_smoothed - (timer_param.rtt_smoothed >> TCP_REXMT_GAIN_SHIFT);
+        timer_param.rtt_smoothed = (rtt << (TCP_SRTT_SHIFT - TCP_REXMT_GAIN_SHIFT))
+            + timer_param.rtt_smoothed
+            - (timer_param.rtt_smoothed >> TCP_REXMT_GAIN_SHIFT);
     // (2.2) When the first RTT measurement R is made, the host MUST set rfc6298
     } else {
         timer_param.rtt_smoothed = rtt << TCP_SRTT_SHIFT;
@@ -186,10 +239,10 @@ pub enum TcpTimerType {
 pub struct RetransmissionVariables {
     pub active: bool,
     pub rexmt_shift: usize,
-    pub rtt: usize,           // msec
-    pub rtt_smoothed: usize,  // msec
-    pub rtt_variance: usize,  // msec
-    pub delta: usize          // msec
+    pub rtt: usize,          // msec
+    pub rtt_smoothed: usize, // msec
+    pub rtt_variance: usize, // msec
+    pub delta: usize,        // msec
 }
 
 impl RetransmissionVariables {
@@ -204,7 +257,7 @@ impl RetransmissionVariables {
 pub struct RetransmissionTimer {
     pub timer_type: TcpTimerType,
     pub timer_param: RetransmissionVariables,
-    pub timer_count: Instant
+    pub timer_count: Instant,
 }
 
 impl RetransmissionTimer {
@@ -212,7 +265,7 @@ impl RetransmissionTimer {
         Self {
             timer_type: TcpTimerType::Retransmission,
             timer_param: RetransmissionVariables::new(),
-            timer_count: Instant::now()
+            timer_count: Instant::now(),
         }
     }
 
@@ -230,7 +283,8 @@ impl RetransmissionTimer {
         self.next_syn();
         log::debug!(
             "Retransmission timer for a SYN packet is fired. MAX={} initial delta={}",
-            TCP_MAXRXTSHIFT, self.timer_param.delta
+            TCP_MAXRXTSHIFT,
+            self.timer_param.delta
         );
     }
 
@@ -245,7 +299,9 @@ impl RetransmissionTimer {
         self.next_datagram();
         log::debug!(
             "Retransmission timer for a Datagram packet is fired. MAX={} shift={} initial delta={}",
-            TCP_MAXRXTSHIFT, self.timer_param.rexmt_shift, self.timer_param.delta
+            TCP_MAXRXTSHIFT,
+            self.timer_param.rexmt_shift,
+            self.timer_param.delta
         );
     }
 
@@ -261,7 +317,9 @@ impl RetransmissionTimer {
             let calc_delta = TCP_REXMT_INIT * TCP_BACKOFF[shift];
             self.timer_param.delta = adjust_delta(calc_delta);
         } else {
-            let calc_delta = ((self.timer_param.rtt_smoothed >> TCP_SRTT_SHIFT) + (self.timer_param.rtt_variance >> TCP_RTTVAR_SHIFT) * 4) * TCP_BACKOFF[shift];
+            let calc_delta = ((self.timer_param.rtt_smoothed >> TCP_SRTT_SHIFT)
+                + (self.timer_param.rtt_variance >> TCP_RTTVAR_SHIFT) * 4)
+                * TCP_BACKOFF[shift];
             self.timer_param.delta = adjust_delta(calc_delta);
         }
     }
@@ -270,7 +328,9 @@ impl RetransmissionTimer {
         let current = self.timer_param.rexmt_shift;
         anyhow::ensure!(
             current != 0 && current <= TCP_MAXRXTSHIFT,
-            "Retransmission counter is {} should be 1~{}.", current, TCP_MAXRXTSHIFT
+            "Retransmission counter is {} should be 1~{}.",
+            current,
+            TCP_MAXRXTSHIFT
         );
         if self.timer_count.elapsed() > Duration::from_millis(self.timer_param.delta as u64) {
             Ok(true)
@@ -315,7 +375,7 @@ impl DelayedAckVariables {
 pub struct DelayedAckTimer {
     pub timer_type: TcpTimerType,
     pub timer_param: DelayedAckVariables,
-    pub timer_count: Instant
+    pub timer_count: Instant,
 }
 
 impl DelayedAckTimer {
@@ -323,7 +383,7 @@ impl DelayedAckTimer {
         Self {
             timer_type: TcpTimerType::DelayedAck,
             timer_param: DelayedAckVariables::new(),
-            timer_count: Instant::now()
+            timer_count: Instant::now(),
         }
     }
 

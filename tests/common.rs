@@ -1,9 +1,9 @@
+use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
-use std::time::{Instant, Duration};
-use anyhow::{Result, Context};
+use std::time::{Duration, Instant};
 
 const SCRIPT_PATH: &str = "./env/";
 const SCRIPT_BASE: &str = "env";
@@ -142,15 +142,24 @@ pub fn child_wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<O
 }
 
 pub fn check_stdout_pattern(child: &mut Child, patterns: &[&str]) -> Result<bool> {
-    let stdout = child.stdout.take().context("Cannot take stdout from child.")?;
-    let output: String = BufReader::new(stdout).lines().collect::<Result<Vec<_>, _>>()?.join("\n");
+    let stdout = child
+        .stdout
+        .take()
+        .context("Cannot take stdout from child.")?;
+    let output: String = BufReader::new(stdout)
+        .lines()
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
     println!("output: {}", output);
     Ok(patterns.iter().all(|pattern| output.contains(pattern)))
 }
 
 pub fn dump_stdout(child: &mut Child) -> Result<()> {
     println!("=== Dump stdout start id={} ===", child.id());
-    let stdout = child.stdout.take().context("Cannot take stdout from child.")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Cannot take stdout from child.")?;
     for line in BufReader::new(stdout).lines() {
         println!("{}", line.context("Failed to read line")?);
     }
@@ -160,7 +169,10 @@ pub fn dump_stdout(child: &mut Child) -> Result<()> {
 
 pub fn dump_stderr(child: &mut Child) -> Result<()> {
     println!("=== Dump stderr start id={} ===", child.id());
-    let stderr = child.stderr.take().context("Cannot take stderr from child.")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Cannot take stderr from child.")?;
     for line in BufReader::new(stderr).lines() {
         println!("{}", line.context("Failed to read line")?);
     }

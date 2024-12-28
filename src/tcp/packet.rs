@@ -1,13 +1,17 @@
-use crate::l2_l3::{
-    defs::Ipv4Type,
-    ip::Ipv4Packet,
-};
+use crate::l2_l3::{defs::Ipv4Type, ip::Ipv4Packet};
 use crate::tcp::{
-    defs::{TcpStatus, TcpOptionKind}, input::{TcpConnection}
+    defs::{TcpOptionKind, TcpStatus},
+    input::TcpConnection,
 };
 use anyhow::{Context, Result};
 use bitflags::bitflags;
-use std::{cmp::{max, min}, collections::{HashMap, VecDeque}, net::Ipv4Addr, sync::MutexGuard, time::{Duration, Instant}};
+use std::{
+    cmp::{max, min},
+    collections::{HashMap, VecDeque},
+    net::Ipv4Addr,
+    sync::MutexGuard,
+    time::{Duration, Instant},
+};
 
 // Tcp header max size is 60 (15*4) bytes because Max Data Offset is 15 (0b1111).
 const TCP_HEADER_LENGTH_BASIC: usize = 20;
@@ -39,15 +43,15 @@ pub const TCP_DEFAULT_WINDOW_SCALE: u8 = 7;
 //
 #[derive(Default, Debug)]
 pub struct TcpPacket {
-    pub src_addr: [u8; 4],  // pesudo header
-    pub dst_addr: [u8; 4],  // pesudo header
-    pub protocol: u8,       // pesudo header
-    pub tcp_length: u16,    // pesudo header
+    pub src_addr: [u8; 4], // pesudo header
+    pub dst_addr: [u8; 4], // pesudo header
+    pub protocol: u8,      // pesudo header
+    pub tcp_length: u16,   // pesudo header
     pub local_port: u16,
     pub remote_port: u16,
     pub seq_number: u32,
     pub ack_number: u32,
-    pub offset: u8,         // 4 bit (payload begins from 4*offset bytes)
+    pub offset: u8, // 4 bit (payload begins from 4*offset bytes)
     pub flag: TcpFlag,
     pub window_size: u16,
     pub checksum: u16,
@@ -55,7 +59,7 @@ pub struct TcpPacket {
     pub option_raw: Vec<u8>,
     pub option: TcpOption,
     pub payload: Vec<u8>,
-    pub valid: bool
+    pub valid: bool,
 }
 
 impl TcpPacket {
@@ -71,9 +75,16 @@ impl TcpPacket {
     pub fn read(&mut self, ipv4_packet: &Ipv4Packet) -> Result<bool> {
         let tcp_len = ipv4_packet.payload.len();
         if tcp_len > 0xffff {
-            anyhow::bail!("TCP packet payload length is {}, must be smaller than 65536+1.", tcp_len);
+            anyhow::bail!(
+                "TCP packet payload length is {}, must be smaller than 65536+1.",
+                tcp_len
+            );
         } else if tcp_len < TCP_HEADER_LENGTH_BASIC {
-            anyhow::bail!("TCP packet payload length is {}, must be larger than header length ({}).", tcp_len, TCP_HEADER_LENGTH_BASIC);
+            anyhow::bail!(
+                "TCP packet payload length is {}, must be larger than header length ({}).",
+                tcp_len,
+                TCP_HEADER_LENGTH_BASIC
+            );
         } else {
             self.tcp_length = tcp_len as u16;
         }
@@ -87,8 +98,14 @@ impl TcpPacket {
         self.ack_number = u32::from_be_bytes(ipv4_packet.payload[8..12].try_into()?);
         self.offset = u8::from_be_bytes(ipv4_packet.payload[12..13].try_into()?) >> 4;
         let offset_bytes = (self.offset * 4) as usize;
-        anyhow::ensure!(tcp_len >= offset_bytes, "TCP packet payload length is {}, but header's data offset indicate {}.", tcp_len, offset_bytes);
-        self.flag = TcpFlag::from_bits_retain(u8::from_be_bytes(ipv4_packet.payload[13..14].try_into()?));
+        anyhow::ensure!(
+            tcp_len >= offset_bytes,
+            "TCP packet payload length is {}, but header's data offset indicate {}.",
+            tcp_len,
+            offset_bytes
+        );
+        self.flag =
+            TcpFlag::from_bits_retain(u8::from_be_bytes(ipv4_packet.payload[13..14].try_into()?));
         self.window_size = u16::from_be_bytes(ipv4_packet.payload[14..16].try_into()?);
         self.checksum = u16::from_be_bytes(ipv4_packet.payload[16..18].try_into()?);
         self.urg_pointer = u16::from_be_bytes(ipv4_packet.payload[18..20].try_into()?);
@@ -110,7 +127,7 @@ impl TcpPacket {
         let mut checksum_tmp: u32 = 0;
         for i in (0..packet.len()).step_by(2) {
             if i + 1 < packet.len() {
-                let word = u16::from_be_bytes([packet[i], packet[i+1]]);
+                let word = u16::from_be_bytes([packet[i], packet[i + 1]]);
                 checksum_tmp += u32::from(word);
             }
         }
@@ -136,8 +153,16 @@ impl TcpPacket {
         }
         let expected_checksum = self.calc_header_checksum();
         if self.checksum != expected_checksum && self.checksum != 0x0 {
-            log::debug!("Unexpected tcp header. Header checksum is 0x{:x} but is expected 0x{:x}.", self.checksum, expected_checksum);
-            anyhow::bail!("TCP Header has bad checksum 0x{:x}, expected 0x{:x}.", self.checksum, expected_checksum);
+            log::debug!(
+                "Unexpected tcp header. Header checksum is 0x{:x} but is expected 0x{:x}.",
+                self.checksum,
+                expected_checksum
+            );
+            anyhow::bail!(
+                "TCP Header has bad checksum 0x{:x}, expected 0x{:x}.",
+                self.checksum,
+                expected_checksum
+            );
         }
 
         Ok(self.valid)
@@ -189,7 +214,8 @@ impl TcpPacket {
     }
 
     fn set_tcp_length(&mut self) {
-        self.tcp_length = (TCP_HEADER_LENGTH_BASIC + self.option_raw.len() + self.payload.len()) as u16;
+        self.tcp_length =
+            (TCP_HEADER_LENGTH_BASIC + self.option_raw.len() + self.payload.len()) as u16;
     }
 
     fn set_packet_params(&mut self) {
@@ -226,14 +252,20 @@ impl TcpPacket {
 
     pub fn new_out_packet(conn: &mut TcpConnection, start_seq: Option<u32>) -> Result<Self> {
         match &conn.status {
-            TcpStatus::SynSent => { Ok(Self::new_syn_sent(conn).context("Failed to create syn_sent packet.")?) }
-            TcpStatus::SynRcvd => { Ok(Self::new_syn_rcvd(conn).context("Failed to create syn_rcvd packet.")?) }
+            TcpStatus::SynSent => {
+                Ok(Self::new_syn_sent(conn).context("Failed to create syn_sent packet.")?)
+            }
+            TcpStatus::SynRcvd => {
+                Ok(Self::new_syn_rcvd(conn).context("Failed to create syn_rcvd packet.")?)
+            }
             TcpStatus::Established => {
                 if !conn.send_flag.snd_from_una {
-                    Ok(Self::new_established_next(conn).context("Failed to create established_next packet.")?)
+                    Ok(Self::new_established_next(conn)
+                        .context("Failed to create established_next packet.")?)
                 } else {
-                    if let Some (start_seq) = start_seq {
-                        Ok(Self::new_established_rexmt(conn, start_seq).context("Failed to create established_rexmt packet.")?)
+                    if let Some(start_seq) = start_seq {
+                        Ok(Self::new_established_rexmt(conn, start_seq)
+                            .context("Failed to create established_rexmt packet.")?)
                     } else {
                         anyhow::bail!("Retransmission should specify start_seq.");
                     }
@@ -293,8 +325,14 @@ impl TcpPacket {
         datagram.ack_number = conn.recv_vars.next_sequence_num;
         datagram.flag = TcpFlag::ACK;
         datagram.window_size = conn.get_recv_window_for_pkt();
-        let start_offset = conn.send_vars.next_sequence_num.wrapping_sub(conn.send_vars.unacknowledged) as usize;
-        let payload_len = min(conn.send_queue.payload.len() - start_offset, conn.send_vars.send_mss as usize);
+        let start_offset = conn
+            .send_vars
+            .next_sequence_num
+            .wrapping_sub(conn.send_vars.unacknowledged) as usize;
+        let payload_len = min(
+            conn.send_queue.payload.len() - start_offset,
+            conn.send_vars.send_mss as usize,
+        );
         let end_offset = start_offset + payload_len;
         datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
         Ok(datagram)
@@ -314,7 +352,10 @@ impl TcpPacket {
         datagram.flag = TcpFlag::ACK;
         datagram.window_size = conn.get_recv_window_for_pkt();
         let start_offset = start_seq.wrapping_sub(conn.send_vars.unacknowledged) as usize;
-        let payload_len = min(conn.send_queue.payload.len() - start_offset, conn.send_vars.send_mss as usize);
+        let payload_len = min(
+            conn.send_queue.payload.len() - start_offset,
+            conn.send_vars.send_mss as usize,
+        );
         let end_offset = start_offset + payload_len;
         datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
         Ok(datagram)
@@ -323,8 +364,15 @@ impl TcpPacket {
     pub fn print_general_info(&self) -> String {
         format!(
             "SEGINFO: SRC={}:{} DST={}:{} SEQ={} ACK={} LENGTH={} WND(RAW)={} FLAG={:?}",
-            Ipv4Addr::from(self.src_addr), self.local_port, Ipv4Addr::from(self.dst_addr), self.remote_port,
-            self.seq_number, self.ack_number, self.payload.len(), self.window_size, self.flag
+            Ipv4Addr::from(self.src_addr),
+            self.local_port,
+            Ipv4Addr::from(self.dst_addr),
+            self.remote_port,
+            self.seq_number,
+            self.ack_number,
+            self.payload.len(),
+            self.window_size,
+            self.flag
         )
     }
 }
@@ -345,11 +393,11 @@ bitflags! {
 
 #[derive(Default, Debug, PartialEq)]
 pub struct TcpOption {
-    pub mss: Option<u16>,                         // kind=2 Maximum Segment Size  2 bytes
-    pub window_scale: Option<u8>,                 // kind=3 Window Scale Option   1 bytes
-    pub sack_permitted: bool,                     // kind=4 Sack-Permitted Option 0 bytes (only kind and length=2)
-    pub sack: Option<Vec<(u32, u32)>>,            // kind=5 Sack Option           8 bytes * n
-    pub timestamps: Option<TcpOptionTimestamp>    // kind=8 Timestamps Option     4 bytes * 2
+    pub mss: Option<u16>,              // kind=2 Maximum Segment Size  2 bytes
+    pub window_scale: Option<u8>,      // kind=3 Window Scale Option   1 bytes
+    pub sack_permitted: bool, // kind=4 Sack-Permitted Option 0 bytes (only kind and length=2)
+    pub sack: Option<Vec<(u32, u32)>>, // kind=5 Sack Option           8 bytes * n
+    pub timestamps: Option<TcpOptionTimestamp>, // kind=8 Timestamps Option     4 bytes * 2
 }
 
 impl TcpOption {
@@ -359,7 +407,7 @@ impl TcpOption {
             window_scale: None,
             sack_permitted: false,
             sack: None,
-            timestamps: None
+            timestamps: None,
         }
     }
 
@@ -367,52 +415,99 @@ impl TcpOption {
         let mut offset: usize = 0;
         let length = option.len();
         while offset < length {
-            let kind = u8::from_be_bytes(option[offset..offset+1].try_into()?);
+            let kind = u8::from_be_bytes(option[offset..offset + 1].try_into()?);
             match TcpOptionKind::from(kind) {
                 TcpOptionKind::EndOption => {
-                    anyhow::ensure!(offset + 1 == length, "EndOption offset is {} but option length is {}.", offset, length);
+                    anyhow::ensure!(
+                        offset + 1 == length,
+                        "EndOption offset is {} but option length is {}.",
+                        offset,
+                        length
+                    );
                     offset += 1;
                 }
                 TcpOptionKind::NoOperation => {
                     offset += 1;
                 }
                 TcpOptionKind::MaxSegmentSize => {
-                    anyhow::ensure!(offset + 4 <= length, "MaxSegmentSize needs 4 bytes but only {} bytes left.", length - offset);
-                    let len = u8::from_be_bytes(option[offset+1..offset+2].try_into()?);
-                    anyhow::ensure!(len == 4, "Length field of MaxSegmentSize must be 4 but is {}.", len);
-                    self.mss = Some(u16::from_be_bytes(option[offset+2..offset+4].try_into()?));
+                    anyhow::ensure!(
+                        offset + 4 <= length,
+                        "MaxSegmentSize needs 4 bytes but only {} bytes left.",
+                        length - offset
+                    );
+                    let len = u8::from_be_bytes(option[offset + 1..offset + 2].try_into()?);
+                    anyhow::ensure!(
+                        len == 4,
+                        "Length field of MaxSegmentSize must be 4 but is {}.",
+                        len
+                    );
+                    self.mss = Some(u16::from_be_bytes(
+                        option[offset + 2..offset + 4].try_into()?,
+                    ));
                     offset += 4;
                 }
                 TcpOptionKind::WindowScale => {
-                    anyhow::ensure!(offset + 3 <= length, "WindowScale needs 3 bytes but only {} bytes left.", length - offset);
-                    let len = u8::from_be_bytes(option[offset+1..offset+2].try_into()?);
-                    anyhow::ensure!(len == 3, "Length field of WindowScale must be 3 but is {}.", len);
-                    self.window_scale = Some(u8::from_be_bytes(option[offset+2..offset+3].try_into()?));
+                    anyhow::ensure!(
+                        offset + 3 <= length,
+                        "WindowScale needs 3 bytes but only {} bytes left.",
+                        length - offset
+                    );
+                    let len = u8::from_be_bytes(option[offset + 1..offset + 2].try_into()?);
+                    anyhow::ensure!(
+                        len == 3,
+                        "Length field of WindowScale must be 3 but is {}.",
+                        len
+                    );
+                    self.window_scale = Some(u8::from_be_bytes(
+                        option[offset + 2..offset + 3].try_into()?,
+                    ));
                     offset += 3;
                 }
                 TcpOptionKind::SackPermission => {
-                    anyhow::ensure!(offset + 2 <= length, "SackPermission needs 2 bytes but only {} bytes left.", length - offset);
-                    let len = u8::from_be_bytes(option[offset+1..offset+2].try_into()?);
-                    anyhow::ensure!(len == 2, "Length field of WindowScale must be 2 but is {}.", len);
+                    anyhow::ensure!(
+                        offset + 2 <= length,
+                        "SackPermission needs 2 bytes but only {} bytes left.",
+                        length - offset
+                    );
+                    let len = u8::from_be_bytes(option[offset + 1..offset + 2].try_into()?);
+                    anyhow::ensure!(
+                        len == 2,
+                        "Length field of WindowScale must be 2 but is {}.",
+                        len
+                    );
                     self.sack_permitted = true;
                     offset += 2;
                 }
                 TcpOptionKind::SackOption => {
-                    anyhow::ensure!(offset + 2 <= length, "SackOption needs 2 bytes but only {} bytes left.", length - offset);
-                    let len = u8::from_be_bytes(option[offset+1..offset+2].try_into()?) as usize;
-                    anyhow::ensure!(offset + len <= length, "Length field of SackOption is {} but only {} bytes left.", len, length - offset);
-                    anyhow::ensure!((length - offset - 2) % 8 == 0, "SackOption payload must be 8 bytes aligned but len-2 is {}.", len - 2);
-                    for i in (offset+2..offset+len).step_by(8) {
+                    anyhow::ensure!(
+                        offset + 2 <= length,
+                        "SackOption needs 2 bytes but only {} bytes left.",
+                        length - offset
+                    );
+                    let len =
+                        u8::from_be_bytes(option[offset + 1..offset + 2].try_into()?) as usize;
+                    anyhow::ensure!(
+                        offset + len <= length,
+                        "Length field of SackOption is {} but only {} bytes left.",
+                        len,
+                        length - offset
+                    );
+                    anyhow::ensure!(
+                        (length - offset - 2) % 8 == 0,
+                        "SackOption payload must be 8 bytes aligned but len-2 is {}.",
+                        len - 2
+                    );
+                    for i in (offset + 2..offset + len).step_by(8) {
                         if let Some(sack) = self.sack.as_mut() {
                             sack.push((
-                                u32::from_be_bytes(option[i..i+4].try_into()?),
-                                u32::from_be_bytes(option[i+4..i+8].try_into()?)
+                                u32::from_be_bytes(option[i..i + 4].try_into()?),
+                                u32::from_be_bytes(option[i + 4..i + 8].try_into()?),
                             ));
                         } else {
                             let mut new_sack = Vec::new();
                             new_sack.push((
-                                u32::from_be_bytes(option[i..i+4].try_into()?),
-                                u32::from_be_bytes(option[i+4..i+8].try_into()?)
+                                u32::from_be_bytes(option[i..i + 4].try_into()?),
+                                u32::from_be_bytes(option[i + 4..i + 8].try_into()?),
                             ));
                             self.sack = Some(new_sack);
                         }
@@ -420,21 +515,37 @@ impl TcpOption {
                     offset += len;
                 }
                 TcpOptionKind::Timestamp => {
-                    anyhow::ensure!(offset + 10 <= length, "Timestamp needs 10 bytes but only {} bytes left.", length - offset);
-                    let len = u8::from_be_bytes(option[offset+1..offset+2].try_into()?);
-                    anyhow::ensure!(len == 10, "Length field of Timestamp must be 10 but is {}.", len);
+                    anyhow::ensure!(
+                        offset + 10 <= length,
+                        "Timestamp needs 10 bytes but only {} bytes left.",
+                        length - offset
+                    );
+                    let len = u8::from_be_bytes(option[offset + 1..offset + 2].try_into()?);
+                    anyhow::ensure!(
+                        len == 10,
+                        "Length field of Timestamp must be 10 but is {}.",
+                        len
+                    );
                     self.timestamps = Some(TcpOptionTimestamp {
-                        ts_value: u32::from_be_bytes(option[offset+2..offset+6].try_into()?),
-                        ts_echo_reply: u32::from_be_bytes(option[offset+6..offset+10].try_into()?),
+                        ts_value: u32::from_be_bytes(option[offset + 2..offset + 6].try_into()?),
+                        ts_echo_reply: u32::from_be_bytes(
+                            option[offset + 6..offset + 10].try_into()?,
+                        ),
                     });
                     offset += 10;
                 }
                 TcpOptionKind::Unknown => {
                     log::debug!("Unknown tcp option. kind: {}", kind);
                     anyhow::ensure!(offset + 2 <= length, "This option kind is unknown, at least need 2 bytes but only {} bytes left.", length - offset);
-                    let len = u8::from_be_bytes(option[offset+1..offset+2].try_into()?) as usize;
+                    let len =
+                        u8::from_be_bytes(option[offset + 1..offset + 2].try_into()?) as usize;
                     if len > 2 {
-                        anyhow::ensure!(offset + len <= length, "Length field of unkown option is {} but only {} bytes left.", len, length - offset);
+                        anyhow::ensure!(
+                            offset + len <= length,
+                            "Length field of unkown option is {} but only {} bytes left.",
+                            len,
+                            length - offset
+                        );
                     }
                     offset += len;
                 }
@@ -473,7 +584,11 @@ impl TcpOption {
                 packet.extend_from_slice(&right.to_be_bytes());
             }
         }
-        if let Some(TcpOptionTimestamp {ts_value, ts_echo_reply}) = self.timestamps {
+        if let Some(TcpOptionTimestamp {
+            ts_value,
+            ts_echo_reply,
+        }) = self.timestamps
+        {
             packet.push(u8::from(TcpOptionKind::Timestamp));
             packet.push(10);
             packet.extend_from_slice(&ts_value.to_be_bytes());
@@ -501,15 +616,15 @@ impl TcpOption {
 //            1       1              4                     4
 #[derive(Debug, PartialEq)]
 pub struct TcpOptionTimestamp {
-    ts_value: u32,       // 4 bytes
-    ts_echo_reply: u32   // 4 bytes
+    ts_value: u32,      // 4 bytes
+    ts_echo_reply: u32, // 4 bytes
 }
 
 #[cfg(test)]
 mod tcp_tests {
     use super::*;
-    use rstest::rstest;
     use hex::decode;
+    use rstest::rstest;
 
     #[rstest]
     #[case(
@@ -604,16 +719,22 @@ mod tcp_tests {
         #[case] expected_urg_pointer: u16,
         #[case] expected_option: TcpOption,
         #[case] tcp_payload_hex: &str,
-        #[case] expected_valid: bool
+        #[case] expected_valid: bool,
     ) {
         let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
         let mut ipv4_packet = Ipv4Packet::new();
-        assert!(ipv4_packet.read(&packet_data).is_ok(), "Failed to read IPv4 packet");
+        assert!(
+            ipv4_packet.read(&packet_data).is_ok(),
+            "Failed to read IPv4 packet"
+        );
 
         let mut tcp_packet = TcpPacket::new();
         assert_eq!(ipv4_packet.protocol, expected_protocol);
         let read_result = tcp_packet.read(&ipv4_packet);
-        assert!(read_result.is_ok(), "TCP packet read failed when it should not have");
+        assert!(
+            read_result.is_ok(),
+            "TCP packet read failed when it should not have"
+        );
 
         if read_result.is_ok() {
             assert_eq!(tcp_packet.src_addr, expected_src_addr);
@@ -632,8 +753,12 @@ mod tcp_tests {
             assert_eq!(tcp_packet.option, expected_option);
             assert_eq!(tcp_packet.valid, expected_valid);
 
-            let payload_data = decode(tcp_payload_hex).expect("Failed to decode payload hex string");
-            assert_eq!(tcp_packet.payload, payload_data, "TCP payload does not match");
+            let payload_data =
+                decode(tcp_payload_hex).expect("Failed to decode payload hex string");
+            assert_eq!(
+                tcp_packet.payload, payload_data,
+                "TCP payload does not match"
+            );
         }
     }
     #[rstest]
@@ -641,15 +766,16 @@ mod tcp_tests {
     #[case("4500003450bf40008006ff4b0a000091ba0fe618d4a40050dd65a54700000000800220004cbb0000020405b401030302010104")]
     // bad tcp checksum, last byte is 01 but should be 02
     #[case("4500003450bf40008006ff4b0a000091ba0fe618d4a40050dd65a54700000000800220004cbb0000020405b40103030201010401")]
-    fn test_tcp_packet_read_error(
-        #[case] encoded_packet: &str,
-    ) {
+    fn test_tcp_packet_read_error(#[case] encoded_packet: &str) {
         let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
         let mut ipv4_packet = Ipv4Packet::new();
         let _ = ipv4_packet.read(&packet_data);
         let mut tcp_packet = TcpPacket::new();
         let result = tcp_packet.read(&ipv4_packet);
 
-        assert!(result.is_err(), "Expected an error for incorrect TCP packet");
+        assert!(
+            result.is_err(),
+            "Expected an error for incorrect TCP packet"
+        );
     }
 }

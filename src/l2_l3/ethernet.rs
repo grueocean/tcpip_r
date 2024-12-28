@@ -13,7 +13,7 @@ pub struct EthernetPacket {
     pub src: [u8; 6],
     pub ethertype: u16,
     pub payload: Vec<u8>,
-    pub valid: bool
+    pub valid: bool,
 }
 
 impl EthernetPacket {
@@ -23,13 +23,16 @@ impl EthernetPacket {
             src: [0; 6],
             ethertype: 0,
             payload: Vec::new(),
-            valid: false
+            valid: false,
         }
     }
 
     pub fn read(&mut self, packet: &Vec<u8>) -> Result<bool> {
         if packet.len() < ETHERNET_HEADER_SIZE {
-            return Err(anyhow::anyhow!("Insufficient packet length for Ethernet Header. packet.len()={}", packet.len()));
+            return Err(anyhow::anyhow!(
+                "Insufficient packet length for Ethernet Header. packet.len()={}",
+                packet.len()
+            ));
         }
         self.dst = packet[0..6].try_into()?;
         self.src = packet[6..12].try_into()?;
@@ -43,7 +46,10 @@ impl EthernetPacket {
     pub fn validate(&mut self) -> Result<bool> {
         self.valid = true;
         if EtherType::from(self.ethertype) == EtherType::Unknown {
-            log::warn!("Reading Unknown EtherType (0x{:x}) packet. Mark packet as invalid.", self.ethertype);
+            log::warn!(
+                "Reading Unknown EtherType (0x{:x}) packet. Mark packet as invalid.",
+                self.ethertype
+            );
             self.valid = false;
         }
 
@@ -62,7 +68,7 @@ impl EthernetPacket {
 }
 
 pub struct EthernetRecveiver {
-    pub rx: Mutex<Box<dyn DataLinkReceiver>>
+    pub rx: Mutex<Box<dyn DataLinkReceiver>>,
 }
 
 impl EthernetRecveiver {
@@ -75,7 +81,7 @@ impl EthernetRecveiver {
         let (_, rx) = match pnet_datalink::channel(&interface, Default::default()) {
             Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
             Ok(_) => return Err(anyhow::anyhow!("Ethernet channel is not available")),
-            Err(e) => return Err(e.into())
+            Err(e) => return Err(e.into()),
         };
 
         Ok(Self { rx: Mutex::new(rx) })
@@ -91,7 +97,7 @@ impl EthernetRecveiver {
 }
 
 pub struct EthernetSender {
-    pub tx: Mutex<Box<dyn DataLinkSender>>
+    pub tx: Mutex<Box<dyn DataLinkSender>>,
 }
 
 impl EthernetSender {
@@ -104,7 +110,7 @@ impl EthernetSender {
         let (tx, _) = match pnet_datalink::channel(&interface, Default::default()) {
             Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
             Ok(_) => return Err(anyhow::anyhow!("Ethernet channel is not available")),
-            Err(e) => return Err(e.into())
+            Err(e) => return Err(e.into()),
         };
 
         Ok(Self { tx: Mutex::new(tx) })
@@ -113,19 +119,20 @@ impl EthernetSender {
     pub fn send_packet(&mut self, packet: &[u8]) -> Result<()> {
         let mut tx = self.tx.lock().unwrap();
         match tx.send_to(packet, None) {
-            Some(result) => {
-                result.map_err(anyhow::Error::from).context("Failed to send packet")
-            }
-            None => Err(anyhow::anyhow!("Send operation did not return a result"))
+            Some(result) => result
+                .map_err(anyhow::Error::from)
+                .context("Failed to send packet"),
+            None => Err(anyhow::anyhow!("Send operation did not return a result")),
         }
     }
 }
 
 pub fn get_interface_mac(interface_name: String) -> Result<Option<MacAddress>> {
     if let Some(mac) = pnet_datalink::interfaces()
-            .into_iter()
-            .find(|i| i.name == interface_name)
-            .and_then(|i| i.mac) {
+        .into_iter()
+        .find(|i| i.name == interface_name)
+        .and_then(|i| i.mac)
+    {
         Ok(Some(MacAddress::new(mac.octets())))
     } else {
         Ok(None)
@@ -135,8 +142,8 @@ pub fn get_interface_mac(interface_name: String) -> Result<Option<MacAddress>> {
 #[cfg(test)]
 mod ethrenet_tests {
     use super::*;
-    use rstest::rstest;
     use hex::decode;
+    use rstest::rstest;
 
     #[rstest]
     #[case(
@@ -172,7 +179,7 @@ mod ethrenet_tests {
         #[case] expected_src: [u8; 6],
         #[case] expected_ethertype: u16,
         #[case] encoded_payload: &str,
-        #[case] expected_valid: bool
+        #[case] expected_valid: bool,
     ) {
         let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
         let payload = decode(encoded_payload).expect("Failed to decode payload hex string");
@@ -185,18 +192,22 @@ mod ethrenet_tests {
         assert_eq!(packet.ethertype, expected_ethertype);
         assert_eq!(packet.payload, payload);
         assert_eq!(packet.valid, expected_valid);
-        assert_eq!(recreated_packet, packet_data, "Recreated packet does not match the original data");
+        assert_eq!(
+            recreated_packet, packet_data,
+            "Recreated packet does not match the original data"
+        );
     }
 
     #[rstest]
     #[case("0102030405")]
-    fn test_ethernet_packet_read_error(
-        #[case] encoded_packet: &str,
-    ) {
+    fn test_ethernet_packet_read_error(#[case] encoded_packet: &str) {
         let packet_data = decode(encoded_packet).expect("Failed to decode hex string");
         let mut packet = EthernetPacket::new();
         let result = packet.read(&packet_data);
 
-        assert!(result.is_err(), "Expected an error for insufficient packet length");
+        assert!(
+            result.is_err(),
+            "Expected an error for insufficient packet length"
+        );
     }
 }
