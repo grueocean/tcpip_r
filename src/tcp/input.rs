@@ -937,7 +937,7 @@ pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bo
             conn.recv_vars.next_sequence_num,
             conn.recv_vars
                 .next_sequence_num
-                .wrapping_add(conn.recv_vars.window_size as u32),
+                 .wrapping_add(conn.recv_vars.window_size as u32),
             tcp_packet
                 .seq_number
                 .wrapping_add(tcp_packet.payload.len() as u32),
@@ -1174,6 +1174,7 @@ pub struct ReceiveVariables {
     pub initial_sequence_num: u32, // initial receive sequence number (IRS)
     pub window_shift: usize,    // received window scale option (Rcv.Wind.Shift)
     pub recv_mss: usize,        // mss report to remote peer
+    pub last_sent_window: usize, // window size recently notified to peer
 }
 
 impl ReceiveVariables {

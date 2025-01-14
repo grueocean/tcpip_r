@@ -31,7 +31,6 @@ const TCP_REXMT_GAIN_SHIFT: usize = 3; // α = 1/8 : A <- (1-α)A + α*M
 const TCP_REXMT_MEAN_SHIFT: usize = 2; // β = 1/4 : D <- D + β*(|M-A|-D)
 pub const TCP_SRTT_SHIFT: usize = 5; // srtt is scaled by 32 (2^5).
 pub const TCP_RTTVAR_SHIFT: usize = 4; // rttvar is scaled by 16 (2^4).
-                                       // Delayed Ack Timer
 const TCP_DELAY_ACK: usize = 40; // BSD: tcp_delacktime
 
 impl TcpStack {
@@ -158,7 +157,7 @@ impl TcpStack {
                     conn.timer.retransmission.timer_param.delta
                 );
             }
-            // Based on Karn Algo, we won't mesure rtt.
+            // Based on Karn Algo, we won't mesure rtt during retransmission.
             conn.rtt_start = None;
             if conn.timer.retransmission.is_finished() {
                 conn.timer.retransmission.init();

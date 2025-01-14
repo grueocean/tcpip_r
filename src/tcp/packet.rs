@@ -271,6 +271,19 @@ impl TcpPacket {
                     }
                 }
             }
+            TcpStatus::FinWait1 => {
+                if !conn.send_flag.snd_from_una {
+                    Ok(Self::new_fin_wait1_next(conn)
+                        .context("Failed to create fin_wait1_next packet.")?)
+                } else {
+                    if let Some(start_seq) = start_seq {
+                        Ok(Self::new_fin_wait1_rexmt(conn, start_seq)
+                            .context("Failed to create fin_wait1_rexmt packet.")?)
+                    } else {
+                        anyhow::bail!("Retransmission should specify start_seq.");
+                    }
+                }
+            }
             other => {
                 anyhow::bail!("Cannot generate packet from connection {}.", other);
             }
@@ -313,7 +326,7 @@ impl TcpPacket {
     }
 
     // create datagram packet starting from SND.NXT
-    pub fn new_established_next(conn: &mut TcpConnection) -> Result<Self> {
+    fn new_datagram_next(conn: &mut TcpConnection) -> Result<(Self, bool)> {
         let mut datagram = Self::new();
         datagram.option.set_default_option()?;
         datagram.src_addr = conn.src_addr.octets();
@@ -323,23 +336,30 @@ impl TcpPacket {
         datagram.remote_port = conn.remote_port;
         datagram.seq_number = conn.send_vars.next_sequence_num;
         datagram.ack_number = conn.recv_vars.next_sequence_num;
-        datagram.flag = TcpFlag::ACK;
         datagram.window_size = conn.get_recv_window_for_pkt();
         let start_offset = conn
             .send_vars
             .next_sequence_num
             .wrapping_sub(conn.send_vars.unacknowledged) as usize;
-        let payload_len = min(
-            conn.send_queue.payload.len() - start_offset,
+        let window_limit_payload_len = conn.send_vars.unacknowledged as usize
+            + conn.send_vars.get_scaled_send_window_size()
+            - conn.send_vars.next_sequence_num as usize;
+        let remain_payload_len = conn.send_queue.payload.len() - start_offset;
+        let payload_len = *[
+            remain_payload_len,
             conn.send_vars.send_mss as usize,
-        );
+            window_limit_payload_len,
+        ]
+        .iter()
+        .min()
+        .unwrap();
         let end_offset = start_offset + payload_len;
         datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
-        Ok(datagram)
+        Ok((datagram, remain_payload_len == payload_len))
     }
 
     // create datagram packet starting from start_seq
-    pub fn new_established_rexmt(conn: &mut TcpConnection, start_seq: u32) -> Result<Self> {
+    fn new_datagram_rexmt(conn: &mut TcpConnection, start_seq: u32) -> Result<(Self, bool)> {
         let mut datagram = Self::new();
         datagram.option.set_default_option()?;
         datagram.src_addr = conn.src_addr.octets();
@@ -349,15 +369,54 @@ impl TcpPacket {
         datagram.remote_port = conn.remote_port;
         datagram.seq_number = start_seq;
         datagram.ack_number = conn.recv_vars.next_sequence_num;
-        datagram.flag = TcpFlag::ACK;
         datagram.window_size = conn.get_recv_window_for_pkt();
         let start_offset = start_seq.wrapping_sub(conn.send_vars.unacknowledged) as usize;
-        let payload_len = min(
-            conn.send_queue.payload.len() - start_offset,
+        let window_limit_payload_len = conn.send_vars.unacknowledged as usize
+            + conn.send_vars.get_scaled_send_window_size()
+            - start_seq as usize;
+        let remain_payload_len = conn.send_queue.payload.len() - start_offset;
+        let payload_len = *[
+            remain_payload_len,
             conn.send_vars.send_mss as usize,
-        );
+            window_limit_payload_len,
+        ]
+        .iter()
+        .min()
+        .unwrap();
         let end_offset = start_offset + payload_len;
         datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
+        Ok((datagram, remain_payload_len == payload_len))
+    }
+
+    pub fn new_established_next(conn: &mut TcpConnection) -> Result<Self> {
+        let (mut datagram, _) = Self::new_datagram_next(conn)?;
+        datagram.flag = TcpFlag::ACK;
+        Ok(datagram)
+    }
+
+    pub fn new_established_rexmt(conn: &mut TcpConnection, start_seq: u32) -> Result<Self> {
+        let (mut datagram, _) = Self::new_datagram_rexmt(conn, start_seq)?;
+        datagram.flag = TcpFlag::ACK;
+        Ok(datagram)
+    }
+
+    pub fn new_fin_wait1_next(conn: &mut TcpConnection) -> Result<Self> {
+        let (mut datagram, sent_all) = Self::new_datagram_next(conn)?;
+        if sent_all {
+            datagram.flag = TcpFlag::ACK | TcpFlag::FIN;
+        } else {
+            datagram.flag = TcpFlag::ACK;
+        }
+        Ok(datagram)
+    }
+
+    pub fn new_fin_wait1_rexmt(conn: &mut TcpConnection, start_seq: u32) -> Result<Self> {
+        let (mut datagram, sent_all) = Self::new_datagram_rexmt(conn, start_seq)?;
+        if sent_all {
+            datagram.flag = TcpFlag::ACK | TcpFlag::FIN;
+        } else {
+            datagram.flag = TcpFlag::ACK;
+        }
         Ok(datagram)
     }
 
