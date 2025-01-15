@@ -36,6 +36,7 @@ const TCP_DEFAULT_RECV_QUEUE_LENGTH: usize = 4096;
 const TCP_RECV_QUEUE_WRAP: usize = 1 << 32;
 const TCP_NO_DELAY: bool = false;
 const TCP_DELAY_ACK: bool = true;
+const FR_RCV_BUFF_RATIO: usize = 10;
 
 impl TcpStack {
     pub fn receive_thread(&self) -> Result<()> {
@@ -225,6 +226,7 @@ impl TcpStack {
                         rtt_start: None,
                         rtt_seq: None,
                         last_snd_ack: 0,
+                        last_sent_window: 0,
                         send_flag: TcpSendControlFlag::new(),
                         conn_flag: TcpConnectionFlag::new(),
                     };
@@ -990,6 +992,7 @@ pub struct TcpConnection {
     pub rtt_start: Option<Instant>, // BSD: t_rtttime
     pub rtt_seq: Option<u32>,       // BSD: t_rtseq
     pub last_snd_ack: u32,          // BSD: last_ack_sent
+    pub last_sent_window: usize, // window size recently notified to peer
     pub send_flag: TcpSendControlFlag,
     pub conn_flag: TcpConnectionFlag,
 }
@@ -1012,6 +1015,7 @@ impl TcpConnection {
             rtt_start: None,
             rtt_seq: None,
             last_snd_ack: 0,
+            last_sent_window: 0,
             send_flag: TcpSendControlFlag::new(),
             conn_flag: TcpConnectionFlag::new(),
         }
@@ -1032,7 +1036,6 @@ impl TcpConnection {
     }
 
     pub fn get_recv_window_size(&self) -> usize {
-        // todo: need to adjust window size to avoid silly window syndrome
         self.recv_queue.queue_length - self.recv_queue.complete_datagram.payload.len()
     }
 
@@ -1174,7 +1177,6 @@ pub struct ReceiveVariables {
     pub initial_sequence_num: u32, // initial receive sequence number (IRS)
     pub window_shift: usize,    // received window scale option (Rcv.Wind.Shift)
     pub recv_mss: usize,        // mss report to remote peer
-    pub last_sent_window: usize, // window size recently notified to peer
 }
 
 impl ReceiveVariables {

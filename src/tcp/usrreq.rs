@@ -223,6 +223,7 @@ impl TcpStack {
                     let mut conns = self.connections.lock().unwrap();
                     let mut listen_queue = self.listen_queue.lock().unwrap();
                     if let Some(ref mut queue) = listen_queue.get_mut(&socket_id) {
+                        eprintln!("found queue. {:?}", queue);
                         if let Some(established_id) = queue.established_unconsumed.pop_front() {
                             eprintln!("found established socket. {}", established_id);
                             if let Some(Some(conn)) = conns.get(&established_id) {
@@ -347,6 +348,7 @@ impl TcpStack {
                             drop(conns);
                             drop(listen_queue);
                             loop {
+                                eprintln!("accept wait loop");
                                 if self.wait_event_with_timeout(
                                     TcpEvent {
                                         socket_id: socket_id,
@@ -359,6 +361,7 @@ impl TcpStack {
                                 } else {
                                     let listen_queue = self.listen_queue.lock().unwrap();
                                     if let Some(queue) = listen_queue.get(&socket_id) {
+                                        eprintln!("accept wait loop: queue {:?}", queue);
                                         if queue.established_unconsumed.len() > 0 {
                                             break;
                                         }
@@ -478,33 +481,40 @@ impl TcpStack {
                 let current_queue_free =
                     conn.send_queue.queue_length - conn.send_queue.payload.len();
                 let remain = payload_len - current_offset;
+                let wrote_bytes: usize;
                 if remain <= current_queue_free {
                     conn.send_queue
                         .payload
                         .extend_from_slice(&payload[current_offset..]);
                     current_offset = payload_len;
                     log::trace!(
-                        "[{}] Wrote {} bytes to send queue. SND.UNA={} CURRENT_QUEUE_LENGTH={}",
+                        "[{}] Wrote remaining all the data ({} bytes) to send queue. SND.UNA={} CURRENT_QUEUE_LENGTH={}",
                         conn.print_log_prefix(socket_id),
                         remain,
                         conn.send_vars.unacknowledged,
                         conn.send_queue.payload.len()
                     );
+                    wrote_bytes = remain;
                 } else {
                     conn.send_queue.payload.extend_from_slice(
                         &payload[current_offset..(current_offset + current_queue_free)],
                     );
                     current_offset += current_queue_free;
-                    log::trace!(
-                        "[{}] Wrote {} bytes to send queue. SND.UNA={} CURRENT_QUEUE_LENGTH={}",
-                        conn.print_log_prefix(socket_id),
-                        current_queue_free,
-                        conn.send_vars.unacknowledged,
-                        conn.send_queue.payload.len()
-                    );
+                    if current_queue_free != 0 {
+                        log::trace!(
+                            "[{}] Wrote partial data ({} bytes) to send queue. SND.UNA={} CURRENT_QUEUE_LENGTH={}",
+                            conn.print_log_prefix(socket_id),
+                            current_queue_free,
+                            conn.send_vars.unacknowledged,
+                            conn.send_queue.payload.len()
+                        );
+                    }
+                    wrote_bytes = current_queue_free;
                 }
-                if let Err(e) = self.send_handler(conn) {
-                    log::warn!("Failed to send a datagram. Err: {e:?}");
+                if wrote_bytes != 0 {
+                    if let Err(e) = self.send_handler(conn) {
+                        log::warn!("Failed to send a datagram. Err: {e:?}");
+                    }
                 }
                 if current_offset == payload_len {
                     if !conn.timer.retransmission.timer_param.active
@@ -563,6 +573,10 @@ impl TcpStack {
                     if read_size != 0 {
                         conn.recv_vars.window_size = conn.recv_queue.queue_length
                             - conn.recv_queue.complete_datagram.payload.len();
+                        conn.send_flag.ack_now = true;
+                        if let Err(e) = self.send_handler(conn) {
+                            log::warn!("Failed to ack after READ Call. Err: {:?}", e);
+                        }
                         return Ok(read_size);
                     }
                 }
@@ -657,6 +671,7 @@ impl TcpStack {
                 rtt_start: _rtt_start,
                 rtt_seq: _rtt_seq,
                 last_snd_ack: _last_snd_ack,
+                last_sent_window: _last_sent_window,
                 send_flag: _send_flag,
                 conn_flag: _conn_flag,
             }) = connection_info

@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
-use std::time::Instant;
+use std::{cmp::min, time::Instant};
 
 const TCP_SEND_LOOP_MAX: usize = 1000;
 
@@ -47,7 +47,7 @@ impl TcpStack {
         syn_packet.option.mss = Some(conn.recv_vars.recv_mss as u16);
         let snd_wnd = (syn_packet.window_size as usize) << conn.recv_vars.window_shift;
         self.send_tcp_packet(syn_packet)?;
-        conn.recv_vars.last_sent_window = snd_wnd;
+        conn.last_sent_window = snd_wnd;
         Ok(0)
     }
 
@@ -55,7 +55,7 @@ impl TcpStack {
         let syn_ack_packet = TcpPacket::new_out_packet(conn, None)?;
         let snd_wnd = (syn_ack_packet.window_size as usize) << conn.recv_vars.window_shift;
         self.send_tcp_packet(syn_ack_packet)?;
-        conn.recv_vars.last_sent_window = snd_wnd;
+        conn.last_sent_window = snd_wnd;
         Ok(0)
     }
 
@@ -65,7 +65,7 @@ impl TcpStack {
         let send_wnd = conn.send_vars.get_scaled_send_window_size();
         let send_mss = conn.send_vars.send_mss;
         let new_data = conn.send_queue.payload.len() - send_nxt.wrapping_sub(send_una) as usize;
-        let next_send_nxt = send_una.wrapping_add(conn.send_queue.payload.len() as u32);
+        let next_send_nxt = send_una.wrapping_add(min(conn.send_queue.payload.len(), conn.send_vars.get_scaled_send_window_size()) as u32);
         let send_allowed = send_una.wrapping_add(send_wnd as u32);
         if conn.send_flag.ack_delayed && new_data == 0 {
             log::debug!(
@@ -97,16 +97,17 @@ impl TcpStack {
                 if next_send_nxt == conn.send_vars.next_sequence_num
                     && conn.last_snd_ack == conn.recv_vars.next_sequence_num
                     && !conn.send_flag.ack_now
-                    && conn.get_recv_window_size() == conn.recv_vars.last_sent_window
+                    && conn.get_recv_window_size() == conn.last_sent_window
                 {
                     log::debug!(
-                        "Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} RCV.NXT={} LAST.SND.ACK={} RCV.WND={} LAST.SENT.RCV.WND={}",
+                        "Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} SND.WND={} RCV.NXT={} LAST.SND.ACK={} RCV.WND={} LAST.SENT.RCV.WND={}",
                         conn.send_flag.snd_from_una,
                         next_send_nxt,
+                        conn.send_vars.get_scaled_send_window_size(),
                         conn.recv_vars.next_sequence_num,
                         conn.last_snd_ack,
                         conn.get_recv_window_size(),
-                        conn.recv_vars.last_sent_window,
+                        conn.last_sent_window,
                     );
                     break;
                 }
@@ -122,7 +123,7 @@ impl TcpStack {
                         conn.send_vars.next_sequence_num.wrapping_add(datagram_size);
                     anyhow::anyhow!(e)
                 })?;
-                conn.recv_vars.last_sent_window = snd_wnd;
+                conn.last_sent_window = snd_wnd;
                 if conn.timer.delayed_ack.timer_param.active {
                     conn.timer.delayed_ack.init();
                 }
@@ -141,6 +142,7 @@ impl TcpStack {
             }
             Ok(0)
         } else {
+            // Usually, it's done by retransmission timer.
             let mut loop_count: usize = 0;
             let mut start_seq = conn.send_vars.unacknowledged;
             loop {
@@ -154,16 +156,17 @@ impl TcpStack {
                 if next_send_nxt == conn.send_vars.next_sequence_num
                     && conn.last_snd_ack == conn.recv_vars.next_sequence_num
                     && !conn.send_flag.ack_now
-                    && conn.get_recv_window_size() == conn.recv_vars.last_sent_window
+                    && conn.get_recv_window_size() == conn.last_sent_window
                 {
                     log::debug!(
-                        "Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} RCV.NXT={} LAST.SND.ACK={} RCV.WND={} LAST.SENT.RCV.WND={}",
+                        "Nothing to send. snd_from_una={} SND.UNA=SND.NXT={} SND.WND={} RCV.NXT={} LAST.SND.ACK={} RCV.WND={} LAST.SENT.RCV.WND={}",
                         conn.send_flag.snd_from_una,
                         next_send_nxt,
+                        conn.send_vars.get_scaled_send_window_size(),
                         conn.recv_vars.next_sequence_num,
                         conn.last_snd_ack,
                         conn.get_recv_window_size(),
-                        conn.recv_vars.last_sent_window,
+                        conn.last_sent_window,
                     );
                     break;
                 }
@@ -175,7 +178,7 @@ impl TcpStack {
                 let snd_wnd = (datagram.window_size as usize) << conn.recv_vars.window_shift;
                 // We don't need to update SND.NXT even if a packet failed to be sent because retransmission will be triggered anyway.
                 self.send_tcp_packet(datagram)?;
-                conn.recv_vars.last_sent_window = snd_wnd;
+                conn.last_sent_window = snd_wnd;
                 if conn.rtt_start.is_none() && datagram_size > 0 {
                     conn.rtt_start = Some(Instant::now());
                     conn.rtt_seq = Some(snd_seq);
