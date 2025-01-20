@@ -65,7 +65,10 @@ impl TcpStack {
         let send_wnd = conn.send_vars.get_scaled_send_window_size();
         let send_mss = conn.send_vars.send_mss;
         let new_data = conn.send_queue.payload.len() - send_nxt.wrapping_sub(send_una) as usize;
-        let next_send_nxt = send_una.wrapping_add(min(conn.send_queue.payload.len(), conn.send_vars.get_scaled_send_window_size()) as u32);
+        let next_send_nxt = send_una.wrapping_add(min(
+            conn.send_queue.payload.len(),
+            conn.send_vars.get_scaled_send_window_size(),
+        ) as u32);
         let send_allowed = send_una.wrapping_add(send_wnd as u32);
         if conn.send_flag.ack_delayed && new_data == 0 {
             log::debug!(

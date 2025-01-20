@@ -110,7 +110,6 @@ fn test_normal_datagram_server_to_client(
         .arg(format!("{}{}", TEST_DATA_DIR, file_name))
         .arg("--size")
         .arg(transfer_size.to_string())
-
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

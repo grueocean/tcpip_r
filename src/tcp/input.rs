@@ -335,7 +335,8 @@ impl TcpStack {
                     ack_packet.ack_number = next_ack;
                     ack_packet.flag = TcpFlag::ACK;
                     if let Some(_scale) = tcp_packet.option.window_scale {
-                        ack_packet.window_size = (conn.get_recv_window_size() >> TCP_DEFAULT_WINDOW_SCALE) as u16;
+                        ack_packet.window_size =
+                            (conn.get_recv_window_size() >> TCP_DEFAULT_WINDOW_SCALE) as u16;
                     } else {
                         ack_packet.window_size = conn.get_recv_window_for_syn_pkt();
                     }
@@ -753,7 +754,10 @@ impl TcpStack {
                     conn.send_vars.max_window_size = max(current_window, new_window);
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
-                    let snd_wnd_edge = conn.send_vars.unacknowledged.wrapping_add(conn.send_vars.get_scaled_send_window_size() as u32);
+                    let snd_wnd_edge = conn
+                        .send_vars
+                        .unacknowledged
+                        .wrapping_add(conn.send_vars.get_scaled_send_window_size() as u32);
                     if seq_greater_than(conn.send_vars.next_sequence_num, snd_wnd_edge) {
                         log::warn!(
                             "[{}] Peer reported a shrunk SND.WND resulting SND.UNA + SND.WND < SND.NXT. Adjusting SND.NXT. ({} -> {})",
@@ -948,7 +952,7 @@ pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bo
             conn.recv_vars.next_sequence_num,
             conn.recv_vars
                 .next_sequence_num
-                 .wrapping_add(conn.recv_vars.window_size as u32),
+                .wrapping_add(conn.recv_vars.window_size as u32),
             tcp_packet
                 .seq_number
                 .wrapping_add(tcp_packet.payload.len() as u32),
@@ -1001,7 +1005,7 @@ pub struct TcpConnection {
     pub rtt_start: Option<Instant>, // BSD: t_rtttime
     pub rtt_seq: Option<u32>,       // BSD: t_rtseq
     pub last_snd_ack: u32,          // BSD: last_ack_sent
-    pub last_sent_window: usize, // window size recently notified to peer
+    pub last_sent_window: usize,    // window size recently notified to peer
     pub send_flag: TcpSendControlFlag,
     pub conn_flag: TcpConnectionFlag,
 }
@@ -1046,7 +1050,10 @@ impl TcpConnection {
 
     pub fn get_recv_window_size(&self) -> usize {
         // https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.2.2
-        let adjust = min(self.recv_queue.queue_length / FR_RCV_BUFF_RATIO, self.recv_vars.recv_mss);
+        let adjust = min(
+            self.recv_queue.queue_length / FR_RCV_BUFF_RATIO,
+            self.recv_vars.recv_mss,
+        );
         let base = self.recv_queue.queue_length - self.recv_queue.complete_datagram.payload.len();
         if base >= adjust {
             (base - adjust) >> self.recv_vars.window_shift << self.recv_vars.window_shift
@@ -1284,7 +1291,10 @@ impl ReceiveQueue {
             complete_start <= new_start && new_end <= complete_max,
             "An invalid segment was added. SEG.SEQ={} SEG.LEN={} QUEUE.BEGIN_SEQ={} QUEUE.MAX_SEQ={}", new_start, payload.len(), complete_start, complete_end
         );
-        if self.complete_datagram.payload.len() == 0 && complete_start == new_start && self.fragmented_datagram.len() == 0 {
+        if self.complete_datagram.payload.len() == 0
+            && complete_start == new_start
+            && self.fragmented_datagram.len() == 0
+        {
             self.complete_datagram.payload = payload.clone();
             return Ok(());
         }
@@ -2074,12 +2084,10 @@ mod tcp_tests {
             sequence_num: 10,
             payload: vec![],
         };
-        let initial_pending = vec![
-            ReceiveFragment {
-                sequence_num: 13,
-                payload: vec![6, 7, 8, 6],
-            },
-        ];
+        let initial_pending = vec![ReceiveFragment {
+            sequence_num: 13,
+            payload: vec![6, 7, 8, 6],
+        }];
         let mut queue = ReceiveQueue {
             queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
             complete_datagram: initial_complete,
