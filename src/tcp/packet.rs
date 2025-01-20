@@ -300,7 +300,7 @@ impl TcpPacket {
         syn_sent.remote_port = conn.remote_port;
         syn_sent.seq_number = conn.send_vars.unacknowledged;
         syn_sent.flag = TcpFlag::SYN;
-        syn_sent.window_size = conn.get_recv_window_for_pkt();
+        syn_sent.window_size = conn.get_recv_window_for_syn_pkt();
         syn_sent.option.window_scale = Some(TCP_DEFAULT_WINDOW_SCALE);
         syn_sent.option.mss = Some(conn.send_vars.send_mss);
         Ok(syn_sent)
@@ -317,7 +317,7 @@ impl TcpPacket {
         syn_rcvd.seq_number = conn.send_vars.unacknowledged;
         syn_rcvd.ack_number = conn.recv_vars.next_sequence_num;
         syn_rcvd.flag = TcpFlag::SYN | TcpFlag::ACK;
-        syn_rcvd.window_size = conn.get_recv_window_size() as u16;
+        syn_rcvd.window_size = conn.get_recv_window_for_syn_pkt();
         if conn.send_vars.window_shift != 0 {
             syn_rcvd.option.window_scale = Some(TCP_DEFAULT_WINDOW_SCALE);
         }

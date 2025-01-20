@@ -51,6 +51,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    eprintln!("_test_tcp_server_data_recv started");
     env_logger::builder()
         .filter_level(log::LevelFilter::Trace)
         .format_timestamp_millis()

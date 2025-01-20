@@ -334,10 +334,10 @@ impl TcpStack {
                     ack_packet.seq_number = next_seq;
                     ack_packet.ack_number = next_ack;
                     ack_packet.flag = TcpFlag::ACK;
-                    if let Some(scale) = tcp_packet.option.window_scale {
-                        ack_packet.window_size = (conn.get_recv_window_size() >> scale) as u16;
+                    if let Some(_scale) = tcp_packet.option.window_scale {
+                        ack_packet.window_size = (conn.get_recv_window_size() >> TCP_DEFAULT_WINDOW_SCALE) as u16;
                     } else {
-                        ack_packet.window_size = conn.get_recv_window_for_pkt();
+                        ack_packet.window_size = conn.get_recv_window_for_syn_pkt();
                     }
                     self.send_tcp_packet(ack_packet)
                         .context("Failed to reply ACK.")?;
@@ -753,6 +753,14 @@ impl TcpStack {
                     conn.send_vars.max_window_size = max(current_window, new_window);
                     conn.send_vars.last_sequence_num = tcp_packet.seq_number;
                     conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
+                    let snd_wnd_edge = conn.send_vars.unacknowledged.wrapping_add(conn.send_vars.get_scaled_send_window_size() as u32);
+                    if seq_greater_than(conn.send_vars.next_sequence_num, snd_wnd_edge) {
+                        log::warn!(
+                            "[{}] Peer reported a shrunk SND.WND resulting SND.UNA + SND.WND < SND.NXT. Adjusting SND.NXT. ({} -> {})",
+                            conn.print_log_prefix(socket_id), conn.send_vars.next_sequence_num, snd_wnd_edge,
+                        );
+                        conn.send_vars.next_sequence_num = snd_wnd_edge;
+                    }
                 }
                 // todo: use timestamp option
                 if let (Some(rtt_start), Some(rtt_seq)) = (conn.rtt_start, conn.rtt_seq) {
@@ -797,7 +805,7 @@ impl TcpStack {
                     conn.recv_vars.window_size = conn.get_recv_window_size();
                     if prev_payload != current_payload {
                         log::debug!(
-                            "[{}] Datagram received {} bytes. (Received datagram length {}->{})",
+                            "[{}] Datagram received {} bytes. (Current received queue length {}->{})",
                             conn.print_log_prefix(socket_id),
                             rcv_nxt_advance,
                             prev_payload,
@@ -916,7 +924,8 @@ pub fn is_segment_acceptable(conn: &TcpConnection, tcp_packet: &TcpPacket) -> bo
             conn.recv_vars.next_sequence_num.wrapping_sub(1),
             conn.recv_vars
                 .next_sequence_num
-                .wrapping_add(conn.recv_vars.window_size as u32 - 1),
+                .wrapping_add(conn.recv_vars.window_size as u32)
+                .wrapping_sub(1),
             tcp_packet.seq_number,
         ) {
             return true;
@@ -1036,11 +1045,25 @@ impl TcpConnection {
     }
 
     pub fn get_recv_window_size(&self) -> usize {
-        self.recv_queue.queue_length - self.recv_queue.complete_datagram.payload.len()
+        // https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.2.2
+        let adjust = min(self.recv_queue.queue_length / FR_RCV_BUFF_RATIO, self.recv_vars.recv_mss);
+        let base = self.recv_queue.queue_length - self.recv_queue.complete_datagram.payload.len();
+        if base >= adjust {
+            (base - adjust) >> self.recv_vars.window_shift << self.recv_vars.window_shift
+        } else {
+            0
+        }
     }
 
     pub fn get_recv_window_for_pkt(&self) -> u16 {
         (self.get_recv_window_size() >> self.recv_vars.window_shift) as u16
+    }
+
+    // During negotiation, window shift is not detemined. As a result, window size could shrunk after window shift
+    // is determined because window size is aligned by window shift. To prevend the shrunk, we align windows size
+    // for a SYN packet based on TCP_DEFAULT_WINDOW_SCALE.
+    pub fn get_recv_window_for_syn_pkt(&self) -> u16 {
+        (self.get_recv_window_size() >> TCP_DEFAULT_WINDOW_SCALE << TCP_DEFAULT_WINDOW_SCALE) as u16
     }
 
     pub fn update_snd_una(&mut self, new_snd_una: u32) -> Result<bool> {
@@ -1261,7 +1284,7 @@ impl ReceiveQueue {
             complete_start <= new_start && new_end <= complete_max,
             "An invalid segment was added. SEG.SEQ={} SEG.LEN={} QUEUE.BEGIN_SEQ={} QUEUE.MAX_SEQ={}", new_start, payload.len(), complete_start, complete_end
         );
-        if self.complete_datagram.payload.len() == 0 && complete_start == new_start {
+        if self.complete_datagram.payload.len() == 0 && complete_start == new_start && self.fragmented_datagram.len() == 0 {
             self.complete_datagram.payload = payload.clone();
             return Ok(());
         }
@@ -2033,6 +2056,46 @@ mod tcp_tests {
 
     #[rstest]
     #[case(
+        10,
+        vec![9; 5],
+        ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![9, 9, 9, 6, 7, 8, 6]
+        },
+        vec![]
+    )]
+    fn test_receive_queue_add_no_complete_1_pending(
+        #[case] new_fragment_seq: usize,
+        #[case] new_fragment_payload: Vec<u8>,
+        #[case] expected_complete: ReceiveFragment,
+        #[case] expected_pending: Vec<ReceiveFragment>,
+    ) {
+        let initial_complete = ReceiveFragment {
+            sequence_num: 10,
+            payload: vec![],
+        };
+        let initial_pending = vec![
+            ReceiveFragment {
+                sequence_num: 13,
+                payload: vec![6, 7, 8, 6],
+            },
+        ];
+        let mut queue = ReceiveQueue {
+            queue_length: TCP_DEFAULT_RECV_QUEUE_LENGTH,
+            complete_datagram: initial_complete,
+            fragmented_datagram: initial_pending,
+        };
+        let result = queue
+            .add(new_fragment_seq, &new_fragment_payload)
+            .expect("Failed to add fragment to queue.");
+
+        assert_eq!(queue.complete_datagram, expected_complete);
+        assert_eq!(queue.fragmented_datagram, expected_pending);
+        assert_eq!(result, ());
+    }
+
+    #[rstest]
+    #[case(
         13,
         vec![9; 2],
         ReceiveFragment {
@@ -2072,7 +2135,7 @@ mod tcp_tests {
             }
         ]
     )]
-    fn test_receive_queue_add_no_complete(
+    fn test_receive_queue_add_no_complete_2_pending(
         #[case] new_fragment_seq: usize,
         #[case] new_fragment_payload: Vec<u8>,
         #[case] expected_complete: ReceiveFragment,

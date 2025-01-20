@@ -140,6 +140,12 @@ impl TcpStack {
             return Ok(());
         };
         if conn.timer.retransmission.is_expired()? {
+            log::trace!(
+                "[{}] Retransmission timer is sending packets. shift={} delta={}",
+                conn.print_log_prefix(socket_id),
+                conn.timer.retransmission.timer_param.rexmt_shift,
+                conn.timer.retransmission.timer_param.delta,
+            );
             conn.send_flag.ack_now = true;
             conn.send_flag.snd_from_una = true;
             if let Err(e) = self.send_handler(conn) {

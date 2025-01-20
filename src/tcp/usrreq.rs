@@ -199,7 +199,6 @@ impl TcpStack {
         let mut conns = self.connections.lock().unwrap();
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
             if conn.status == TcpStatus::Listen {
-                eprintln!("listen socket found.");
                 let mut listen_queue = self.listen_queue.lock().unwrap();
                 if let Some(queue) = listen_queue.get_mut(&socket_id) {
                     queue.accepted += 1;
@@ -219,13 +218,10 @@ impl TcpStack {
                 drop(conns);
                 drop(listen_queue);
                 loop {
-                    eprintln!("look for the established socket.");
                     let mut conns = self.connections.lock().unwrap();
                     let mut listen_queue = self.listen_queue.lock().unwrap();
                     if let Some(ref mut queue) = listen_queue.get_mut(&socket_id) {
-                        eprintln!("found queue. {:?}", queue);
                         if let Some(established_id) = queue.established_unconsumed.pop_front() {
-                            eprintln!("found established socket. {}", established_id);
                             if let Some(Some(conn)) = conns.get(&established_id) {
                                 queue.established_consumed.push_back(established_id);
                                 queue.accepted -= 1;
@@ -245,7 +241,6 @@ impl TcpStack {
                         }
                         // there is a already pending connection which received syn but not yet replied syn-ack.
                         if let Some(syn_recv_id) = queue.pending.pop_front() {
-                            eprintln!("found syn_recv socket. {}", syn_recv_id);
                             // reply syn-ack
                             if let Some(Some(conn)) = conns.get_mut(&syn_recv_id) {
                                 if conn.status != TcpStatus::SynRcvd {
@@ -269,7 +264,6 @@ impl TcpStack {
                             drop(conns);
                             drop(listen_queue);
                             loop {
-                                eprintln!("ACCEPT CALL: Waiting for established.");
                                 // Current TcpStatus is SynRcvd
                                 if let (_valid, Some(event)) = self.wait_events_with_timeout(
                                     vec![
@@ -348,7 +342,6 @@ impl TcpStack {
                             drop(conns);
                             drop(listen_queue);
                             loop {
-                                eprintln!("accept wait loop");
                                 if self.wait_event_with_timeout(
                                     TcpEvent {
                                         socket_id: socket_id,
@@ -361,7 +354,6 @@ impl TcpStack {
                                 } else {
                                     let listen_queue = self.listen_queue.lock().unwrap();
                                     if let Some(queue) = listen_queue.get(&socket_id) {
-                                        eprintln!("accept wait loop: queue {:?}", queue);
                                         if queue.established_unconsumed.len() > 0 {
                                             break;
                                         }
