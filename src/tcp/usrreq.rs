@@ -664,6 +664,7 @@ impl TcpStack {
                 rtt_seq: _rtt_seq,
                 last_snd_ack: _last_snd_ack,
                 last_sent_window: _last_sent_window,
+                fin_seq: _fin_sent,
                 send_flag: _send_flag,
                 conn_flag: _conn_flag,
             }) = connection_info

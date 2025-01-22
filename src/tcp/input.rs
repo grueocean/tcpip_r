@@ -227,6 +227,7 @@ impl TcpStack {
                         rtt_seq: None,
                         last_snd_ack: 0,
                         last_sent_window: 0,
+                        fin_seq: None,
                         send_flag: TcpSendControlFlag::new(),
                         conn_flag: TcpConnectionFlag::new(),
                     };
@@ -831,14 +832,8 @@ impl TcpStack {
                     conn.send_flag.ack_now = true;
                 }
             }
-            // Enter the CLOSE-WAIT state. rfc9293
             if tcp_packet.flag.contains(TcpFlag::FIN) {
-                conn.status = TcpStatus::CloseWait;
-                log::debug!(
-                    "[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}",
-                    conn.print_log_prefix(socket_id),
-                    tcp_packet.flag
-                );
+                conn.send_flag.ack_now = true;
             }
             if let Err(e) = self.send_handler(conn) {
                 log::warn!(
@@ -847,6 +842,15 @@ impl TcpStack {
                     tcp_packet.ack_number,
                     conn.send_vars.next_sequence_num,
                     e
+                );
+            }
+            // Enter the CLOSE-WAIT state. rfc9293
+            if tcp_packet.flag.contains(TcpFlag::FIN) {
+                conn.status = TcpStatus::CloseWait;
+                log::debug!(
+                    "[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}",
+                    conn.print_log_prefix(socket_id),
+                    tcp_packet.flag
                 );
             }
             if !conn.timer.retransmission.timer_param.active
@@ -1006,6 +1010,7 @@ pub struct TcpConnection {
     pub rtt_seq: Option<u32>,       // BSD: t_rtseq
     pub last_snd_ack: u32,          // BSD: last_ack_sent
     pub last_sent_window: usize,    // window size recently notified to peer
+    pub fin_seq: Option<u32>,       // seq number for fin that is already sent
     pub send_flag: TcpSendControlFlag,
     pub conn_flag: TcpConnectionFlag,
 }
@@ -1029,6 +1034,7 @@ impl TcpConnection {
             rtt_seq: None,
             last_snd_ack: 0,
             last_sent_window: 0,
+            fin_seq: None,
             send_flag: TcpSendControlFlag::new(),
             conn_flag: TcpConnectionFlag::new(),
         }

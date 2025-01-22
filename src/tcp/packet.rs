@@ -271,19 +271,8 @@ impl TcpPacket {
                     }
                 }
             }
-            TcpStatus::FinWait1 => {
-                if !conn.send_flag.snd_from_una {
-                    Ok(Self::new_fin_wait1_next(conn)
-                        .context("Failed to create fin_wait1_next packet.")?)
-                } else {
-                    if let Some(start_seq) = start_seq {
-                        Ok(Self::new_fin_wait1_rexmt(conn, start_seq)
-                            .context("Failed to create fin_wait1_rexmt packet.")?)
-                    } else {
-                        anyhow::bail!("Retransmission should specify start_seq.");
-                    }
-                }
-            }
+            TcpStatus::FinWait1 => Ok(Self::new_fin_wait1_next(conn)
+                .context("Failed to create fin_wait1_next packet.")?),
             other => {
                 anyhow::bail!("Cannot generate packet from connection {}.", other);
             }
@@ -355,7 +344,10 @@ impl TcpPacket {
         .unwrap();
         let end_offset = start_offset + payload_len;
         datagram.payload = conn.send_queue.payload[start_offset..end_offset].to_vec();
-        Ok((datagram, remain_payload_len == payload_len))
+        Ok((
+            datagram,
+            remain_payload_len == payload_len || window_limit_payload_len == payload_len,
+        ))
     }
 
     // create datagram packet starting from start_seq
@@ -394,6 +386,21 @@ impl TcpPacket {
         Ok(datagram)
     }
 
+    pub fn new_fin(conn: &TcpConnection, fin_seq: u32) -> Result<Self> {
+        let mut fin = Self::new();
+        fin.option.set_default_option()?;
+        fin.src_addr = conn.src_addr.octets();
+        fin.dst_addr = conn.dst_addr.octets();
+        fin.protocol = u8::from(Ipv4Type::TCP);
+        fin.local_port = conn.local_port;
+        fin.remote_port = conn.remote_port;
+        fin.seq_number = fin_seq;
+        fin.ack_number = conn.recv_vars.next_sequence_num;
+        fin.window_size = conn.get_recv_window_for_pkt();
+        fin.flag = TcpFlag::FIN | TcpFlag::ACK;
+        Ok(fin)
+    }
+
     pub fn new_established_rexmt(conn: &mut TcpConnection, start_seq: u32) -> Result<Self> {
         let (mut datagram, _) = Self::new_datagram_rexmt(conn, start_seq)?;
         datagram.flag = TcpFlag::ACK;
@@ -401,23 +408,17 @@ impl TcpPacket {
     }
 
     pub fn new_fin_wait1_next(conn: &mut TcpConnection) -> Result<Self> {
-        let (mut datagram, sent_all) = Self::new_datagram_next(conn)?;
-        if sent_all {
-            datagram.flag = TcpFlag::ACK | TcpFlag::FIN;
+        if let Some(fin_seq) = conn.fin_seq {
+            Ok(Self::new_fin(conn, fin_seq)?)
         } else {
-            datagram.flag = TcpFlag::ACK;
+            let (mut fin, sent_all) = Self::new_datagram_next(conn)?;
+            if sent_all {
+                fin.flag = TcpFlag::ACK | TcpFlag::FIN;
+            } else {
+                fin.flag = TcpFlag::ACK;
+            }
+            Ok(fin)
         }
-        Ok(datagram)
-    }
-
-    pub fn new_fin_wait1_rexmt(conn: &mut TcpConnection, start_seq: u32) -> Result<Self> {
-        let (mut datagram, sent_all) = Self::new_datagram_rexmt(conn, start_seq)?;
-        if sent_all {
-            datagram.flag = TcpFlag::ACK | TcpFlag::FIN;
-        } else {
-            datagram.flag = TcpFlag::ACK;
-        }
-        Ok(datagram)
     }
 
     pub fn print_general_info(&self) -> String {
@@ -437,7 +438,7 @@ impl TcpPacket {
 }
 
 bitflags! {
-    #[derive(Default, Debug, PartialEq)]
+    #[derive(Clone, Default, Debug, PartialEq)]
     pub struct TcpFlag: u8 {
         const FIN = 0b00_00_00_01; // No more data from sender.
         const SYN = 0b00_00_00_10; // Synchronize sequence numbers.

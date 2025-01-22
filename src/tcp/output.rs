@@ -134,8 +134,7 @@ impl TcpStack {
                     conn.rtt_start = Some(Instant::now());
                     conn.rtt_seq = Some(snd_seq);
                 }
-                conn.send_vars.next_sequence_num =
-                    conn.send_vars.next_sequence_num.wrapping_add(datagram_size);
+                conn.send_vars.next_sequence_num = snd_seq.wrapping_add(datagram_size);
                 conn.last_snd_ack = snd_ack;
                 if next_send_nxt == conn.send_vars.next_sequence_num
                     || send_allowed == conn.send_vars.next_sequence_num
@@ -202,6 +201,42 @@ impl TcpStack {
             }
             Ok(0)
         }
+    }
+
+    pub fn send_handler_fin_wait1(&self, conn: &mut TcpConnection) -> Result<usize> {
+        let mut loop_count: usize = 0;
+        loop {
+            anyhow::ensure!(
+                loop_count < TCP_SEND_LOOP_MAX,
+                "Tcp send loop count is {} should be lower than {}.",
+                loop_count,
+                TCP_SEND_LOOP_MAX
+            );
+            loop_count += 1;
+            let datagram = TcpPacket::new_out_packet(conn, None)
+                .context("Failed to create a datagram/fin packet.")?;
+            let datagram_size = datagram.payload.len() as u32;
+            let snd_seq = datagram.seq_number;
+            let snd_ack = datagram.ack_number;
+            let snd_wnd = (datagram.window_size as usize) << conn.recv_vars.window_shift;
+            let seg_fin = datagram.flag.contains(TcpFlag::FIN);
+            if let Err(e) = self.send_tcp_packet(datagram) {
+                log::warn!("Failed to send in send_handler_fin_wait1. Err: {e}");
+            }
+            conn.last_sent_window = snd_wnd;
+            if conn.rtt_start.is_none() && datagram_size > 0 {
+                conn.rtt_start = Some(Instant::now());
+                conn.rtt_seq = Some(snd_seq);
+            }
+            conn.send_vars.next_sequence_num = snd_seq.wrapping_add(datagram_size);
+            conn.last_snd_ack = snd_ack;
+            if seg_fin {
+                conn.fin_seq = Some(conn.send_vars.next_sequence_num);
+                conn.send_vars.next_sequence_num = conn.send_vars.next_sequence_num.wrapping_add(1);
+                break;
+            }
+        }
+        Ok(0)
     }
 
     pub fn send_tcp_packet(&self, mut tcp_packet: TcpPacket) -> Result<()> {
