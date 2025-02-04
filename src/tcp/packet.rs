@@ -243,10 +243,20 @@ impl TcpPacket {
         rst
     }
 
+    // <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK> rfc9293
     pub fn create_rst_ack(&self) -> Self {
         let mut rst = self.create_reply_base();
-        rst.seq_number = self.ack_number;
+        rst.seq_number = 0;
+        rst.seq_number = self.seq_number.wrapping_add(self.payload.len() as u32);
         rst.flag = TcpFlag::RST | TcpFlag::ACK;
+        rst
+    }
+
+    // <SEQ=SEG.ACK><CTL=RST> rfc9293
+    pub fn create_rst(&self) -> Self {
+        let mut rst = self.create_reply_base();
+        rst.seq_number = self.ack_number;
+        rst.flag = TcpFlag::RST;
         rst
     }
 
@@ -271,8 +281,12 @@ impl TcpPacket {
                     }
                 }
             }
-            TcpStatus::FinWait1 => Ok(Self::new_fin_wait1_next(conn)
-                .context("Failed to create fin_wait1_next packet.")?),
+            TcpStatus::FinWait1 => {
+                Ok(Self::new_fin_wait1(conn).context("Failed to create fin_wait1_next packet.")?)
+            }
+            TcpStatus::CloseWait => {
+                Ok(Self::new_close_wait(conn).context("Failed to create close_wait packet.")?)
+            }
             other => {
                 anyhow::bail!("Cannot generate packet from connection {}.", other);
             }
@@ -397,7 +411,7 @@ impl TcpPacket {
         fin.seq_number = fin_seq;
         fin.ack_number = conn.recv_vars.next_sequence_num;
         fin.window_size = conn.get_recv_window_for_pkt();
-        fin.flag = TcpFlag::FIN | TcpFlag::ACK;
+        fin.flag = TcpFlag::ACK | TcpFlag::FIN;
         Ok(fin)
     }
 
@@ -407,7 +421,7 @@ impl TcpPacket {
         Ok(datagram)
     }
 
-    pub fn new_fin_wait1_next(conn: &mut TcpConnection) -> Result<Self> {
+    pub fn new_fin_wait1(conn: &mut TcpConnection) -> Result<Self> {
         if let Some(fin_seq) = conn.fin_seq {
             Ok(Self::new_fin(conn, fin_seq)?)
         } else {
@@ -419,6 +433,13 @@ impl TcpPacket {
             }
             Ok(fin)
         }
+    }
+
+    pub fn new_close_wait(conn: &mut TcpConnection) -> Result<Self> {
+        let (mut ack_of_fin, _) = Self::new_datagram_next(conn)?;
+        // +1 for fin
+        ack_of_fin.ack_number = ack_of_fin.ack_number.wrapping_add(1);
+        Ok(ack_of_fin)
     }
 
     pub fn print_general_info(&self) -> String {

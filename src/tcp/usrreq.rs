@@ -438,16 +438,10 @@ impl TcpStack {
                         }
                     }
                     TcpEventType::Refused => {
-                        anyhow::bail!(TcpError::RefusedError {
-                            id: socket_id,
-                            addr: addr
-                        })
+                        anyhow::bail!(TcpError::RefusedError { id: socket_id })
                     }
                     TcpEventType::Closed => {
-                        anyhow::bail!(TcpError::ClosedError {
-                            id: socket_id,
-                            addr: addr
-                        })
+                        anyhow::bail!(TcpError::ClosedError { id: socket_id })
                     }
                     other => {
                         anyhow::bail!(
@@ -599,9 +593,11 @@ impl TcpStack {
                     }
                     TcpEventType::Refused => {
                         log::warn!("While waiting for the socket (id={}) sending datagram, the connection refused.", socket_id);
+                        anyhow::bail!(TcpError::RefusedError { id: socket_id })
                     }
                     TcpEventType::Closed => {
                         log::warn!("While waiting for the socket (id={}) sending datagram, the connection closed.", socket_id);
+                        anyhow::bail!(TcpError::ClosedError { id: socket_id })
                     }
                     other => {
                         anyhow::bail!("Wake up from unexpected event ({:?}). Expected DatagramReceived/Refused/Closed.", other);

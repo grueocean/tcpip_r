@@ -44,6 +44,7 @@ pub enum TcpStatus {
     Established,
     FinWait1,
     FinWait2,
+    Closing,
     TimeWait,
     CloseWait,
     LastAck,
@@ -59,6 +60,7 @@ impl Display for TcpStatus {
             TcpStatus::Established => write!(f, "ESTABLISHED"),
             TcpStatus::FinWait1 => write!(f, "FIN-WAIT-1"),
             TcpStatus::FinWait2 => write!(f, "FIN-WAIT-2"),
+            TcpStatus::Closing => write!(f, "CLOSING"),
             TcpStatus::TimeWait => write!(f, "TIME-WAIT"),
             TcpStatus::CloseWait => write!(f, "CLOSE-WAIT"),
             TcpStatus::LastAck => write!(f, "LAST-ACK"),
@@ -69,8 +71,8 @@ impl Display for TcpStatus {
 
 #[derive(Error, Debug)]
 pub enum TcpError {
-    #[error("Connection refused. socket id: {id} remote addr: {addr}")]
-    RefusedError { id: usize, addr: SocketAddrV4 },
-    #[error("Connection closed. socket id: {id} remote addr: {addr}")]
-    ClosedError { id: usize, addr: SocketAddrV4 },
+    #[error("Connection refused. socket id: {id}")]
+    RefusedError { id: usize },
+    #[error("Connection closed. socket id: {id}")]
+    ClosedError { id: usize },
 }

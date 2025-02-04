@@ -33,6 +33,12 @@ impl TcpStack {
             TcpStatus::Established => self
                 .send_handler_established(conn)
                 .context("send_handler_established failed."),
+            TcpStatus::FinWait1 => self
+                .send_handler_fin_or_ack(conn)
+                .context("send_handler_fin_or_ack (FIN-WAIT1) failed."),
+            TcpStatus::CloseWait => self
+                .send_handler_fin_or_ack(conn)
+                .context("send_handler_fin_or_ack (CLOSE-WAIT) failed."),
             other => {
                 conn.send_flag.init();
                 anyhow::bail!("Send handler for {} is not implemented.", other);
@@ -203,7 +209,7 @@ impl TcpStack {
         }
     }
 
-    pub fn send_handler_fin_wait1(&self, conn: &mut TcpConnection) -> Result<usize> {
+    pub fn send_handler_fin_or_ack(&self, conn: &mut TcpConnection) -> Result<usize> {
         let mut loop_count: usize = 0;
         loop {
             anyhow::ensure!(
@@ -270,6 +276,12 @@ impl TcpStack {
 
     pub fn send_back_rst_ack(&self, original_packet: &TcpPacket) -> Result<()> {
         let rst_packet = original_packet.create_rst_ack();
+        self.send_tcp_packet(rst_packet)?;
+        Ok(())
+    }
+
+    pub fn send_back_rst(&self, original_packet: &TcpPacket) -> Result<()> {
+        let rst_packet = original_packet.create_rst();
         self.send_tcp_packet(rst_packet)?;
         Ok(())
     }
