@@ -32,6 +32,7 @@ const TCP_REXMT_MEAN_SHIFT: usize = 2; // β = 1/4 : D <- D + β*(|M-A|-D)
 pub const TCP_SRTT_SHIFT: usize = 5; // srtt is scaled by 32 (2^5).
 pub const TCP_RTTVAR_SHIFT: usize = 4; // rttvar is scaled by 16 (2^4).
 const TCP_DELAY_ACK: usize = 40; // BSD: tcp_delacktime
+const TCP_2MSL: usize = 10_000;
 
 impl TcpStack {
     pub fn timer_thread(&self) -> Result<()> {
@@ -68,6 +69,9 @@ impl TcpStack {
                     self.timer_handler_datagram(socket_id, &mut conns)
                         .context("timer_handler_datagram failed. (state=ESTABLISHED)")?;
                 }
+                TcpStatus::TimeWait => self
+                    .timer_handler_timewait(socket_id, &mut conns)
+                    .context("timer_handler_timewait failed. (state=TIME-WAIT)")?,
                 _ => {}
             }
         }
@@ -207,6 +211,37 @@ impl TcpStack {
         }
         Ok(())
     }
+
+    pub fn timer_handler_timewait(
+        &self,
+        socket_id: usize,
+        conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>,
+    ) -> Result<()> {
+        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            if self.timer_handler_2msl(socket_id, conn)? {
+                conns.remove(&socket_id);
+            }
+        } else {
+            anyhow::bail!("Cannot find socket (id={}).", socket_id);
+        }
+        Ok(())
+    }
+
+    fn timer_handler_2msl(&self, socket_id: usize, conn: &mut TcpConnection) -> Result<bool> {
+        if !conn.timer.two_msl.timer_param.active {
+            return Ok(false);
+        };
+        if conn.timer.two_msl.is_expired()? {
+            conn.status = TcpStatus::Closed;
+            conn.timer.two_msl.init();
+            log::debug!(
+                "[{}] 2MSL timer closed a TIMEWAIT socket.",
+                conn.print_log_prefix(socket_id)
+            );
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 pub fn update_retransmission_param(conn: &mut TcpConnection, rtt: usize) -> Result<()> {
@@ -238,6 +273,7 @@ pub fn update_retransmission_param(conn: &mut TcpConnection, rtt: usize) -> Resu
 pub enum TcpTimerType {
     Retransmission,
     DelayedAck,
+    TwoMSL,
 }
 
 #[derive(Debug, Default)]
@@ -411,10 +447,59 @@ impl DelayedAckTimer {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct TwoMSLVariables {
+    pub active: bool,
+}
+
+impl TwoMSLVariables {
+    pub fn new() -> Self {
+        Self {
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TwoMSLTimer {
+    pub timer_type: TcpTimerType,
+    pub timer_param: TwoMSLVariables,
+    pub timer_count: Instant,
+}
+
+impl TwoMSLTimer {
+    pub fn new() -> Self {
+        Self {
+            timer_type: TcpTimerType::TwoMSL,
+            timer_param: TwoMSLVariables::new(),
+            timer_count: Instant::now(),
+        }
+    }
+
+    pub fn init(&mut self) {
+        self.timer_param.active = false;
+    }
+
+    pub fn fire(&mut self) {
+        self.timer_param.active = true;
+        self.timer_count = Instant::now();
+        log::debug!("2MSL timer is fired. interval={}", TCP_2MSL);
+    }
+
+    pub fn is_expired(&self) -> Result<bool> {
+        if self.timer_count.elapsed() > Duration::from_millis(TCP_2MSL as u64) {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TcpTimer {
     pub retransmission: RetransmissionTimer,
     pub delayed_ack: DelayedAckTimer,
+    pub two_msl: TwoMSLTimer,
 }
 
 impl TcpTimer {
@@ -422,6 +507,7 @@ impl TcpTimer {
         Self {
             retransmission: RetransmissionTimer::new(),
             delayed_ack: DelayedAckTimer::new(),
+            two_msl: TwoMSLTimer::new(),
         }
     }
 }
