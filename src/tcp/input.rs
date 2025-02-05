@@ -932,7 +932,11 @@ impl TcpStack {
                             queue.established_consumed.retain(|&x| x != socket_id);
                         }
                     }
-                    log::debug!("[{}] An ESTABLISHED connection is removed because of a RST packet. SEG.FLAG={:?}", conn.print_log_prefix(socket_id), tcp_packet.flag);
+                    log::debug!(
+                        "[{}] Connection is removed because of a RST packet. SEG.FLAG={:?}",
+                        conn.print_log_prefix(socket_id),
+                        tcp_packet.flag
+                    );
                     conn.status = TcpStatus::Closed;
                     match &conn.status {
                         TcpStatus::Established
@@ -966,7 +970,7 @@ impl TcpStack {
                 return Ok(());
             // if the ACK bit is on, rfc9293
             } else {
-                let ret = self.recv_handler_internal_ack_on(socket_id, conn, tcp_packet)?;
+                let ret = self.recv_handler_internal_seg_ack(socket_id, conn, tcp_packet)?;
                 if conn.status == TcpStatus::Closed {
                     conns.remove(&socket_id);
                     return Ok(());
@@ -976,60 +980,7 @@ impl TcpStack {
             }
             // Seventh, process the segment text: rfc9293
             if tcp_packet.payload.len() != 0 {
-                let prev_payload = conn.recv_queue.complete_datagram.payload.len();
-                if let Err(e) = conn
-                    .recv_queue
-                    .add(tcp_packet.seq_number as usize, &tcp_packet.payload)
-                {
-                    log::warn!("Failed to add a segment to the recv queue. Err: {:?}", e);
-                } else {
-                    let current_payload = conn.recv_queue.complete_datagram.payload.len();
-                    let rcv_nxt_advance = current_payload - prev_payload;
-                    let rcv_nxt_next = conn
-                        .recv_queue
-                        .get_real_begin_sequence_num()
-                        .wrapping_add(current_payload as u32);
-                    log::debug!(
-                        "[{}] RCV.NXT advanced. ({}->{}).",
-                        conn.print_log_prefix(socket_id),
-                        conn.recv_vars.next_sequence_num,
-                        rcv_nxt_next
-                    );
-                    conn.recv_vars.next_sequence_num = rcv_nxt_next;
-                    conn.recv_vars.window_size = conn.get_recv_window_size();
-                    if prev_payload != current_payload {
-                        log::debug!(
-                            "[{}] Datagram received {} bytes. (Current received queue length {}->{})",
-                            conn.print_log_prefix(socket_id),
-                            rcv_nxt_advance,
-                            prev_payload,
-                            current_payload
-                        );
-                        self.publish_event(TcpEvent {
-                            socket_id: socket_id,
-                            event: TcpEventType::DatagramReceived,
-                        });
-                    }
-                }
-                if !conn.timer.delayed_ack.timer_param.active
-                    && conn.conn_flag.use_delayed_ack
-                    && !conn.has_unsent_data()
-                {
-                    conn.send_flag.ack_delayed = true;
-                    conn.timer.delayed_ack.fire();
-                } else {
-                    conn.send_flag.ack_now = true;
-                }
-            }
-            // Enter the CLOSE-WAIT state. rfc9293
-            if tcp_packet.flag.contains(TcpFlag::FIN) {
-                conn.send_flag.ack_now = true;
-                conn.status = TcpStatus::CloseWait;
-                log::debug!(
-                    "[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}",
-                    conn.print_log_prefix(socket_id),
-                    tcp_packet.flag
-                );
+                self.recv_handler_internal_process_segment(socket_id, conn, tcp_packet)?;
             }
             if let Err(e) = self.send_handler(conn) {
                 log::warn!(
@@ -1039,6 +990,9 @@ impl TcpStack {
                     conn.send_vars.next_sequence_num,
                     e
                 );
+            }
+            if tcp_packet.flag.contains(TcpFlag::FIN) {
+                self.recv_handler_internal_seg_fin(socket_id, conn, tcp_packet)?;
             }
             if !conn.timer.retransmission.timer_param.active
                 && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num
@@ -1063,7 +1017,7 @@ impl TcpStack {
         }
     }
 
-    fn recv_handler_internal_ack_on(
+    fn recv_handler_internal_seg_ack(
         &self,
         socket_id: usize,
         conn: &mut TcpConnection,
@@ -1088,6 +1042,8 @@ impl TcpStack {
                 }
             }
             TcpStatus::TimeWait => {
+                // todo: implement
+                //
                 // The only thing that can arrive in this state is a retransmission of the remote FIN.
                 // Acknowledge it, and restart the 2 MSL timeout. rfc9293
             }
@@ -1244,6 +1200,91 @@ impl TcpStack {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn recv_handler_internal_process_segment(
+        &self,
+        socket_id: usize,
+        conn: &mut TcpConnection,
+        tcp_packet: &TcpPacket,
+    ) -> Result<()> {
+        // This should not occur since a FIN has been received from the remote side.
+        // Ignore the segment text. rfc9293
+        match &conn.status {
+            TcpStatus::CloseWait
+            | TcpStatus::Closing
+            | TcpStatus::LastAck
+            | TcpStatus::TimeWait => {
+                return Ok(());
+            }
+            _ => {}
+        }
+        let prev_payload = conn.recv_queue.complete_datagram.payload.len();
+        if let Err(e) = conn
+            .recv_queue
+            .add(tcp_packet.seq_number as usize, &tcp_packet.payload)
+        {
+            log::warn!("Failed to add a segment to the recv queue. Err: {:?}", e);
+        } else {
+            let current_payload = conn.recv_queue.complete_datagram.payload.len();
+            let rcv_nxt_advance = current_payload - prev_payload;
+            let rcv_nxt_next = conn
+                .recv_queue
+                .get_real_begin_sequence_num()
+                .wrapping_add(current_payload as u32);
+            log::debug!(
+                "[{}] RCV.NXT advanced. ({}->{}).",
+                conn.print_log_prefix(socket_id),
+                conn.recv_vars.next_sequence_num,
+                rcv_nxt_next
+            );
+            conn.recv_vars.next_sequence_num = rcv_nxt_next;
+            conn.recv_vars.window_size = conn.get_recv_window_size();
+            if prev_payload != current_payload {
+                log::debug!(
+                    "[{}] Datagram received {} bytes. (Current received queue length {}->{})",
+                    conn.print_log_prefix(socket_id),
+                    rcv_nxt_advance,
+                    prev_payload,
+                    current_payload
+                );
+                self.publish_event(TcpEvent {
+                    socket_id: socket_id,
+                    event: TcpEventType::DatagramReceived,
+                });
+            }
+        }
+        if !conn.timer.delayed_ack.timer_param.active
+            && conn.conn_flag.use_delayed_ack
+            && !conn.has_unsent_data()
+        {
+            conn.send_flag.ack_delayed = true;
+            conn.timer.delayed_ack.fire();
+        } else {
+            conn.send_flag.ack_now = true;
+        }
+        Ok(())
+    }
+
+    fn recv_handler_internal_seg_fin(
+        &self,
+        socket_id: usize,
+        conn: &mut TcpConnection,
+        tcp_packet: &TcpPacket,
+    ) -> Result<()> {
+        match &conn.status {
+            // Enter the CLOSE-WAIT state. rfc9293
+            TcpStatus::Established => {
+                conn.status = TcpStatus::CloseWait;
+                log::debug!(
+                    "[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}",
+                    conn.print_log_prefix(socket_id),
+                    tcp_packet.flag
+                );
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn generate_initial_sequence(&self) -> u32 {
