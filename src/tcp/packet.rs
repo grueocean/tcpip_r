@@ -287,6 +287,9 @@ impl TcpPacket {
             TcpStatus::CloseWait => {
                 Ok(Self::new_close_wait(conn).context("Failed to create close_wait packet.")?)
             }
+            TcpStatus::FinWait2 | TcpStatus::Closing => {
+                Ok(Self::new_ack(conn).context("Failed to create new_ack packet.")?)
+            }
             other => {
                 anyhow::bail!("Cannot generate packet from connection {}.", other);
             }
@@ -440,6 +443,21 @@ impl TcpPacket {
         // +1 for fin
         ack_of_fin.ack_number = ack_of_fin.ack_number.wrapping_add(1);
         Ok(ack_of_fin)
+    }
+
+    pub fn new_ack(conn: &TcpConnection) -> Result<Self> {
+        let mut ack = Self::new();
+        ack.option.set_default_option()?;
+        ack.src_addr = conn.src_addr.octets();
+        ack.dst_addr = conn.dst_addr.octets();
+        ack.protocol = u8::from(Ipv4Type::TCP);
+        ack.local_port = conn.local_port;
+        ack.remote_port = conn.remote_port;
+        ack.seq_number = conn.send_vars.next_sequence_num;
+        ack.ack_number = conn.recv_vars.next_sequence_num;
+        ack.window_size = conn.get_recv_window_for_pkt();
+        ack.flag = TcpFlag::ACK;
+        Ok(ack)
     }
 
     pub fn print_general_info(&self) -> String {

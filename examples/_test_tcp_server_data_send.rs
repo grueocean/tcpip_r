@@ -88,6 +88,6 @@ fn main() -> Result<()> {
             }
         }
     }
-    stream.shutdown()?;
+    stream.shutdown_dummy()?;
     Ok(())
 }

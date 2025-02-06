@@ -74,7 +74,7 @@ fn main() -> Result<()> {
             break;
         }
     }
-    stream.shutdown()?;
+    stream.shutdown_dummy()?;
     let file_data = fs::read(args.file)?;
     if rcvd_data == file_data {
         Ok(())

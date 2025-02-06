@@ -100,7 +100,7 @@ impl TcpStack {
                             .context("recv_handler_syn_rcvd failed.")?;
                     }
                     TcpStatus::Established => {
-                        self.recv_handler_established(id, tcp_packet, conns)
+                        self.recv_handler_other(id, tcp_packet, conns)
                             .context("recv_handler_established failed.")?;
                     }
                     other => {
@@ -557,7 +557,6 @@ impl TcpStack {
                     conn.send_vars.window_size = tcp_packet.window_size;
                     conn.send_vars.max_window_size =
                         max(current_window, conn.get_recv_window_size());
-                    conn.status = TcpStatus::Established;
                     conn.timer.retransmission.init();
                     let parent_id = conn.parent_id;
                     let mut listen_queue: MutexGuard<HashMap<usize, ListenQueue>> =
@@ -569,10 +568,11 @@ impl TcpStack {
                             queue.established_unconsumed.push_back(socket_id);
                         }
                     }
-                    log::debug!(
-                        "[{}] Status changed from SYN-RECEIVED to ESTABLISHED. SEG.FLAG={:?}",
-                        conn.print_log_prefix(socket_id),
-                        tcp_packet.flag
+                    update_tcp_status_simple(
+                        socket_id,
+                        conn,
+                        Some(tcp_packet),
+                        TcpStatus::Established,
                     );
                     self.publish_event(TcpEvent {
                         socket_id: socket_id,
@@ -590,12 +590,7 @@ impl TcpStack {
                 }
             }
             if tcp_packet.flag.contains(TcpFlag::FIN) {
-                log::debug!(
-                    "[{}] Status changed from SYN-RECEIVED to CLOSE-WAIT. SEG.FLAG={:?}",
-                    conn.print_log_prefix(socket_id),
-                    tcp_packet.flag
-                );
-                conn.status = TcpStatus::CloseWait;
+                update_tcp_status_simple(socket_id, conn, Some(tcp_packet), TcpStatus::CloseWait);
                 self.publish_event(TcpEvent {
                     socket_id: socket_id,
                     event: TcpEventType::Closed,
@@ -843,12 +838,7 @@ impl TcpStack {
             // Enter the CLOSE-WAIT state. rfc9293
             if tcp_packet.flag.contains(TcpFlag::FIN) {
                 conn.send_flag.ack_now = true;
-                conn.status = TcpStatus::CloseWait;
-                log::debug!(
-                    "[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}",
-                    conn.print_log_prefix(socket_id),
-                    tcp_packet.flag
-                );
+                update_tcp_status_simple(socket_id, conn, Some(tcp_packet), TcpStatus::CloseWait);
             }
             if let Err(e) = self.send_handler(conn) {
                 log::warn!(
@@ -912,6 +902,7 @@ impl TcpStack {
                 }
                 return Ok(());
             }
+            // Second, check the RST bit: rfc9293
             if tcp_packet.flag.contains(TcpFlag::RST) {
                 // 1) If the RST bit is set and the sequence number is outside the current receive window, silently drop the segment. rfc9293
                 if !(conn.recv_vars.next_sequence_num <= tcp_packet.seq_number
@@ -957,6 +948,7 @@ impl TcpStack {
                     return Ok(());
                 }
             }
+            // Fourth, check the SYN bit: rfc9293
             if tcp_packet.flag.contains(TcpFlag::SYN) {
                 // It's a challenge ACK situation too, but I don't implement this now.
                 //
@@ -982,6 +974,8 @@ impl TcpStack {
             if tcp_packet.payload.len() != 0 {
                 self.recv_handler_internal_process_segment(socket_id, conn, tcp_packet)?;
             }
+            // Send an acknowledgment of the form:
+            // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> rfc9293
             if let Err(e) = self.send_handler(conn) {
                 log::warn!(
                     "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {}",
@@ -991,26 +985,11 @@ impl TcpStack {
                     e
                 );
             }
+            // Eighth, check the FIN bit: rfc9293
             if tcp_packet.flag.contains(TcpFlag::FIN) {
                 self.recv_handler_internal_seg_fin(socket_id, conn, tcp_packet)?;
             }
-            if !conn.timer.retransmission.timer_param.active
-                && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num
-            {
-                conn.timer.retransmission.fire_datagram();
-                log::debug!(
-                    "Enabled retransmission timer in recv_handler_established. shift={} SND.UNA={} SND.NXT={}",
-                    conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged, conn.send_vars.next_sequence_num
-                );
-            } else if conn.timer.retransmission.timer_param.active
-                && conn.send_vars.unacknowledged == conn.send_vars.next_sequence_num
-            {
-                conn.timer.retransmission.timer_param.active = false;
-                log::debug!(
-                    "Disabled retransmission timer in recv_handler_established. shift={} SND.UNA=SND.NXT={}",
-                    conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged
-                );
-            }
+            update_timer(socket_id, conn);
             return Ok(());
         } else {
             anyhow::bail!("No socket (id={}).", socket_id);
@@ -1030,22 +1009,33 @@ impl TcpStack {
                 if let Some(fin_seq) = conn.fin_seq {
                     // if the ACK acknowledges our FIN, then enter the TIME-WAIT state; rfc9293
                     if fin_seq.wrapping_add(1) == conn.send_vars.unacknowledged {
-                        conn.status = TcpStatus::Closed;
-                        log::debug!(
-                            "[{}] Status changed from LAST-ACK to CLOSED. SEG.FLAG={:?}",
-                            conn.print_log_prefix(socket_id),
-                            tcp_packet.flag
+                        update_tcp_status_simple(
+                            socket_id,
+                            conn,
+                            Some(tcp_packet),
+                            TcpStatus::Closed,
                         );
                     }
+                    return Ok(true);
                 } else {
                     anyhow::bail!("LAST-ACK socket should have sent a FIN packet, but conn.fin_seq is not set.")
                 }
             }
             TcpStatus::TimeWait => {
-                // todo: implement
-                //
                 // The only thing that can arrive in this state is a retransmission of the remote FIN.
                 // Acknowledge it, and restart the 2 MSL timeout. rfc9293
+                if let Err(e) = self.send_handler(conn) {
+                    log::warn!(
+                        "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {}",
+                        conn.print_log_prefix(socket_id),
+                        tcp_packet.ack_number,
+                        conn.send_vars.next_sequence_num,
+                        e
+                    );
+                }
+                conn.timer.two_msl.init();
+                conn.timer.two_msl.fire();
+                return Ok(true);
             }
             _ => {}
         }
@@ -1158,11 +1148,11 @@ impl TcpStack {
                 if let Some(fin_seq) = conn.fin_seq {
                     // if the FIN segment is now acknowledged, then enter FIN-WAIT-2 and continue processing in that state. rfc9293
                     if fin_seq.wrapping_add(1) == conn.send_vars.unacknowledged {
-                        conn.status = TcpStatus::FinWait2;
-                        log::debug!(
-                            "[{}] Status changed from FIN-WAIT1 to FIN-WAIT2. SEG.FLAG={:?}",
-                            conn.print_log_prefix(socket_id),
-                            tcp_packet.flag
+                        update_tcp_status_simple(
+                            socket_id,
+                            conn,
+                            Some(tcp_packet),
+                            TcpStatus::FinWait2,
                         );
                     }
                 } else {
@@ -1186,11 +1176,11 @@ impl TcpStack {
                 if let Some(fin_seq) = conn.fin_seq {
                     // if the ACK acknowledges our FIN, then enter the TIME-WAIT state; rfc9293
                     if fin_seq.wrapping_add(1) == conn.send_vars.unacknowledged {
-                        conn.status = TcpStatus::TimeWait;
-                        log::debug!(
-                            "[{}] Status changed from CLOSING to TIME-WAIT. SEG.FLAG={:?}",
-                            conn.print_log_prefix(socket_id),
-                            tcp_packet.flag
+                        update_tcp_status_simple(
+                            socket_id,
+                            conn,
+                            Some(tcp_packet),
+                            TcpStatus::TimeWait,
                         );
                     }
                 } else {
@@ -1275,12 +1265,39 @@ impl TcpStack {
         match &conn.status {
             // Enter the CLOSE-WAIT state. rfc9293
             TcpStatus::Established => {
-                conn.status = TcpStatus::CloseWait;
-                log::debug!(
-                    "[{}] Status changed from ESTABLISHED to CLOSED-WAIT. SEG.FLAG={:?}",
-                    conn.print_log_prefix(socket_id),
-                    tcp_packet.flag
-                );
+                update_tcp_status_simple(socket_id, conn, Some(tcp_packet), TcpStatus::CloseWait);
+            }
+            TcpStatus::FinWait1 => {
+                if let Some(fin_seq) = conn.fin_seq {
+                    // If our FIN has been ACKed (perhaps in this segment), then enter TIME-WAIT,
+                    // start the time-wait timer, turn off the other timers; rfc9293
+                    if fin_seq.wrapping_add(1) == conn.send_vars.unacknowledged {
+                        update_tcp_status_simple(
+                            socket_id,
+                            conn,
+                            Some(tcp_packet),
+                            TcpStatus::TimeWait,
+                        );
+                        conn.timer.retransmission.init();
+                        conn.timer.delayed_ack.init();
+                        conn.timer.two_msl.fire();
+                    // otherwise, enter the CLOSING state. rfc9293
+                    } else {
+                        update_tcp_status_simple(
+                            socket_id,
+                            conn,
+                            Some(tcp_packet),
+                            TcpStatus::Closing,
+                        );
+                    }
+                }
+            }
+            // Enter the TIME-WAIT state. Start the time-wait timer, turn off the other timers. rfc9293
+            TcpStatus::FinWait2 => {
+                update_tcp_status_simple(socket_id, conn, Some(tcp_packet), TcpStatus::TimeWait);
+                conn.timer.retransmission.init();
+                conn.timer.delayed_ack.init();
+                conn.timer.two_msl.fire();
             }
             _ => {}
         }
@@ -1391,6 +1408,56 @@ pub fn should_update_window(conn: &TcpConnection, tcp_packet: &TcpPacket) -> boo
         true
     } else {
         false
+    }
+}
+
+pub fn update_tcp_status_simple(
+    socket_id: usize,
+    conn: &mut TcpConnection,
+    tcp_packet: Option<&TcpPacket>,
+    new_status: TcpStatus,
+) {
+    if let Some(tcp_packet) = tcp_packet {
+        log::debug!(
+            "[{}] Status changed from {} to {}. SEG.FLAG={:?}",
+            conn.print_log_prefix(socket_id),
+            conn.status,
+            new_status,
+            tcp_packet.flag
+        );
+    } else {
+        log::debug!(
+            "[{}] Status changed from {} to {}.",
+            conn.print_log_prefix(socket_id),
+            conn.status,
+            new_status,
+        );
+    }
+    conn.status = new_status;
+}
+
+pub fn update_timer(socket_id: usize, conn: &mut TcpConnection) {
+    match &conn.status {
+        TcpStatus::Established => {
+            if !conn.timer.retransmission.timer_param.active
+                && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num
+            {
+                conn.timer.retransmission.fire_datagram();
+                log::debug!(
+                    "[{}] Enabled retransmission timer in recv_handler_established. shift={} SND.UNA={} SND.NXT={}",
+                    conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged, conn.send_vars.next_sequence_num
+                );
+            } else if conn.timer.retransmission.timer_param.active
+                && conn.send_vars.unacknowledged == conn.send_vars.next_sequence_num
+            {
+                conn.timer.retransmission.timer_param.active = false;
+                log::debug!(
+                    "[{}] Disabled retransmission timer in recv_handler_established. shift={} SND.UNA=SND.NXT={}",
+                    conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged
+                );
+            }
+        }
+        _ => {}
     }
 }
 

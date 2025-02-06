@@ -607,9 +607,8 @@ impl TcpStack {
         }
     }
 
-    pub fn shutdown(&self, socket_id: usize) -> Result<()> {
-        // wip: just flushing queue
-        log::trace!("SHUTDOWN CALL: id={}", socket_id);
+    pub fn shutdown_dummy(&self, socket_id: usize) -> Result<()> {
+        log::trace!("SHUTDOWN DMMUY CALL: id={}", socket_id);
         loop {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
@@ -621,7 +620,6 @@ impl TcpStack {
             } else {
                 anyhow::bail!("Cannot find the socket (id={}).", socket_id);
             }
-            // thread::sleep(Duration::from_millis(10));
         }
         log::trace!("Shutting down. id={}", socket_id);
         Ok(())
