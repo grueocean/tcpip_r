@@ -101,7 +101,7 @@ impl TcpStack {
                     }
                     TcpStatus::Established => {
                         self.recv_handler_other(id, tcp_packet, conns)
-                            .context("recv_handler_established failed.")?;
+                            .context("recv_handler_other failed.")?;
                     }
                     other => {
                         anyhow::bail!("Recv handler for TcpStatus {} is not implemented.", other);
@@ -598,275 +598,6 @@ impl TcpStack {
                 return Ok(());
             }
             Ok(())
-        } else {
-            anyhow::bail!("No socket (id={}).", socket_id);
-        }
-    }
-
-    pub fn recv_handler_established(
-        &self,
-        socket_id: usize,
-        tcp_packet: &TcpPacket,
-        mut conns: MutexGuard<HashMap<usize, Option<TcpConnection>>>,
-    ) -> Result<()> {
-        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
-            // check if a segment is acceptable
-            if !is_segment_acceptable(conn, tcp_packet) {
-                if !tcp_packet.flag.contains(TcpFlag::RST) {
-                    conn.send_flag.ack_now = true;
-                    if let Err(e) = self.send_handler(conn) {
-                        log::warn!(
-                            "[{}] Received an unacceptable non-RST packet and just send back ACK, but failed. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={} SEG.FLAG={:?} Err: {:?}",
-                            conn.print_log_prefix(socket_id), tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size, tcp_packet.flag, e
-                        );
-                    } else {
-                        log::debug!(
-                            "[{}] Received an unacceptable non-RST packet and just send back ACK. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={} SEG.FLAG={:?}",
-                            conn.print_log_prefix(socket_id), tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.get_recv_window_size(), tcp_packet.flag
-                        );
-                    }
-                } else {
-                    log::debug!(
-                        "[{}] Received an unacceptable RST packet and ignored. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
-                        conn.print_log_prefix(socket_id), tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
-                    );
-                }
-                return Ok(());
-            }
-            if tcp_packet.flag.contains(TcpFlag::RST) {
-                // 1) If the RST bit is set and the sequence number is outside the current receive window, silently drop the segment. rfc9293
-                if !(conn.recv_vars.next_sequence_num <= tcp_packet.seq_number
-                    && tcp_packet.seq_number
-                        < conn.recv_vars.next_sequence_num + conn.recv_vars.window_size as u32)
-                {
-                    log::debug!(
-                        "[{}] Received a RST packet that is outside of receive window and ignored. SEG.SEQ={} SEG.LEN={} RCV.NXT={} RCV.WND={}",
-                        conn.print_log_prefix(socket_id), tcp_packet.seq_number, tcp_packet.payload.len(), conn.recv_vars.next_sequence_num, conn.recv_vars.window_size
-                    );
-                // 2) If the RST bit is set and the sequence number exactly matches the next expected sequence number (RCV.NXT) ... rfc9293
-                } else if conn.recv_vars.next_sequence_num == tcp_packet.seq_number {
-                    let parent_id = conn.parent_id;
-                    let mut listen_queue = self.listen_queue.lock().unwrap();
-                    if let Some(parent) = parent_id {
-                        if let Some(queue) = listen_queue.get_mut(&parent) {
-                            queue.established_unconsumed.retain(|&x| x != socket_id);
-                            queue.established_consumed.retain(|&x| x != socket_id);
-                        }
-                    }
-                    log::debug!("[{}] An ESTABLISHED connection is removed because of a RST packet. SEG.FLAG={:?}", conn.print_log_prefix(socket_id), tcp_packet.flag);
-                    conns.remove(&socket_id);
-                    self.publish_event(TcpEvent {
-                        socket_id: socket_id,
-                        event: TcpEventType::Closed,
-                    });
-                    return Ok(());
-                } else {
-                    // It's a challenge ACK situation, but I don't implement this now.
-                    return Ok(());
-                }
-            }
-            if tcp_packet.flag.contains(TcpFlag::SYN) {
-                // It's a challenge ACK situation too, but I don't implement this now.
-                //
-                // RFC 5961 recommends that in these synchronized states, if the SYN bit is set,
-                // irrespective of the sequence number, TCP endpoints MUST send a "challenge ACK"
-                // to the remote peer: rfc9293
-                return Ok(());
-            }
-            // if the ACK bit is off, drop the segment and return rfc9293
-            if !tcp_packet.flag.contains(TcpFlag::ACK) {
-                return Ok(());
-            // if the ACK bit is on, rfc9293
-            } else {
-                // TCP stacks that implement RFC 5961 MUST add an input check that the ACK value is acceptable
-                // only if it is in the range of ((SND.UNA - MAX.SND.WND) =< SEG.ACK =< SND.NXT). rfc9293
-                if !seq_in_range(
-                    conn.send_vars
-                        .unacknowledged
-                        .wrapping_sub(conn.send_vars.max_window_size as u32),
-                    conn.send_vars.next_sequence_num,
-                    tcp_packet.ack_number,
-                ) {
-                    // It's a challenge ACK situation too, but I don't implement this now.
-                    return Ok(());
-                }
-                // If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK. ... rfc9293
-                if seq_in_range(
-                    conn.send_vars.unacknowledged.wrapping_add(1),
-                    conn.send_vars.next_sequence_num,
-                    tcp_packet.ack_number,
-                ) {
-                    if conn.send_vars.unacknowledged != tcp_packet.ack_number {
-                        log::debug!(
-                            "[{}] SND.UNA advanced ({}->{} SND.NXT={}).",
-                            conn.print_log_prefix(socket_id),
-                            conn.send_vars.unacknowledged,
-                            tcp_packet.ack_number,
-                            conn.send_vars.next_sequence_num
-                        );
-                    }
-                    if conn.update_snd_una(tcp_packet.ack_number)? {
-                        self.publish_event(TcpEvent {
-                            socket_id: socket_id,
-                            event: TcpEventType::SendMore,
-                        });
-                    };
-                } else if seq_less_equal(tcp_packet.ack_number, conn.send_vars.unacknowledged) {
-                    // If the ACK is a duplicate (SEG.ACK =< SND.UNA), it can be ignored. rfc9293
-                    log::debug!(
-                        "[{}] Duplicate ack. SEG.LENGTH={} SND.UNA={} SEG.ACK={} ",
-                        conn.print_log_prefix(socket_id),
-                        tcp_packet.payload.len(),
-                        conn.send_vars.unacknowledged,
-                        tcp_packet.ack_number
-                    );
-                } else if seq_greater_than(tcp_packet.ack_number, conn.send_vars.next_sequence_num)
-                {
-                    // If the ACK acks something not yet sent (SEG.ACK > SND.NXT),
-                    // then send an ACK, drop the segment, and return. rfc9293
-                    if let Err(e) = self.send_handler(conn) {
-                        log::warn!(
-                            "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {:?}",
-                            conn.print_log_prefix(socket_id),
-                            tcp_packet.ack_number,
-                            conn.send_vars.next_sequence_num,
-                            e
-                        );
-                    }
-                    return Ok(());
-                }
-                if should_update_window(conn, tcp_packet) {
-                    let current_window = conn.send_vars.get_scaled_send_window_size();
-                    let new_window =
-                        (tcp_packet.window_size << conn.send_vars.window_shift) as usize;
-                    log::debug!(
-                        "[{}] SND.WND updated. ({}->{} window_shift={} SEG.SEQ={} SEG.ACK={}).",
-                        conn.print_log_prefix(socket_id),
-                        current_window,
-                        new_window,
-                        conn.send_vars.window_shift,
-                        tcp_packet.seq_number,
-                        tcp_packet.ack_number
-                    );
-                    if current_window != new_window {
-                        self.publish_event(TcpEvent {
-                            socket_id: socket_id,
-                            event: TcpEventType::SendMore,
-                        });
-                    }
-                    conn.send_vars.window_size = tcp_packet.window_size;
-                    conn.send_vars.max_window_size = max(current_window, new_window);
-                    conn.send_vars.last_sequence_num = tcp_packet.seq_number;
-                    conn.send_vars.last_acknowledge_num = tcp_packet.ack_number;
-                    let snd_wnd_edge = conn
-                        .send_vars
-                        .unacknowledged
-                        .wrapping_add(conn.send_vars.get_scaled_send_window_size() as u32);
-                    if seq_greater_than(conn.send_vars.next_sequence_num, snd_wnd_edge) {
-                        log::warn!(
-                            "[{}] Peer reported a shrunk SND.WND resulting in SND.UNA + SND.WND < SND.NXT. Adjusting SND.NXT. ({}->{})",
-                            conn.print_log_prefix(socket_id), conn.send_vars.next_sequence_num, snd_wnd_edge,
-                        );
-                        conn.send_vars.next_sequence_num = snd_wnd_edge;
-                    }
-                }
-                // todo: use timestamp option
-                if let (Some(rtt_start), Some(rtt_seq)) = (conn.rtt_start, conn.rtt_seq) {
-                    if seq_greater_equal(tcp_packet.ack_number, rtt_seq) {
-                        update_retransmission_param(
-                            conn,
-                            rtt_start.elapsed().as_millis() as usize,
-                        )?;
-                        let timer_param = &conn.timer.retransmission.timer_param;
-                        log::debug!(
-                            "[{}] Retransmission param updated. rtt={} rtt_smoothed={}({}) rtt_variance={}({}) shift={} delta={}",
-                            conn.print_log_prefix(socket_id), timer_param.rtt, timer_param.rtt_smoothed, timer_param.rtt_smoothed >> TCP_SRTT_SHIFT,
-                            timer_param.rtt_variance, timer_param.rtt_variance >> TCP_RTTVAR_SHIFT, timer_param.rexmt_shift, timer_param.delta
-                        );
-                        conn.rtt_start = None;
-                        conn.rtt_seq = None;
-                    }
-                }
-            }
-            // Seventh, process the segment text: rfc9293
-            if tcp_packet.payload.len() != 0 {
-                let prev_payload = conn.recv_queue.complete_datagram.payload.len();
-                if let Err(e) = conn
-                    .recv_queue
-                    .add(tcp_packet.seq_number as usize, &tcp_packet.payload)
-                {
-                    log::warn!("Failed to add a segment to the recv queue. Err: {:?}", e);
-                } else {
-                    let current_payload = conn.recv_queue.complete_datagram.payload.len();
-                    let rcv_nxt_advance = current_payload - prev_payload;
-                    let rcv_nxt_next = conn
-                        .recv_queue
-                        .get_real_begin_sequence_num()
-                        .wrapping_add(current_payload as u32);
-                    log::debug!(
-                        "[{}] RCV.NXT advanced. ({}->{}).",
-                        conn.print_log_prefix(socket_id),
-                        conn.recv_vars.next_sequence_num,
-                        rcv_nxt_next
-                    );
-                    conn.recv_vars.next_sequence_num = rcv_nxt_next;
-                    conn.recv_vars.window_size = conn.get_recv_window_size();
-                    if prev_payload != current_payload {
-                        log::debug!(
-                            "[{}] Datagram received {} bytes. (Current received queue length {}->{})",
-                            conn.print_log_prefix(socket_id),
-                            rcv_nxt_advance,
-                            prev_payload,
-                            current_payload
-                        );
-                        self.publish_event(TcpEvent {
-                            socket_id: socket_id,
-                            event: TcpEventType::DatagramReceived,
-                        });
-                    }
-                }
-                if !conn.timer.delayed_ack.timer_param.active
-                    && conn.conn_flag.use_delayed_ack
-                    && !conn.has_unsent_data()
-                {
-                    conn.send_flag.ack_delayed = true;
-                    conn.timer.delayed_ack.fire();
-                } else {
-                    conn.send_flag.ack_now = true;
-                }
-            }
-            // Enter the CLOSE-WAIT state. rfc9293
-            if tcp_packet.flag.contains(TcpFlag::FIN) {
-                conn.send_flag.ack_now = true;
-                update_tcp_status_simple(socket_id, conn, Some(tcp_packet), TcpStatus::CloseWait);
-            }
-            if let Err(e) = self.send_handler(conn) {
-                log::warn!(
-                    "[{}] Acked, but failed. SEG.ACK={} SND.NXT={} Err: {}",
-                    conn.print_log_prefix(socket_id),
-                    tcp_packet.ack_number,
-                    conn.send_vars.next_sequence_num,
-                    e
-                );
-            }
-            if !conn.timer.retransmission.timer_param.active
-                && conn.send_vars.unacknowledged != conn.send_vars.next_sequence_num
-            {
-                conn.timer.retransmission.fire_datagram();
-                log::debug!(
-                    "Enabled retransmission timer in recv_handler_established. shift={} SND.UNA={} SND.NXT={}",
-                    conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged, conn.send_vars.next_sequence_num
-                );
-            } else if conn.timer.retransmission.timer_param.active
-                && conn.send_vars.unacknowledged == conn.send_vars.next_sequence_num
-            {
-                conn.timer.retransmission.timer_param.active = false;
-                log::debug!(
-                    "Disabled retransmission timer in recv_handler_established. shift={} SND.UNA=SND.NXT={}",
-                    conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged
-                );
-            }
-            return Ok(());
         } else {
             anyhow::bail!("No socket (id={}).", socket_id);
         }
@@ -1444,7 +1175,7 @@ pub fn update_timer(socket_id: usize, conn: &mut TcpConnection) {
             {
                 conn.timer.retransmission.fire_datagram();
                 log::debug!(
-                    "[{}] Enabled retransmission timer in recv_handler_established. shift={} SND.UNA={} SND.NXT={}",
+                    "[{}] Enabled retransmission timer in recv_handler_other. shift={} SND.UNA={} SND.NXT={}",
                     conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged, conn.send_vars.next_sequence_num
                 );
             } else if conn.timer.retransmission.timer_param.active
@@ -1452,7 +1183,7 @@ pub fn update_timer(socket_id: usize, conn: &mut TcpConnection) {
             {
                 conn.timer.retransmission.timer_param.active = false;
                 log::debug!(
-                    "[{}] Disabled retransmission timer in recv_handler_established. shift={} SND.UNA=SND.NXT={}",
+                    "[{}] Disabled retransmission timer in recv_handler_other. shift={} SND.UNA=SND.NXT={}",
                     conn.print_log_prefix(socket_id), conn.timer.retransmission.timer_param.rexmt_shift, conn.send_vars.unacknowledged
                 );
             }
