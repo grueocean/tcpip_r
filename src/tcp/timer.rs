@@ -32,7 +32,7 @@ const TCP_REXMT_MEAN_SHIFT: usize = 2; // β = 1/4 : D <- D + β*(|M-A|-D)
 pub const TCP_SRTT_SHIFT: usize = 5; // srtt is scaled by 32 (2^5).
 pub const TCP_RTTVAR_SHIFT: usize = 4; // rttvar is scaled by 16 (2^4).
 const TCP_DELAY_ACK: usize = 40; // BSD: tcp_delacktime
-const TCP_2MSL: usize = 10_000;
+const TCP_2MSL: usize = 3_000;
 
 impl TcpStack {
     pub fn timer_thread(&self) -> Result<()> {
@@ -68,6 +68,14 @@ impl TcpStack {
                 TcpStatus::Established => {
                     self.timer_handler_datagram(socket_id, &mut conns)
                         .context("timer_handler_datagram failed. (state=ESTABLISHED)")?;
+                }
+                TcpStatus::FinWait1 => {
+                    self.timer_handler_retransmission_only(socket_id, &mut conns)
+                        .context("timer_handler_retransmission_only failed. (state=FIN-WAIT1)")?;
+                }
+                TcpStatus::LastAck => {
+                    self.timer_handler_retransmission_only(socket_id, &mut conns)
+                        .context("timer_handler_retransmission_only failed. (state=LAST-ACK)")?;
                 }
                 TcpStatus::TimeWait => self
                     .timer_handler_timewait(socket_id, &mut conns)
@@ -208,6 +216,19 @@ impl TcpStack {
                 );
             }
             conn.timer.delayed_ack.init();
+        }
+        Ok(())
+    }
+
+    pub fn timer_handler_retransmission_only(
+        &self,
+        socket_id: usize,
+        conns: &mut MutexGuard<HashMap<usize, Option<TcpConnection>>>,
+    ) -> Result<()> {
+        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            self.timer_handler_datagram_retransmission(socket_id, conn)?;
+        } else {
+            anyhow::bail!("Cannot find socket (id={}).", socket_id);
         }
         Ok(())
     }

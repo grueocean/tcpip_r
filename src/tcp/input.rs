@@ -26,6 +26,8 @@ use std::{
     time::Duration,
 };
 
+use super::usrreq::Shutdown;
+
 const MAX_SEQ: u32 = u32::MAX;
 // "The present global default is five minutes." rfc9293
 const TCP_OPEN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -232,6 +234,7 @@ impl TcpStack {
                         last_snd_ack: 0,
                         last_sent_window: 0,
                         fin_seq: None,
+                        shutdown: Shutdown::None,
                         send_flag: TcpSendControlFlag::new(),
                         conn_flag: TcpConnectionFlag::new(),
                     };
@@ -1220,6 +1223,7 @@ pub struct TcpConnection {
     pub last_snd_ack: u32,          // BSD: last_ack_sent
     pub last_sent_window: usize,    // window size recently notified to peer
     pub fin_seq: Option<u32>,       // seq number for fin that is already sent
+    pub shutdown: Shutdown,
     pub send_flag: TcpSendControlFlag,
     pub conn_flag: TcpConnectionFlag,
 }
@@ -1244,6 +1248,7 @@ impl TcpConnection {
             last_snd_ack: 0,
             last_sent_window: 0,
             fin_seq: None,
+            shutdown: Shutdown::None,
             send_flag: TcpSendControlFlag::new(),
             conn_flag: TcpConnectionFlag::new(),
         }

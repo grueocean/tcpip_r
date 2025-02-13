@@ -281,13 +281,12 @@ impl TcpPacket {
                     }
                 }
             }
-            TcpStatus::FinWait1 => {
-                Ok(Self::new_fin_wait1(conn).context("Failed to create fin_wait1_next packet.")?)
-            }
+            TcpStatus::FinWait1 | TcpStatus::LastAck => Ok(Self::new_datagram_fin(conn)
+                .context("Failed to create new_datagram_fin packet.")?),
             TcpStatus::CloseWait => {
                 Ok(Self::new_close_wait(conn).context("Failed to create close_wait packet.")?)
             }
-            TcpStatus::FinWait2 | TcpStatus::Closing => {
+            TcpStatus::FinWait2 | TcpStatus::Closing | TcpStatus::TimeWait => {
                 Ok(Self::new_ack(conn).context("Failed to create new_ack packet.")?)
             }
             other => {
@@ -424,7 +423,7 @@ impl TcpPacket {
         Ok(datagram)
     }
 
-    pub fn new_fin_wait1(conn: &mut TcpConnection) -> Result<Self> {
+    pub fn new_datagram_fin(conn: &mut TcpConnection) -> Result<Self> {
         if let Some(fin_seq) = conn.fin_seq {
             Ok(Self::new_fin(conn, fin_seq)?)
         } else {

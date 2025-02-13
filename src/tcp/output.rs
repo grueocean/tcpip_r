@@ -269,14 +269,14 @@ impl TcpStack {
     }
 
     pub fn send_back_rst_syn(&self, original_packet: &TcpPacket) -> Result<()> {
-        let rst_packet = original_packet.create_rst_syn();
-        self.send_tcp_packet(rst_packet)?;
+        let rst_syn_packet = original_packet.create_rst_syn();
+        self.send_tcp_packet(rst_syn_packet)?;
         Ok(())
     }
 
     pub fn send_back_rst_ack(&self, original_packet: &TcpPacket) -> Result<()> {
-        let rst_packet = original_packet.create_rst_ack();
-        self.send_tcp_packet(rst_packet)?;
+        let rst_ack_packet = original_packet.create_rst_ack();
+        self.send_tcp_packet(rst_ack_packet)?;
         Ok(())
     }
 

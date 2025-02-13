@@ -6,7 +6,7 @@ use crate::{
     tcp::{
         self,
         defs::{TcpError, TcpStatus},
-        input::{ListenQueue, TcpConnection, TcpEvent, TcpEventType},
+        input::{update_tcp_status_simple, ListenQueue, TcpConnection, TcpEvent, TcpEventType},
         output,
         packet::{TcpFlag, TcpPacket, TCP_DEFAULT_WINDOW_SCALE},
         timer::{update_retransmission_param, TcpTimer, TCP_RTTVAR_SHIFT, TCP_SRTT_SHIFT},
@@ -14,7 +14,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use log;
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 use std::ops::Range;
 use std::sync::{mpsc::channel, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -24,6 +23,10 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::MutexGuard,
     time::Duration,
+};
+use std::{
+    io::Read,
+    net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs},
 };
 
 pub const TCP_MAX_SOCKET: usize = 100;
@@ -464,6 +467,16 @@ impl TcpStack {
         loop {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+                match conn.shutdown {
+                    Shutdown::Write | Shutdown::Both => {
+                        anyhow::bail!(
+                            "This socket (id={} status={}) is already shutdown for write.",
+                            socket_id,
+                            conn.status
+                        );
+                    }
+                    _ => {}
+                }
                 let current_queue_free =
                     conn.send_queue.queue_length - conn.send_queue.payload.len();
                 let remain = payload_len - current_offset;
@@ -554,6 +567,12 @@ impl TcpStack {
         loop {
             let mut conns = self.connections.lock().unwrap();
             if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+                match conn.shutdown {
+                    Shutdown::Read | Shutdown::Both => {
+                        return Ok(0);
+                    }
+                    _ => {}
+                }
                 if conn.recv_queue.complete_datagram.payload.len() != 0 {
                     let read_size = conn.recv_queue.read(payload)?;
                     if read_size != 0 {
@@ -621,7 +640,42 @@ impl TcpStack {
                 anyhow::bail!("Cannot find the socket (id={}).", socket_id);
             }
         }
-        log::trace!("Shutting down. id={}", socket_id);
+        log::trace!("Shutting down. (dummy call) id={}", socket_id);
+        Ok(())
+    }
+
+    pub fn shutdown(&self, socket_id: usize, shutdown: Shutdown) -> Result<()> {
+        log::trace!("SHUTDOWN CALL: id={}", socket_id);
+        let mut conns = self.connections.lock().unwrap();
+        if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            conn.shutdown = shutdown;
+            match conn.shutdown {
+                Shutdown::None => {
+                    anyhow::bail!("Need to specify shutdown type.");
+                }
+                Shutdown::Write | Shutdown::Both => match conn.status {
+                    TcpStatus::Established => {
+                        update_tcp_status_simple(socket_id, conn, None, TcpStatus::FinWait1);
+                    }
+                    TcpStatus::CloseWait => {
+                        update_tcp_status_simple(socket_id, conn, None, TcpStatus::LastAck);
+                    }
+                    _ => {}
+                },
+                Shutdown::Read => {
+                    return Ok(());
+                }
+            }
+            if let Err(e) = self.send_handler(conn) {
+                log::warn!(
+                    "[{}] Failed to send FIN. Err: {:?}",
+                    conn.print_log_prefix(socket_id),
+                    e
+                );
+            }
+        } else {
+            anyhow::bail!("Cannot find the socket (id={}).", socket_id);
+        }
         Ok(())
     }
 
@@ -659,6 +713,7 @@ impl TcpStack {
                 last_snd_ack: _last_snd_ack,
                 last_sent_window: _last_sent_window,
                 fin_seq: _fin_sent,
+                shutdown: _shutdown,
                 send_flag: _send_flag,
                 conn_flag: _conn_flag,
             }) = connection_info
@@ -767,4 +822,12 @@ impl TcpStack {
         *e = event;
         condvar.notify_all();
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum Shutdown {
+    None,
+    Read,
+    Write,
+    Both,
 }
