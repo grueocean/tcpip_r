@@ -49,6 +49,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    if let Some(binary_name) = std::env::args().next() {
+        eprintln!("name: {}", binary_name);
+    }
     env_logger::builder().format_timestamp_millis().init();
     let args = Args::parse();
     let config =

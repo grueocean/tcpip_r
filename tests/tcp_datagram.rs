@@ -20,10 +20,10 @@ const NETWORK_TCPIP0: &str = "172.20.10.110";
 const NETWORK_TCPIP1: &str = "172.20.10.111";
 const SUBNETMASK: usize = 24;
 const TESTAPP_PATH: &str = "./target/debug/examples/";
-const TESTAPP_TCP_CLIENT_DATA_RECV: &str = "_test_tcp_client_data_recv";
-const TESTAPP_TCP_SERVER_DATA_SEND: &str = "_test_tcp_server_data_send";
-const TESTAPP_TCP_CLIENT_DATA_SEND: &str = "_test_tcp_client_data_send";
-const TESTAPP_TCP_SERVER_DATA_RECV: &str = "_test_tcp_server_data_recv";
+const TESTAPP_TCP_DATA1_CLIENT_RECV: &str = "_test_tcp_data1_client_recv";
+const TESTAPP_TCP_DATA1_SERVER_SEND: &str = "_test_tcp_data1_server_send";
+const TESTAPP_TCP_DATA2_CLIENT_SEND: &str = "_test_tcp_data2_client_send";
+const TESTAPP_TCP_DATA2_SERVER_RECV: &str = "_test_tcp_data2_server_recv";
 const TEST_INITIALIZE: u64 = 100; // msec
 const TEST_TIMEOUT: u64 = 10; // sec
 const CLIENT_CONNECTTED: &str = "Socket connected!";
@@ -67,7 +67,7 @@ fn test_normal_datagram_server_to_client(
         .arg("netns")
         .arg("exec")
         .arg("Dev0")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_SERVER_DATA_SEND))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_DATA1_SERVER_SEND))
         .arg("--iface")
         .arg("d0")
         .arg("--network")
@@ -88,14 +88,14 @@ fn test_normal_datagram_server_to_client(
         .spawn()
         .context(format!(
             "Failed to execute {}.",
-            TESTAPP_TCP_SERVER_DATA_SEND
+            TESTAPP_TCP_DATA1_SERVER_SEND
         ))?;
     let mut client = Command::new("sudo")
         .arg("ip")
         .arg("netns")
         .arg("exec")
         .arg("Dev1")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_DATA_RECV))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_DATA1_CLIENT_RECV))
         .arg("--iface")
         .arg("d1")
         .arg("--network")
@@ -115,7 +115,7 @@ fn test_normal_datagram_server_to_client(
         .spawn()
         .context(format!(
             "Failed to execute {}.",
-            TESTAPP_TCP_CLIENT_DATA_RECV
+            TESTAPP_TCP_DATA1_CLIENT_RECV
         ))?;
     if let Some(server_status) =
         child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))?
@@ -184,7 +184,7 @@ fn test_normal_datagram_client_to_server(
         .arg("netns")
         .arg("exec")
         .arg("Dev0")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_SERVER_DATA_RECV))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_DATA2_SERVER_RECV))
         .arg("--iface")
         .arg("d0")
         .arg("--network")
@@ -202,14 +202,14 @@ fn test_normal_datagram_client_to_server(
         .spawn()
         .context(format!(
             "Failed to execute {}.",
-            TESTAPP_TCP_SERVER_DATA_SEND
+            TESTAPP_TCP_DATA1_SERVER_SEND
         ))?;
     let mut client = Command::new("sudo")
         .arg("ip")
         .arg("netns")
         .arg("exec")
         .arg("Dev1")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_DATA_SEND))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_DATA2_CLIENT_SEND))
         .arg("--iface")
         .arg("d1")
         .arg("--network")
@@ -231,7 +231,7 @@ fn test_normal_datagram_client_to_server(
         .spawn()
         .context(format!(
             "Failed to execute {}.",
-            TESTAPP_TCP_CLIENT_DATA_RECV
+            TESTAPP_TCP_DATA1_CLIENT_RECV
         ))?;
     if let Some(server_status) =
         child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))?

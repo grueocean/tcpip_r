@@ -4,9 +4,13 @@ use eui48::MacAddress;
 use hex;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::from_utf8;
+use tcpip_r::tcp::defs::TcpStatus;
 use tcpip_r::{
     l2_l3::ip::{generate_network_config, Ipv4Config},
-    tcp::socket::{TcpListener, TcpStream},
+    tcp::{
+        socket::{TcpListener, TcpStream},
+        usrreq::Shutdown,
+    },
 };
 
 #[derive(Parser, Debug)]
@@ -45,30 +49,20 @@ fn main() -> Result<()> {
     if let Some(binary_name) = std::env::args().next() {
         eprintln!("name: {}", binary_name);
     }
-    env_logger::builder().format_timestamp_millis().init();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Trace)
+        .format_timestamp_millis()
+        .init();
     let args = Args::parse();
     let config =
         generate_network_config(args.iface, args.mac, args.mtu, args.network, args.gateway)?;
     let tcp = TcpListener::new(config)?;
     tcp.bind(SocketAddrV4::new(args.network.address, args.port))?;
-    println!("Start accepting connections.");
-    let (stream, addr) = tcp.accept()?;
-    println!("accepted: {}", addr);
-    loop {
-        let mut buf = [0; 1024];
-        match stream.read(&mut buf) {
-            Ok(amt) => {
-                let data = &buf[..amt];
-                let ascii = from_utf8(data)
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|_| String::from("Data contains non-ASCII characters"));
-                let hex = hex::encode(data);
-                println!("Tcp packet received ({} bytes).", amt);
-                println!("hex: {}\nascii: {}", hex, ascii);
-            }
-            Err(e) => {
-                println!("Tcp recv error. Err: {}", e);
-            }
-        }
-    }
+    let (stream, _addr) = tcp.accept()?;
+    println!("Socket accepted!");
+    stream.wait(Some(&[TcpStatus::CloseWait]))?;
+    stream.shutdown(Shutdown::Both)?;
+    stream.wait(None)?;
+    println!("Socket shutdown.");
+    Ok(())
 }

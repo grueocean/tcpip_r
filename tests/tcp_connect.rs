@@ -18,8 +18,8 @@ const NETWORK_TCPIP0: &str = "172.20.10.110";
 const NETWORK_TCPIP1: &str = "172.20.10.111";
 const SUBNETMASK: usize = 24;
 const TESTAPP_PATH: &str = "./target/debug/examples/";
-const TESTAPP_TCP_CLIENT_OPEN: &str = "_test_tcp_client_open";
-const TESTAPP_TCP_SERVER_OPEN: &str = "_test_tcp_server_open";
+const TESTAPP_TCP_OPEN_CLIENT: &str = "_test_tcp_open_client";
+const TESTAPP_TCP_OPEN_SERVER: &str = "_test_tcp_open_server";
 const TEST_INITIALIZE: u64 = 50; // msec
 const TEST_TIMEOUT: u64 = 10; // sec
 const CLIENT_CONNECTTED: &str = "Socket connected!";
@@ -50,7 +50,7 @@ fn test_normal_3way_handshake_client() -> Result<()> {
         .arg("netns")
         .arg("exec")
         .arg("Dev0")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_OPEN))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_OPEN_CLIENT))
         .arg("--iface")
         .arg("d0")
         .arg("--network")
@@ -64,7 +64,7 @@ fn test_normal_3way_handshake_client() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_OPEN))?;
+        .context(format!("Failed to execute {}.", TESTAPP_TCP_OPEN_CLIENT))?;
     if let Some(status) = child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT))? {
         println!("status: {:?}", status);
         if status.success() && check_stdout_pattern(&mut client, &expected_client_stdout)? {
@@ -94,7 +94,7 @@ fn test_normal_3way_handshake_server() -> Result<()> {
         .arg("netns")
         .arg("exec")
         .arg("Dev0")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_SERVER_OPEN))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_OPEN_SERVER))
         .arg("--iface")
         .arg("d0")
         .arg("--network")
@@ -106,7 +106,7 @@ fn test_normal_3way_handshake_server() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_SERVER_OPEN))?;
+        .context(format!("Failed to execute {}.", TESTAPP_TCP_OPEN_SERVER))?;
     thread::sleep(Duration::from_millis(TEST_INITIALIZE));
     let mut client = Command::new("sudo")
         .arg("ip")
@@ -151,7 +151,7 @@ fn test_normal_3way_handshake_both() -> Result<()> {
         .arg("netns")
         .arg("exec")
         .arg("Dev0")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_SERVER_OPEN))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_OPEN_SERVER))
         .arg("--iface")
         .arg("d0")
         .arg("--network")
@@ -163,13 +163,13 @@ fn test_normal_3way_handshake_both() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_SERVER_OPEN))?;
+        .context(format!("Failed to execute {}.", TESTAPP_TCP_OPEN_SERVER))?;
     let mut client = Command::new("sudo")
         .arg("ip")
         .arg("netns")
         .arg("exec")
         .arg("Dev1")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_OPEN))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_OPEN_CLIENT))
         .arg("--iface")
         .arg("d1")
         .arg("--network")
@@ -183,7 +183,7 @@ fn test_normal_3way_handshake_both() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_OPEN))?;
+        .context(format!("Failed to execute {}.", TESTAPP_TCP_OPEN_CLIENT))?;
     if let Some(server_status) =
         child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))?
     {
@@ -225,7 +225,7 @@ fn test_simultaneous_open() -> Result<()> {
         .arg("netns")
         .arg("exec")
         .arg("Dev0")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_OPEN))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_OPEN_CLIENT))
         .arg("--iface")
         .arg("d0")
         .arg("--network")
@@ -241,13 +241,13 @@ fn test_simultaneous_open() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_OPEN))?;
+        .context(format!("Failed to execute {}.", TESTAPP_TCP_OPEN_CLIENT))?;
     let mut client2 = Command::new("sudo")
         .arg("ip")
         .arg("netns")
         .arg("exec")
         .arg("Dev1")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLIENT_OPEN))
+        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_OPEN_CLIENT))
         .arg("--iface")
         .arg("d1")
         .arg("--network")
@@ -263,7 +263,7 @@ fn test_simultaneous_open() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_CLIENT_OPEN))?;
+        .context(format!("Failed to execute {}.", TESTAPP_TCP_OPEN_CLIENT))?;
     if let Some(status1) = child_wait_with_timeout(&mut client1, Duration::from_secs(TEST_TIMEOUT))?
     {
         println!("client1 status: {:?}", status1);

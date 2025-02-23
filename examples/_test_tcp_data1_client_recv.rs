@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use eui48::MacAddress;
 use hex;
-use std::io;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::from_utf8;
 use std::thread;
@@ -46,9 +47,18 @@ struct Args {
 
     #[arg(long, help = "Local port, e.g., 300", default_value_t = 0)]
     lport: u16,
+
+    #[arg(long, help = "File to be rcvd")]
+    file: String,
+
+    #[arg(long, help = "Transfer size")]
+    size: usize,
 }
 
 fn main() -> Result<()> {
+    if let Some(binary_name) = std::env::args().next() {
+        eprintln!("name: {}", binary_name);
+    }
     env_logger::builder()
         .filter_level(log::LevelFilter::Trace)
         .format_timestamp_millis()
@@ -56,8 +66,26 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let config =
         generate_network_config(args.iface, args.mac, args.mtu, args.network, args.gateway)?;
-    let tcp = TcpStream::new(config)?;
-    tcp.connect_with_bind(SocketAddrV4::new(args.dst, args.port), args.lport)?;
+    let stream = TcpStream::new(config)?;
+    stream.connect_with_bind(SocketAddrV4::new(args.dst, args.port), args.lport)?;
     println!("Socket connected!");
-    Ok(())
+    let mut total_bytes: usize = 0;
+    let mut buffer = [0u8; 1024];
+    let mut rcvd_data = Vec::new();
+    loop {
+        let bytes_read = stream.read(&mut buffer)?;
+        total_bytes += bytes_read;
+        rcvd_data.extend_from_slice(&buffer[..bytes_read]);
+        if bytes_read == 0 || total_bytes == args.size {
+            break;
+        }
+    }
+    stream.shutdown_dummy()?;
+    let file_data = fs::read(args.file)?;
+    if rcvd_data == file_data {
+        Ok(())
+    } else {
+        eprintln!("Received data is incorrect.");
+        anyhow::bail!("Received data is incorrect.")
+    }
 }

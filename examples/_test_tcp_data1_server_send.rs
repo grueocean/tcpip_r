@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use eui48::MacAddress;
 use hex;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufReader, Read};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::str::from_utf8;
 use std::thread;
+use std::time::Duration;
 use tcpip_r::{
     l2_l3::ip::{generate_network_config, Ipv4Config},
     tcp::socket::{TcpListener, TcpStream},
@@ -14,7 +14,7 @@ use tcpip_r::{
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-#[command(after_help = "EXAMPLES: ./tcp_client -i d0 -n 172.20.10.100/24 -g 172.20.10.1 -p 300")]
+#[command(after_help = "EXAMPLES: ./tcp_server -i d0 -n 172.20.10.100/24 -g 172.20.10.1 -p 300")]
 struct Args {
     #[arg(long, short = 'i', help = "Interface name, e.g., eth0")]
     iface: String,
@@ -37,26 +37,26 @@ struct Args {
 
     #[arg(
         long,
-        short = 'd',
-        help = "Destination Ipv4 Address, e.g., 172.20.10.1"
+        short = 'p',
+        help = "Port for this tcp server (0 if assign ephemeral port), e.g., 300",
+        default_value_t = 0
     )]
-    dst: Ipv4Addr,
-
-    #[arg(long, short = 'p', help = "Destination port, e.g., 300")]
     port: u16,
-
-    #[arg(long, help = "Local port, e.g., 300", default_value_t = 0)]
-    lport: u16,
 
     #[arg(long, help = "File to be rcvd")]
     file: String,
+
+    #[arg(long, help = "Buffer size")]
+    buf: usize,
 
     #[arg(long, help = "Transfer size")]
     size: usize,
 }
 
 fn main() -> Result<()> {
-    eprintln!("_test_tcp_client_data_recv started");
+    if let Some(binary_name) = std::env::args().next() {
+        eprintln!("name: {}", binary_name);
+    }
     env_logger::builder()
         .filter_level(log::LevelFilter::Trace)
         .format_timestamp_millis()
@@ -64,26 +64,32 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let config =
         generate_network_config(args.iface, args.mac, args.mtu, args.network, args.gateway)?;
-    let stream = TcpStream::new(config)?;
-    stream.connect_with_bind(SocketAddrV4::new(args.dst, args.port), args.lport)?;
-    println!("Socket connected!");
+    let tcp = TcpListener::new(config)?;
+    tcp.bind(SocketAddrV4::new(args.network.address, args.port))?;
+    let (stream, _addr) = tcp.accept()?;
+    println!("Socket accepted!");
+    let file = File::open(args.file).context("Failed to open test file.")?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = vec![0u8; args.buf];
     let mut total_bytes: usize = 0;
-    let mut buffer = [0u8; 1024];
-    let mut rcvd_data = Vec::new();
     loop {
-        let bytes_read = stream.read(&mut buffer)?;
+        let bytes_read = reader
+            .read(&mut buffer)
+            .context("Failed to read from test file.")?;
+        eprintln!("Write: {}~{}", total_bytes, total_bytes + bytes_read);
         total_bytes += bytes_read;
-        rcvd_data.extend_from_slice(&buffer[..bytes_read]);
-        if bytes_read == 0 || total_bytes == args.size {
+        if bytes_read == 0 {
             break;
+        }
+        loop {
+            if let Err(e) = stream.write(&buffer[..bytes_read]) {
+                eprintln!("Failed to write to stream. Err: {:?}", e);
+                thread::sleep(Duration::from_millis(10));
+            } else {
+                break;
+            }
         }
     }
     stream.shutdown_dummy()?;
-    let file_data = fs::read(args.file)?;
-    if rcvd_data == file_data {
-        Ok(())
-    } else {
-        eprintln!("Received data is incorrect.");
-        anyhow::bail!("Received data is incorrect.")
-    }
+    Ok(())
 }

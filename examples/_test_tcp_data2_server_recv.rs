@@ -51,7 +51,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    eprintln!("_test_tcp_server_data_recv started");
+    if let Some(binary_name) = std::env::args().next() {
+        eprintln!("name: {}", binary_name);
+    }
     env_logger::builder()
         .filter_level(log::LevelFilter::Trace)
         .format_timestamp_millis()
