@@ -983,6 +983,14 @@ impl TcpStack {
                     );
                     conn.recv_vars.next_sequence_num = rcv_nxt_next;
                 }
+            } else {
+                log::debug!(
+                    "[{}] RCV.NXT advanced. ({}->{}).",
+                    conn.print_log_prefix(socket_id),
+                    conn.recv_vars.next_sequence_num,
+                    rcv_nxt_next
+                );
+                conn.recv_vars.next_sequence_num = rcv_nxt_next;
             }
             conn.recv_vars.window_size = conn.get_recv_window_size();
             if prev_payload != current_payload {
