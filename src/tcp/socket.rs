@@ -3,7 +3,7 @@ use crate::{
         defs::Ipv4Type,
         ip::{get_global_l3stack, Ipv4Packet, L3Stack, NetworkConfiguration},
     },
-    tcp::{defs, packet::TcpPacket, usrreq},
+    tcp::{defs::TcpStatus, packet::TcpPacket, usrreq::Shutdown},
 };
 use anyhow::{Context, Result};
 use std::sync::{mpsc::channel, Arc, Condvar, Mutex, OnceLock};
@@ -123,5 +123,15 @@ impl TcpStream {
     pub fn shutdown_dummy(&self) -> Result<()> {
         let tcp = get_global_tcpstack(self.config.clone())?;
         Ok(tcp.shutdown_dummy(self.socket_id)?)
+    }
+
+    pub fn shutdown(&self, shutdown: Shutdown) -> Result<()> {
+        let tcp = get_global_tcpstack(self.config.clone())?;
+        Ok(tcp.shutdown(self.socket_id, shutdown)?)
+    }
+
+    pub fn wait(&self, target_status: Option<&[TcpStatus]>) -> Result<()> {
+        let tcp = get_global_tcpstack(self.config.clone())?;
+        Ok(tcp.wait(self.socket_id, target_status)?)
     }
 }

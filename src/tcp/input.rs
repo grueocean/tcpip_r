@@ -101,12 +101,18 @@ impl TcpStack {
                         self.recv_handler_syn_rcvd(id, tcp_packet, conns)
                             .context("recv_handler_syn_rcvd failed.")?;
                     }
-                    TcpStatus::Established => {
+                    TcpStatus::Established
+                    | TcpStatus::FinWait1
+                    | TcpStatus::FinWait2
+                    | TcpStatus::Closing
+                    | TcpStatus::TimeWait
+                    | TcpStatus::CloseWait
+                    | TcpStatus::LastAck => {
                         self.recv_handler_other(id, tcp_packet, conns)
                             .context("recv_handler_other failed.")?;
                     }
-                    other => {
-                        anyhow::bail!("Recv handler for TcpStatus {} is not implemented.", other);
+                    TcpStatus::Closed => {
+                        anyhow::bail!("Recv handler for TcpStatus CLOSED is not implemented.");
                     }
                 }
                 return Ok(());
@@ -233,7 +239,8 @@ impl TcpStack {
                         rtt_seq: None,
                         last_snd_ack: 0,
                         last_sent_window: 0,
-                        fin_seq: None,
+                        fin_seq_sent: None,
+                        fin_seq_recv: None,
                         shutdown: Shutdown::None,
                         send_flag: TcpSendControlFlag::new(),
                         conn_flag: TcpConnectionFlag::new(),
@@ -705,7 +712,7 @@ impl TcpStack {
                 }
             }
             // Seventh, process the segment text: rfc9293
-            if tcp_packet.payload.len() != 0 {
+            if tcp_packet.payload.len() != 0 || tcp_packet.flag.contains(TcpFlag::FIN) {
                 self.recv_handler_internal_process_segment(socket_id, conn, tcp_packet)?;
             }
             // Send an acknowledgment of the form:
@@ -740,9 +747,9 @@ impl TcpStack {
             TcpStatus::LastAck => {
                 // The only thing that can arrive in this state is an acknowledgment of our FIN.
                 // If our FIN is now acknowledged, delete the TCB, enter the CLOSED state, and return. rfc9293
-                if let Some(fin_seq) = conn.fin_seq {
+                if let Some(fin_seq) = conn.fin_seq_sent {
                     // if the ACK acknowledges our FIN, then enter the TIME-WAIT state; rfc9293
-                    if fin_seq.wrapping_add(1) == conn.send_vars.unacknowledged {
+                    if fin_seq.wrapping_add(1) == tcp_packet.ack_number {
                         update_tcp_status_simple(
                             socket_id,
                             conn,
@@ -800,12 +807,11 @@ impl TcpStack {
                     conn.send_vars.next_sequence_num
                 );
             }
-            if conn.update_snd_una(tcp_packet.ack_number)? {
-                self.publish_event(TcpEvent {
-                    socket_id: socket_id,
-                    event: TcpEventType::SendMore,
-                });
-            };
+            conn.update_snd_una(tcp_packet.ack_number)?;
+            self.publish_event(TcpEvent {
+                socket_id: socket_id,
+                event: TcpEventType::SendMore,
+            });
         } else if seq_less_equal(tcp_packet.ack_number, conn.send_vars.unacknowledged) {
             // If the ACK is a duplicate (SEG.ACK =< SND.UNA), it can be ignored. rfc9293
             log::debug!(
@@ -879,9 +885,9 @@ impl TcpStack {
         }
         match &conn.status {
             TcpStatus::FinWait1 => {
-                if let Some(fin_seq) = conn.fin_seq {
+                if let Some(fin_seq) = conn.fin_seq_sent {
                     // if the FIN segment is now acknowledged, then enter FIN-WAIT-2 and continue processing in that state. rfc9293
-                    if fin_seq.wrapping_add(1) == conn.send_vars.unacknowledged {
+                    if fin_seq.wrapping_add(1) == tcp_packet.ack_number {
                         update_tcp_status_simple(
                             socket_id,
                             conn,
@@ -907,7 +913,7 @@ impl TcpStack {
                 // Do the same processing as for the ESTABLISHED state. rfc9293
             }
             TcpStatus::Closing => {
-                if let Some(fin_seq) = conn.fin_seq {
+                if let Some(fin_seq) = conn.fin_seq_sent {
                     // if the ACK acknowledges our FIN, then enter the TIME-WAIT state; rfc9293
                     if fin_seq.wrapping_add(1) == conn.send_vars.unacknowledged {
                         update_tcp_status_simple(
@@ -952,17 +958,32 @@ impl TcpStack {
         } else {
             let current_payload = conn.recv_queue.complete_datagram.payload.len();
             let rcv_nxt_advance = current_payload - prev_payload;
-            let rcv_nxt_next = conn
-                .recv_queue
-                .get_real_begin_sequence_num()
-                .wrapping_add(current_payload as u32);
-            log::debug!(
-                "[{}] RCV.NXT advanced. ({}->{}).",
-                conn.print_log_prefix(socket_id),
-                conn.recv_vars.next_sequence_num,
-                rcv_nxt_next
-            );
-            conn.recv_vars.next_sequence_num = rcv_nxt_next;
+            let rcv_nxt_next = conn.recv_queue.get_end_sequence_num();
+            if tcp_packet.flag.contains(TcpFlag::FIN) {
+                let fin_seq_recv = tcp_packet
+                    .seq_number
+                    .wrapping_add(tcp_packet.payload.len() as u32);
+                conn.fin_seq_recv = Some(fin_seq_recv);
+            }
+            if let Some(fin_seq_recv) = conn.fin_seq_recv {
+                if rcv_nxt_next == fin_seq_recv {
+                    log::debug!(
+                        "[{}] RCV.NXT advanced including FIN(1). ({}->{}).",
+                        conn.print_log_prefix(socket_id),
+                        conn.recv_vars.next_sequence_num,
+                        rcv_nxt_next.wrapping_add(1)
+                    );
+                    conn.recv_vars.next_sequence_num = rcv_nxt_next.wrapping_add(1);
+                } else {
+                    log::debug!(
+                        "[{}] RCV.NXT advanced. ({}->{}).",
+                        conn.print_log_prefix(socket_id),
+                        conn.recv_vars.next_sequence_num,
+                        rcv_nxt_next
+                    );
+                    conn.recv_vars.next_sequence_num = rcv_nxt_next;
+                }
+            }
             conn.recv_vars.window_size = conn.get_recv_window_size();
             if prev_payload != current_payload {
                 log::debug!(
@@ -978,14 +999,16 @@ impl TcpStack {
                 });
             }
         }
-        if !conn.timer.delayed_ack.timer_param.active
-            && conn.conn_flag.use_delayed_ack
-            && !conn.has_unsent_data()
-        {
-            conn.send_flag.ack_delayed = true;
-            conn.timer.delayed_ack.fire();
-        } else {
-            conn.send_flag.ack_now = true;
+        if conn.status == TcpStatus::Established {
+            if !conn.timer.delayed_ack.timer_param.active
+                && conn.conn_flag.use_delayed_ack
+                && !conn.has_unsent_data()
+            {
+                conn.send_flag.ack_delayed = true;
+                conn.timer.delayed_ack.fire();
+            } else {
+                conn.send_flag.ack_now = true;
+            }
         }
         Ok(())
     }
@@ -999,13 +1022,22 @@ impl TcpStack {
         match &conn.status {
             // Enter the CLOSE-WAIT state. rfc9293
             TcpStatus::Established => {
-                update_tcp_status_simple(socket_id, conn, Some(tcp_packet), TcpStatus::CloseWait);
+                if let Some(fin_seq_recv) = conn.fin_seq_recv {
+                    if fin_seq_recv == conn.recv_queue.get_end_sequence_num() {
+                        update_tcp_status_simple(
+                            socket_id,
+                            conn,
+                            Some(tcp_packet),
+                            TcpStatus::CloseWait,
+                        );
+                    }
+                }
             }
             TcpStatus::FinWait1 => {
-                if let Some(fin_seq) = conn.fin_seq {
+                if let Some(fin_seq) = conn.fin_seq_sent {
                     // If our FIN has been ACKed (perhaps in this segment), then enter TIME-WAIT,
                     // start the time-wait timer, turn off the other timers; rfc9293
-                    if fin_seq.wrapping_add(1) == conn.send_vars.unacknowledged {
+                    if fin_seq.wrapping_add(1) == tcp_packet.ack_number {
                         update_tcp_status_simple(
                             socket_id,
                             conn,
@@ -1222,7 +1254,8 @@ pub struct TcpConnection {
     pub rtt_seq: Option<u32>,       // BSD: t_rtseq
     pub last_snd_ack: u32,          // BSD: last_ack_sent
     pub last_sent_window: usize,    // window size recently notified to peer
-    pub fin_seq: Option<u32>,       // seq number for fin that is already sent
+    pub fin_seq_sent: Option<u32>,  // seq number for fin that is already sent
+    pub fin_seq_recv: Option<u32>,  // seq number for fin that is recieved previously
     pub shutdown: Shutdown,
     pub send_flag: TcpSendControlFlag,
     pub conn_flag: TcpConnectionFlag,
@@ -1247,7 +1280,8 @@ impl TcpConnection {
             rtt_seq: None,
             last_snd_ack: 0,
             last_sent_window: 0,
-            fin_seq: None,
+            fin_seq_sent: None,
+            fin_seq_recv: None,
             shutdown: Shutdown::None,
             send_flag: TcpSendControlFlag::new(),
             conn_flag: TcpConnectionFlag::new(),
@@ -1269,6 +1303,7 @@ impl TcpConnection {
     }
 
     pub fn get_recv_window_size(&self) -> usize {
+        // 3.8.6.2.2. Receiver's Algorithm -- When to Send a Window Update
         // https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.2.2
         let adjust = min(
             self.recv_queue.queue_length / FR_RCV_BUFF_RATIO,
@@ -1293,19 +1328,25 @@ impl TcpConnection {
         (self.get_recv_window_size() >> TCP_DEFAULT_WINDOW_SCALE << TCP_DEFAULT_WINDOW_SCALE) as u16
     }
 
-    pub fn update_snd_una(&mut self, new_snd_una: u32) -> Result<bool> {
+    pub fn update_snd_una(&mut self, new_snd_una: u32) -> Result<()> {
         anyhow::ensure!(
             seq_less_equal(new_snd_una, self.send_vars.next_sequence_num),
             "New SND.UNA ({}) should be equal or smaller than SND.NXT ({}).",
             new_snd_una,
             self.send_vars.next_sequence_num
         );
-        let different = new_snd_una != self.send_vars.unacknowledged;
+        if let Some(fin_seq_sent) = self.fin_seq_sent {
+            if fin_seq_sent.wrapping_add(1) == new_snd_una {
+                self.send_queue.payload.clear();
+                self.send_vars.unacknowledged = new_snd_una;
+                return Ok(());
+            }
+        }
         self.send_queue
             .payload
             .drain(..new_snd_una.wrapping_sub(self.send_vars.unacknowledged) as usize);
         self.send_vars.unacknowledged = new_snd_una;
-        Ok(different)
+        Ok(())
     }
 
     pub fn has_unsent_data(&self) -> bool {
@@ -1489,6 +1530,11 @@ impl ReceiveQueue {
         }
     }
 
+    pub fn get_end_sequence_num(&self) -> u32 {
+        self.get_real_begin_sequence_num()
+            .wrapping_add(self.complete_datagram.payload.len() as u32)
+    }
+
     pub fn add(&mut self, seq: usize, payload: &Vec<u8>) -> Result<()> {
         log::trace!(
             "Adding SEQ={} (LEN: {}) to recv queue {}.",
@@ -1496,7 +1542,9 @@ impl ReceiveQueue {
             payload.len(),
             self.get_current()
         );
-        anyhow::ensure!(payload.len() > 0, "Cannot add an empty segment.");
+        if payload.len() == 0 {
+            return Ok(());
+        }
         let virtual_seq = self
             .convert_virtual_sequence_num(seq)
             .context("Failed to add segment, possibly it is out of the receive queue.")?;

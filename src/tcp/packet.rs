@@ -424,7 +424,7 @@ impl TcpPacket {
     }
 
     pub fn new_datagram_fin(conn: &mut TcpConnection) -> Result<Self> {
-        if let Some(fin_seq) = conn.fin_seq {
+        if let Some(fin_seq) = conn.fin_seq_sent {
             Ok(Self::new_fin(conn, fin_seq)?)
         } else {
             let (mut fin, sent_all) = Self::new_datagram_next(conn)?;
@@ -439,8 +439,8 @@ impl TcpPacket {
 
     pub fn new_close_wait(conn: &mut TcpConnection) -> Result<Self> {
         let (mut ack_of_fin, _) = Self::new_datagram_next(conn)?;
-        // +1 for fin
-        ack_of_fin.ack_number = ack_of_fin.ack_number.wrapping_add(1);
+        ack_of_fin.flag = TcpFlag::ACK;
+        ack_of_fin.ack_number = ack_of_fin.ack_number;
         Ok(ack_of_fin)
     }
 

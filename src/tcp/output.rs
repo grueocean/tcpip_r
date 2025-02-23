@@ -30,15 +30,15 @@ impl TcpStack {
             TcpStatus::SynRcvd => self
                 .send_handler_syn_rcvd(conn)
                 .context("send_handler_syn_rcvd failed."),
-            TcpStatus::Established => self
-                .send_handler_established(conn)
-                .context("send_handler_established failed."),
-            TcpStatus::FinWait1 => self
+            TcpStatus::Established | TcpStatus::CloseWait => self
+                .send_handler_datagram(conn)
+                .context("send_handler_datagram failed."),
+            TcpStatus::FinWait1 | TcpStatus::LastAck => self
                 .send_handler_fin_or_ack(conn)
-                .context("send_handler_fin_or_ack (FIN-WAIT1) failed."),
-            TcpStatus::CloseWait => self
-                .send_handler_fin_or_ack(conn)
-                .context("send_handler_fin_or_ack (CLOSE-WAIT) failed."),
+                .context("send_handler_fin_or_ack failed."),
+            TcpStatus::FinWait2 | TcpStatus::Closing => self
+                .send_handler_ack(conn)
+                .context("send_handler_ack failed."),
             other => {
                 conn.send_flag.init();
                 anyhow::bail!("Send handler for {} is not implemented.", other);
@@ -52,20 +52,24 @@ impl TcpStack {
         let mut syn_packet = TcpPacket::new_out_packet(conn, None)?;
         syn_packet.option.mss = Some(conn.recv_vars.recv_mss as u16);
         let snd_wnd = (syn_packet.window_size as usize) << conn.recv_vars.window_shift;
+        let snd_ack = syn_packet.ack_number;
         self.send_tcp_packet(syn_packet)?;
         conn.last_sent_window = snd_wnd;
+        conn.last_snd_ack = snd_ack;
         Ok(0)
     }
 
     pub fn send_handler_syn_rcvd(&self, conn: &mut TcpConnection) -> Result<usize> {
         let syn_ack_packet = TcpPacket::new_out_packet(conn, None)?;
         let snd_wnd = (syn_ack_packet.window_size as usize) << conn.recv_vars.window_shift;
+        let snd_ack = syn_ack_packet.ack_number;
         self.send_tcp_packet(syn_ack_packet)?;
         conn.last_sent_window = snd_wnd;
+        conn.last_snd_ack = snd_ack;
         Ok(0)
     }
 
-    pub fn send_handler_established(&self, conn: &mut TcpConnection) -> Result<usize> {
+    pub fn send_handler_datagram(&self, conn: &mut TcpConnection) -> Result<usize> {
         let send_una = conn.send_vars.unacknowledged;
         let send_nxt = conn.send_vars.next_sequence_num;
         let send_wnd = conn.send_vars.get_scaled_send_window_size();
@@ -209,6 +213,7 @@ impl TcpStack {
         }
     }
 
+    // todo: handle the case if no SND.WND available before sending FIN
     pub fn send_handler_fin_or_ack(&self, conn: &mut TcpConnection) -> Result<usize> {
         let mut loop_count: usize = 0;
         loop {
@@ -227,7 +232,7 @@ impl TcpStack {
             let snd_wnd = (datagram.window_size as usize) << conn.recv_vars.window_shift;
             let seg_fin = datagram.flag.contains(TcpFlag::FIN);
             if let Err(e) = self.send_tcp_packet(datagram) {
-                log::warn!("Failed to send in send_handler_fin_wait1. Err: {e}");
+                log::warn!("Failed to send in send_handler_fin_or_ack. Err: {e}");
             }
             conn.last_sent_window = snd_wnd;
             if conn.rtt_start.is_none() && datagram_size > 0 {
@@ -237,11 +242,24 @@ impl TcpStack {
             conn.send_vars.next_sequence_num = snd_seq.wrapping_add(datagram_size);
             conn.last_snd_ack = snd_ack;
             if seg_fin {
-                conn.fin_seq = Some(conn.send_vars.next_sequence_num);
+                conn.fin_seq_sent = Some(conn.send_vars.next_sequence_num);
                 conn.send_vars.next_sequence_num = conn.send_vars.next_sequence_num.wrapping_add(1);
                 break;
             }
         }
+        Ok(0)
+    }
+
+    pub fn send_handler_ack(&self, conn: &mut TcpConnection) -> Result<usize> {
+        let ack =
+            TcpPacket::new_out_packet(conn, None).context("Failed to create an ack packet.")?;
+        let snd_wnd = (ack.window_size as usize) << conn.recv_vars.window_shift;
+        let snd_ack = ack.ack_number;
+        if let Err(e) = self.send_tcp_packet(ack) {
+            log::warn!("Failed to send in send_handler_ack. Err: {e}");
+        }
+        conn.last_sent_window = snd_wnd;
+        conn.last_snd_ack = snd_ack;
         Ok(0)
     }
 

@@ -645,7 +645,7 @@ impl TcpStack {
     }
 
     pub fn shutdown(&self, socket_id: usize, shutdown: Shutdown) -> Result<()> {
-        log::trace!("SHUTDOWN CALL: id={}", socket_id);
+        log::trace!("SHUTDOWN CALL: id={} shutdown={:?}", socket_id, shutdown);
         let mut conns = self.connections.lock().unwrap();
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
             conn.shutdown = shutdown;
@@ -668,13 +668,38 @@ impl TcpStack {
             }
             if let Err(e) = self.send_handler(conn) {
                 log::warn!(
-                    "[{}] Failed to send FIN. Err: {:?}",
+                    "[{}] Failed to send a FIN packet. Err: {:?}",
                     conn.print_log_prefix(socket_id),
                     e
                 );
             }
         } else {
             anyhow::bail!("Cannot find the socket (id={}).", socket_id);
+        }
+        Ok(())
+    }
+
+    pub fn wait(&self, socket_id: usize, target_status: Option<&[TcpStatus]>) -> Result<()> {
+        log::trace!(
+            "WAIT CALL: id={} target_status={:?}",
+            socket_id,
+            target_status
+        );
+        loop {
+            let mut conns = self.connections.lock().unwrap();
+            if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+                if let Some(status) = target_status {
+                    if status.contains(&conn.status) {
+                        break;
+                    }
+                } else {
+                    if conn.status == TcpStatus::TimeWait || conn.status == TcpStatus::Closed {
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
         }
         Ok(())
     }
@@ -712,7 +737,8 @@ impl TcpStack {
                 rtt_seq: _rtt_seq,
                 last_snd_ack: _last_snd_ack,
                 last_sent_window: _last_sent_window,
-                fin_seq: _fin_sent,
+                fin_seq_sent: _fin_sqe_sent,
+                fin_seq_recv: _fin_seq_recv,
                 shutdown: _shutdown,
                 send_flag: _send_flag,
                 conn_flag: _conn_flag,
