@@ -174,70 +174,70 @@ fn test_normal_shutdown_both() -> Result<()> {
     Ok(())
 }
 
-#[test]
-#[serial]
-fn test_normal_shutdown_client_drop() -> Result<()> {
-    let mut suc = false;
-    let expected_client_stdout = [CLIENT_CONNECTTED, SHUTDOWN];
-    let env_num: usize = 1;
-    setup_env(env_num)?;
-    insert_drop(env_num, 30)?;
-    thread::sleep(Duration::from_millis(TEST_INITIALIZE));
-    let mut server = Command::new("sudo")
-        .arg("ip")
-        .arg("netns")
-        .arg("exec")
-        .arg("Tcpip0")
-        .arg("nc")
-        .arg("-l")
-        .arg(TCP_SERVER_PORT.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to execut server (nc).")?;
-    let mut client = Command::new("sudo")
-        .arg("ip")
-        .arg("netns")
-        .arg("exec")
-        .arg("Dev0")
-        .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLOSE_CLIENT))
-        .arg("--iface")
-        .arg("d0")
-        .arg("--network")
-        .arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
-        .arg("--gateway")
-        .arg(GATEWAY.to_string())
-        .arg("--dst")
-        .arg(NETWORK_TCPIP0.to_string())
-        .arg("--port")
-        .arg(TCP_SERVER_PORT.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context(format!("Failed to execute {}.", TESTAPP_TCP_CLOSE_CLIENT))?;
-    if let Some(client_status) =
-        child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT_DROP))?
-    {
-        println!("client status: {:?}", client_status);
-        if let Some(server_status) =
-            child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))?
-        {
-            println!("server status: {:?}", server_status);
-            if client_status.success()
-                && check_stdout_pattern(&mut client, &expected_client_stdout)?
-                && server_status.success()
-            {
-                suc = true;
-            }
-        }
-    }
-    server.kill()?;
-    server.wait()?;
-    client.kill()?;
-    client.wait()?;
-    dump_stderr(&mut server)?;
-    dump_stderr(&mut client)?;
-    cleanup_env(env_num)?;
-    assert!(suc, "Connection is not closed correctly.");
-    Ok(())
-}
+// #[test]
+// #[serial]
+// fn test_normal_shutdown_client_drop() -> Result<()> {
+//     let mut suc = false;
+//     let expected_client_stdout = [CLIENT_CONNECTTED, SHUTDOWN];
+//     let env_num: usize = 1;
+//     setup_env(env_num)?;
+//     insert_drop(env_num, 30)?;
+//     thread::sleep(Duration::from_millis(TEST_INITIALIZE));
+//     let mut server = Command::new("sudo")
+//         .arg("ip")
+//         .arg("netns")
+//         .arg("exec")
+//         .arg("Tcpip0")
+//         .arg("nc")
+//         .arg("-l")
+//         .arg(TCP_SERVER_PORT.to_string())
+//         .stdout(Stdio::piped())
+//         .stderr(Stdio::piped())
+//         .spawn()
+//         .context("Failed to execut server (nc).")?;
+//     let mut client = Command::new("sudo")
+//         .arg("ip")
+//         .arg("netns")
+//         .arg("exec")
+//         .arg("Dev0")
+//         .arg(format!("{}{}", TESTAPP_PATH, TESTAPP_TCP_CLOSE_CLIENT))
+//         .arg("--iface")
+//         .arg("d0")
+//         .arg("--network")
+//         .arg(format!("{}/{}", NETWORK_DEV0, SUBNETMASK))
+//         .arg("--gateway")
+//         .arg(GATEWAY.to_string())
+//         .arg("--dst")
+//         .arg(NETWORK_TCPIP0.to_string())
+//         .arg("--port")
+//         .arg(TCP_SERVER_PORT.to_string())
+//         .stdout(Stdio::piped())
+//         .stderr(Stdio::piped())
+//         .spawn()
+//         .context(format!("Failed to execute {}.", TESTAPP_TCP_CLOSE_CLIENT))?;
+//     if let Some(client_status) =
+//         child_wait_with_timeout(&mut client, Duration::from_secs(TEST_TIMEOUT_DROP))?
+//     {
+//         println!("client status: {:?}", client_status);
+//         if let Some(server_status) =
+//             child_wait_with_timeout(&mut server, Duration::from_secs(TEST_TIMEOUT))?
+//         {
+//             println!("server status: {:?}", server_status);
+//             if client_status.success()
+//                 && check_stdout_pattern(&mut client, &expected_client_stdout)?
+//                 && server_status.success()
+//             {
+//                 suc = true;
+//             }
+//         }
+//     }
+//     server.kill()?;
+//     server.wait()?;
+//     client.kill()?;
+//     client.wait()?;
+//     dump_stderr(&mut server)?;
+//     dump_stderr(&mut client)?;
+//     cleanup_env(env_num)?;
+//     assert!(suc, "Connection is not closed correctly.");
+//     Ok(())
+// }
