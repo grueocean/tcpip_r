@@ -75,4 +75,6 @@ pub enum TcpError {
     RefusedError { id: usize },
     #[error("Connection closed. socket id: {id}")]
     ClosedError { id: usize },
+    #[error("Connection closing. socket id: {id}")]
+    ClosingError { id: usize },
 }

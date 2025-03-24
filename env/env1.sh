@@ -99,9 +99,9 @@ drop() {
 clear() {
     set -eux
 
+    tc qdisc del dev l2-0 root
     tc qdisc del dev l2-1 root
     tc qdisc del dev l2-2 root
-    tc qdisc del dev l2-0 root
     tc qdisc del dev l2-3 root
 }
 

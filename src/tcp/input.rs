@@ -1231,6 +1231,15 @@ pub fn update_timer(socket_id: usize, conn: &mut TcpConnection) {
                 );
             }
         }
+        TcpStatus::FinWait1 | TcpStatus::LastAck => {
+            if !conn.timer.retransmission.timer_param.active {
+                conn.timer.retransmission.fire_datagram();
+                log::debug!(
+                    "[{}] Enabled retransmission timer for FIN in recv_handler_other.",
+                    conn.print_log_prefix(socket_id)
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -1889,6 +1898,7 @@ pub enum TcpEventType {
     Refused,
     DatagramReceived,
     SendMore,
+    Closing,
 }
 
 #[derive(Debug, Clone, PartialEq)]

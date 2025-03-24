@@ -6,7 +6,7 @@ use crate::{
     tcp::{
         self,
         defs::{TcpError, TcpStatus},
-        input::{update_tcp_status_simple, ListenQueue, TcpConnection, TcpEvent, TcpEventType},
+        input::{update_tcp_status_simple, update_timer, ListenQueue, TcpConnection, TcpEvent, TcpEventType},
         output,
         packet::{TcpFlag, TcpPacket, TCP_DEFAULT_WINDOW_SCALE},
         timer::{update_retransmission_param, TcpTimer, TCP_RTTVAR_SHIFT, TCP_SRTT_SHIFT},
@@ -648,13 +648,32 @@ impl TcpStack {
         log::trace!("SHUTDOWN CALL: id={} shutdown={:?}", socket_id, shutdown);
         let mut conns = self.connections.lock().unwrap();
         if let Some(Some(conn)) = conns.get_mut(&socket_id) {
+            match conn.status {
+                TcpStatus::Listen | TcpStatus::SynSent => {
+                    // todo: implement
+                    return Ok(());
+                }
+                TcpStatus::Closed => {
+                    anyhow::bail!("No connection exists.");
+                }
+                TcpStatus::FinWait1
+                | TcpStatus::FinWait2
+                | TcpStatus::Closing
+                | TcpStatus::LastAck
+                | TcpStatus::TimeWait => {
+                    anyhow::bail!(TcpError::ClosingError { id: socket_id });
+                }
+                TcpStatus::SynRcvd | TcpStatus::Established | TcpStatus::CloseWait => {
+                    // do nothing here.
+                }
+            }
             conn.shutdown = shutdown;
             match conn.shutdown {
                 Shutdown::None => {
                     anyhow::bail!("Need to specify shutdown type.");
                 }
                 Shutdown::Write | Shutdown::Both => match conn.status {
-                    TcpStatus::Established => {
+                    TcpStatus::SynRcvd | TcpStatus::Established => {
                         update_tcp_status_simple(socket_id, conn, None, TcpStatus::FinWait1);
                     }
                     TcpStatus::CloseWait => {
@@ -673,6 +692,7 @@ impl TcpStack {
                     e
                 );
             }
+            update_timer(socket_id, conn);
         } else {
             anyhow::bail!("Cannot find the socket (id={}).", socket_id);
         }
