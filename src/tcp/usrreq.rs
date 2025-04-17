@@ -6,7 +6,10 @@ use crate::{
     tcp::{
         self,
         defs::{TcpError, TcpStatus},
-        input::{update_tcp_status_simple, update_timer, ListenQueue, TcpConnection, TcpEvent, TcpEventType},
+        input::{
+            update_tcp_status_simple, update_timer, ListenQueue, TcpConnection, TcpEvent,
+            TcpEventType,
+        },
         output,
         packet::{TcpFlag, TcpPacket, TCP_DEFAULT_WINDOW_SCALE},
         timer::{update_retransmission_param, TcpTimer, TCP_RTTVAR_SHIFT, TCP_SRTT_SHIFT},
@@ -755,6 +758,7 @@ impl TcpStack {
                 timer: _timer,
                 rtt_start: _rtt_start,
                 rtt_seq: _rtt_seq,
+                dupacks_rcvd: _dupacks_rcvd,
                 last_snd_ack: _last_snd_ack,
                 last_sent_window: _last_sent_window,
                 fin_seq_sent: _fin_sqe_sent,

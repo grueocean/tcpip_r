@@ -235,6 +235,7 @@ impl TcpStack {
                         send_queue: SendQueue::new(),
                         recv_queue: recv_queue,
                         timer: TcpTimer::new(),
+                        dupacks_rcvd: 0,
                         rtt_start: None,
                         rtt_seq: None,
                         last_snd_ack: 0,
@@ -814,8 +815,10 @@ impl TcpStack {
             });
         } else if seq_less_equal(tcp_packet.ack_number, conn.send_vars.unacknowledged) {
             // If the ACK is a duplicate (SEG.ACK =< SND.UNA), it can be ignored. rfc9293
+            conn.dupacks_rcvd += 1;
             log::debug!(
-                "[{}] Duplicate ack. SEG.LENGTH={} SND.UNA={} SEG.ACK={} ",
+                "[{}] Duplicate ack. DUPACK_COUNT={} SEG.LENGTH={} SND.UNA={} SEG.ACK={} ",
+                conn.dupacks_rcvd,
                 conn.print_log_prefix(socket_id),
                 tcp_packet.payload.len(),
                 conn.send_vars.unacknowledged,
@@ -950,30 +953,44 @@ impl TcpStack {
             _ => {}
         }
         let prev_payload = conn.recv_queue.complete_datagram.payload.len();
-        if let Err(e) = conn
+        match conn
             .recv_queue
             .add(tcp_packet.seq_number as usize, &tcp_packet.payload)
         {
-            log::warn!("Failed to add a segment to the recv queue. Err: {:?}", e);
-        } else {
-            let current_payload = conn.recv_queue.complete_datagram.payload.len();
-            let rcv_nxt_advance = current_payload - prev_payload;
-            let rcv_nxt_next = conn.recv_queue.get_end_sequence_num();
-            if tcp_packet.flag.contains(TcpFlag::FIN) {
-                let fin_seq_recv = tcp_packet
-                    .seq_number
-                    .wrapping_add(tcp_packet.payload.len() as u32);
-                conn.fin_seq_recv = Some(fin_seq_recv);
+            Err(e) => {
+                log::warn!("Failed to add a segment to the recv queue. Err: {:?}", e);
             }
-            if let Some(fin_seq_recv) = conn.fin_seq_recv {
-                if rcv_nxt_next == fin_seq_recv {
-                    log::debug!(
-                        "[{}] RCV.NXT advanced including FIN(1). ({}->{}).",
-                        conn.print_log_prefix(socket_id),
-                        conn.recv_vars.next_sequence_num,
-                        rcv_nxt_next.wrapping_add(1)
-                    );
-                    conn.recv_vars.next_sequence_num = rcv_nxt_next.wrapping_add(1);
+            Ok(out_of_order_detected) => {
+                if out_of_order_detected {
+                    conn.send_flag.ack_now = true;
+                }
+                let current_payload = conn.recv_queue.complete_datagram.payload.len();
+                let rcv_nxt_advance = current_payload - prev_payload;
+                let rcv_nxt_next = conn.recv_queue.get_end_sequence_num();
+                if tcp_packet.flag.contains(TcpFlag::FIN) {
+                    let fin_seq_recv = tcp_packet
+                        .seq_number
+                        .wrapping_add(tcp_packet.payload.len() as u32);
+                    conn.fin_seq_recv = Some(fin_seq_recv);
+                }
+                if let Some(fin_seq_recv) = conn.fin_seq_recv {
+                    if rcv_nxt_next == fin_seq_recv {
+                        log::debug!(
+                            "[{}] RCV.NXT advanced including FIN(1). ({}->{}).",
+                            conn.print_log_prefix(socket_id),
+                            conn.recv_vars.next_sequence_num,
+                            rcv_nxt_next.wrapping_add(1)
+                        );
+                        conn.recv_vars.next_sequence_num = rcv_nxt_next.wrapping_add(1);
+                    } else {
+                        log::debug!(
+                            "[{}] RCV.NXT advanced. ({}->{}).",
+                            conn.print_log_prefix(socket_id),
+                            conn.recv_vars.next_sequence_num,
+                            rcv_nxt_next
+                        );
+                        conn.recv_vars.next_sequence_num = rcv_nxt_next;
+                    }
                 } else {
                     log::debug!(
                         "[{}] RCV.NXT advanced. ({}->{}).",
@@ -983,39 +1000,20 @@ impl TcpStack {
                     );
                     conn.recv_vars.next_sequence_num = rcv_nxt_next;
                 }
-            } else {
-                log::debug!(
-                    "[{}] RCV.NXT advanced. ({}->{}).",
-                    conn.print_log_prefix(socket_id),
-                    conn.recv_vars.next_sequence_num,
-                    rcv_nxt_next
-                );
-                conn.recv_vars.next_sequence_num = rcv_nxt_next;
-            }
-            conn.recv_vars.window_size = conn.get_recv_window_size();
-            if prev_payload != current_payload {
-                log::debug!(
-                    "[{}] Datagram received {} bytes. (Current received queue length {}->{})",
-                    conn.print_log_prefix(socket_id),
-                    rcv_nxt_advance,
-                    prev_payload,
-                    current_payload
-                );
-                self.publish_event(TcpEvent {
-                    socket_id: socket_id,
-                    event: TcpEventType::DatagramReceived,
-                });
-            }
-        }
-        if conn.status == TcpStatus::Established {
-            if !conn.timer.delayed_ack.timer_param.active
-                && conn.conn_flag.use_delayed_ack
-                && !conn.has_unsent_data()
-            {
-                conn.send_flag.ack_delayed = true;
-                conn.timer.delayed_ack.fire();
-            } else {
-                conn.send_flag.ack_now = true;
+                conn.recv_vars.window_size = conn.get_recv_window_size();
+                if prev_payload != current_payload {
+                    log::debug!(
+                        "[{}] Datagram received {} bytes. (Current received queue length {}->{})",
+                        conn.print_log_prefix(socket_id),
+                        rcv_nxt_advance,
+                        prev_payload,
+                        current_payload
+                    );
+                    self.publish_event(TcpEvent {
+                        socket_id: socket_id,
+                        event: TcpEventType::DatagramReceived,
+                    });
+                }
             }
         }
         Ok(())
@@ -1269,6 +1267,7 @@ pub struct TcpConnection {
     pub timer: TcpTimer,
     pub rtt_start: Option<Instant>, // BSD: t_rtttime
     pub rtt_seq: Option<u32>,       // BSD: t_rtseq
+    pub dupacks_rcvd: usize,        // BSD: t_dupacks
     pub last_snd_ack: u32,          // BSD: last_ack_sent
     pub last_sent_window: usize,    // window size recently notified to peer
     pub fin_seq_sent: Option<u32>,  // seq number for fin that is already sent
@@ -1295,6 +1294,7 @@ impl TcpConnection {
             timer: TcpTimer::new(),
             rtt_start: None,
             rtt_seq: None,
+            dupacks_rcvd: 0,
             last_snd_ack: 0,
             last_sent_window: 0,
             fin_seq_sent: None,
@@ -1552,15 +1552,17 @@ impl ReceiveQueue {
             .wrapping_add(self.complete_datagram.payload.len() as u32)
     }
 
-    pub fn add(&mut self, seq: usize, payload: &Vec<u8>) -> Result<()> {
+    // returns if this segment generate hole or not
+    pub fn add(&mut self, seq: usize, payload: &Vec<u8>) -> Result<bool> {
         log::trace!(
             "Adding SEQ={} (LEN: {}) to recv queue {}.",
             seq,
             payload.len(),
             self.get_current()
         );
+        let mut out_of_order_detected = false;
         if payload.len() == 0 {
-            return Ok(());
+            return Ok(out_of_order_detected);
         }
         let virtual_seq = self
             .convert_virtual_sequence_num(seq)
@@ -1581,10 +1583,10 @@ impl ReceiveQueue {
             && self.fragmented_datagram.len() == 0
         {
             self.complete_datagram.payload = payload.clone();
-            return Ok(());
+            return Ok(out_of_order_detected);
         }
         if new_end <= complete_end {
-            return Ok(());
+            return Ok(out_of_order_detected);
         }
         let mut pending_new = Vec::new();
         let mut tmp_fragment: Option<ReceiveFragment> = None;
@@ -1626,6 +1628,7 @@ impl ReceiveQueue {
                         payload: current_payload.clone(),
                     });
                     complete_marge = true;
+                    out_of_order_detected = true;
                     continue;
                 //                      current
                 //                         |
@@ -1641,6 +1644,7 @@ impl ReceiveQueue {
                         payload: fragment_marged,
                     });
                     complete_marge = true;
+                    out_of_order_detected = true;
                     continue;
                 //                      current
                 //                         |
@@ -1669,6 +1673,7 @@ impl ReceiveQueue {
                         sequence_num: tmp_start,
                         payload: fragment_marged,
                     });
+                    out_of_order_detected = true;
                     continue;
                 //                      current
                 //                         |
@@ -1695,6 +1700,7 @@ impl ReceiveQueue {
                         sequence_num: *current_seq,
                         payload: current_payload.clone(),
                     });
+                    out_of_order_detected = true;
                     continue;
                 }
                 anyhow::bail!(
@@ -1721,6 +1727,7 @@ impl ReceiveQueue {
                         payload: current_payload.clone(),
                     });
                     complete_marge = true;
+                    out_of_order_detected = true;
                     continue;
                 //                      current
                 //                         |
@@ -1740,6 +1747,7 @@ impl ReceiveQueue {
                         payload: fragment_marged,
                     });
                     complete_marge = true;
+                    out_of_order_detected = true;
                     continue;
                 //                      current
                 //                         |
@@ -1799,6 +1807,7 @@ impl ReceiveQueue {
                         sequence_num: new_start,
                         payload: payload.to_vec(),
                     });
+                    out_of_order_detected = true;
                     continue;
                 }
                 anyhow::bail!(
@@ -1827,7 +1836,7 @@ impl ReceiveQueue {
             }
         }
         self.fragmented_datagram = pending_new;
-        Ok(())
+        Ok(out_of_order_detected)
     }
 
     // After read from recv queue, we need to update RCV.WND.
@@ -1913,6 +1922,7 @@ mod tcp_tests {
     use rstest::rstest;
 
     #[rstest]
+    // 01
     #[case(
         13,
         vec![9; 4],
@@ -1929,8 +1939,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 02
     #[case(
         15,
         vec![9; 2],
@@ -1947,8 +1959,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 03
     #[case(
         16,
         vec![9; 2],
@@ -1969,8 +1983,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 04
     #[case(
         18,
         vec![9; 4],
@@ -1987,8 +2003,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 05
     #[case(
         20,
         vec![9; 2],
@@ -2005,8 +2023,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 06
     #[case(
         20,
         vec![9; 5],
@@ -2023,8 +2043,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 07
     #[case(
         18,
         vec![9; 14],
@@ -2037,8 +2059,10 @@ mod tcp_tests {
                 sequence_num: 18,
                 payload: vec![9, 9, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 08
     #[case(
         23,
         vec![9; 7],
@@ -2051,8 +2075,10 @@ mod tcp_tests {
                 sequence_num: 20,
                 payload: vec![6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 09
     #[case(
         23,
         vec![9; 13],
@@ -2065,8 +2091,10 @@ mod tcp_tests {
                 sequence_num: 20,
                 payload: vec![6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4, 9, 9]
             }
-        ]
+        ],
+        true,
     )]
+    // 10
     #[case(
         25,
         vec![9; 2],
@@ -2087,8 +2115,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 11
     #[case(
         37,
         vec![9; 2],
@@ -2109,8 +2139,10 @@ mod tcp_tests {
                 sequence_num: 37,
                 payload: vec![9, 9]
             }
-        ]
+        ],
+        true,
     )]
+    // 12
     #[case(
         15,
         vec![9; 5],
@@ -2123,8 +2155,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![1, 2, 3, 4]
             }
-        ]
+        ],
+        true,
     )]
+    // 13
     #[case(
         15,
         vec![9; 15],
@@ -2132,8 +2166,10 @@ mod tcp_tests {
             sequence_num: 10,
             payload: vec![1, 2, 3, 4, 5, 9, 9, 9, 9, 9, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4]
         },
-        vec![]
+        vec![],
+        true,
     )]
+    // 14
     #[case(
         13,
         vec![9; 22],
@@ -2141,13 +2177,15 @@ mod tcp_tests {
             sequence_num: 10,
             payload: vec![1, 2, 3, 4, 5, 9, 9, 9, 9, 9, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 1, 2, 3, 4, 9]
         },
-        vec![]
+        vec![],
+        true,
     )]
     fn test_receive_queue_add_2_pending(
         #[case] new_fragment_seq: usize,
         #[case] new_fragment_payload: Vec<u8>,
         #[case] expected_complete: ReceiveFragment,
         #[case] expected_pending: Vec<ReceiveFragment>,
+        #[case] expected_out_of_order_detected: bool,
     ) {
         let initial_complete = ReceiveFragment {
             sequence_num: 10,
@@ -2174,10 +2212,11 @@ mod tcp_tests {
 
         assert_eq!(queue.complete_datagram, expected_complete);
         assert_eq!(queue.fragmented_datagram, expected_pending);
-        assert_eq!(result, ());
+        assert_eq!(result, expected_out_of_order_detected);
     }
 
     #[rstest]
+    // 01
     #[case(
         23,
         vec![9; 8],
@@ -2198,8 +2237,10 @@ mod tcp_tests {
                 sequence_num: 32,
                 payload: vec![8, 7, 6, 5]
             }
-        ]
+        ],
+        true,
     )]
+    // 02
     #[case(
         23,
         vec![9; 9],
@@ -2216,8 +2257,10 @@ mod tcp_tests {
                 sequence_num: 23,
                 payload: vec![9, 9, 2, 3, 4, 5, 9, 9, 9, 8, 7, 6, 5]
             }
-        ]
+        ],
+        true,
     )]
+    // 03
     #[case(
         23,
         vec![9; 14],
@@ -2234,8 +2277,10 @@ mod tcp_tests {
                 sequence_num: 23,
                 payload: vec![9, 9, 2, 3, 4, 5, 9, 9, 9, 8, 7, 6, 5, 9]
             }
-        ]
+        ],
+        true,
     )]
+    // 04
     #[case(
         30,
         vec![9; 1],
@@ -2260,8 +2305,10 @@ mod tcp_tests {
                 sequence_num: 32,
                 payload: vec![8, 7, 6, 5]
             }
-        ]
+        ],
+        true,
     )]
+    // 05
     #[case(
         30,
         vec![9; 4],
@@ -2282,8 +2329,10 @@ mod tcp_tests {
                 sequence_num: 30,
                 payload: vec![9, 9, 8, 7, 6, 5]
             }
-        ]
+        ],
+        true,
     )]
+    // 06
     #[case(
         13,
         vec![9; 18],
@@ -2296,8 +2345,10 @@ mod tcp_tests {
                 sequence_num: 32,
                 payload: vec![8, 7, 6, 5]
             }
-        ]
+        ],
+        true,
     )]
+    // 07
     #[case(
         15,
         vec![9; 16],
@@ -2310,13 +2361,15 @@ mod tcp_tests {
                 sequence_num: 32,
                 payload: vec![8, 7, 6, 5]
             }
-        ]
+        ],
+        true,
     )]
     fn test_receive_queue_add_3_pending(
         #[case] new_fragment_seq: usize,
         #[case] new_fragment_payload: Vec<u8>,
         #[case] expected_complete: ReceiveFragment,
         #[case] expected_pending: Vec<ReceiveFragment>,
+        #[case] expected_out_of_order_detected: bool,
     ) {
         let initial_complete = ReceiveFragment {
             sequence_num: 10,
@@ -2347,7 +2400,7 @@ mod tcp_tests {
 
         assert_eq!(queue.complete_datagram, expected_complete);
         assert_eq!(queue.fragmented_datagram, expected_pending);
-        assert_eq!(result, ());
+        assert_eq!(result, expected_out_of_order_detected);
     }
 
     #[rstest]
@@ -2385,7 +2438,6 @@ mod tcp_tests {
 
         assert_eq!(queue.complete_datagram, expected_complete);
         assert_eq!(queue.fragmented_datagram, expected_pending);
-        assert_eq!(result, ());
     }
 
     #[rstest]
@@ -2409,7 +2461,8 @@ mod tcp_tests {
                 sequence_num: 25,
                 payload: vec![2, 3, 4, 5]
             }
-        ]
+        ],
+        true,
     )]
     #[case(
         13,
@@ -2427,13 +2480,15 @@ mod tcp_tests {
                 sequence_num: 25,
                 payload: vec![2, 3, 4, 5]
             }
-        ]
+        ],
+        true,
     )]
     fn test_receive_queue_add_no_complete_2_pending(
         #[case] new_fragment_seq: usize,
         #[case] new_fragment_payload: Vec<u8>,
         #[case] expected_complete: ReceiveFragment,
         #[case] expected_pending: Vec<ReceiveFragment>,
+        #[case] expected_out_of_order_detected: bool,
     ) {
         let initial_complete = ReceiveFragment {
             sequence_num: 10,
@@ -2460,7 +2515,7 @@ mod tcp_tests {
 
         assert_eq!(queue.complete_datagram, expected_complete);
         assert_eq!(queue.fragmented_datagram, expected_pending);
-        assert_eq!(result, ());
+        assert_eq!(result, expected_out_of_order_detected);
     }
 
     #[rstest]
@@ -2471,7 +2526,8 @@ mod tcp_tests {
             sequence_num: 10,
             payload: vec![1, 2, 3, 9, 9]
         },
-        vec![]
+        vec![],
+        false,
     )]
     #[case(
         11,
@@ -2480,13 +2536,15 @@ mod tcp_tests {
             sequence_num: 10,
             payload: vec![1, 2, 3, 9, 9]
         },
-        vec![]
+        vec![],
+        false,
     )]
     fn test_receive_queue_add_simple(
         #[case] new_fragment_seq: usize,
         #[case] new_fragment_payload: Vec<u8>,
         #[case] expected_complete: ReceiveFragment,
         #[case] expected_pending: Vec<ReceiveFragment>,
+        #[case] expected_out_of_order_detected: bool,
     ) {
         let initial_complete = ReceiveFragment {
             sequence_num: 10,
@@ -2504,7 +2562,7 @@ mod tcp_tests {
 
         assert_eq!(queue.complete_datagram, expected_complete);
         assert_eq!(queue.fragmented_datagram, expected_pending);
-        assert_eq!(result, ());
+        assert_eq!(result, expected_out_of_order_detected);
     }
 
     #[rstest]
@@ -2548,7 +2606,6 @@ mod tcp_tests {
 
         assert_eq!(queue.complete_datagram, expected_complete);
         assert_eq!(queue.fragmented_datagram, expected_pending);
-        assert_eq!(result, ());
     }
 
     #[rstest]
